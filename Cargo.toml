@@ -44,6 +44,7 @@ members = [
     "contracts/insurance",
     "contracts/anomaly_detector",
     "contracts/subscription",
+    "contracts/multisig_admin",
 ]
 
 [workspace.package]
