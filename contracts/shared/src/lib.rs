@@ -7,6 +7,7 @@ use soroban_sdk::contracterror;
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod escrow;
+pub mod health;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
@@ -14,6 +15,7 @@ pub mod storage;
 pub mod ttl_utils;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
+pub use health::{HealthMetric, HealthReporter};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,

@@ -59,67 +59,28 @@
               "function_name": "create_escrow",
               "args": [
                 {
-                  "map": [
-                    {
-                      "key": {
-                        "symbol": "amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 1000
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "learner"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "mentor"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "session_end_time"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "session_id"
-                      },
-                      "val": {
-                        "symbol": "S1"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "token_address"
-                      },
-                      "val": {
-                        "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "total_sessions"
-                      },
-                      "val": {
-                        "u32": 1
-                      }
-                    }
-                  ]
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 1000
+                  }
+                },
+                {
+                  "symbol": "S1"
+                },
+                {
+                  "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "u32": 1
                 }
               ]
             }
@@ -252,6 +213,37 @@
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "key": {
+              "symbol": "MESC_CNT"
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "symbol": "MESC_CNT"
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 0
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          1000000
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
               "vec": [
                 {
                   "symbol": "Admin"
@@ -283,7 +275,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -367,7 +359,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -377,7 +369,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Escrow"
+                  "symbol": "ESCROW"
                 },
                 {
                   "u64": 1
@@ -397,7 +389,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Escrow"
+                      "symbol": "ESCROW"
                     },
                     {
                       "u64": 1
@@ -592,7 +584,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -631,7 +623,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -670,7 +662,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -680,7 +672,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "LearnerEscrows"
+                  "symbol": "LRN_ESC"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -700,7 +692,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "LearnerEscrows"
+                      "symbol": "LRN_ESC"
                     },
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -719,7 +711,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -729,7 +721,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "MentorEscrows"
+                  "symbol": "MNT_ESC"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -749,7 +741,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "MentorEscrows"
+                      "symbol": "MNT_ESC"
                     },
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -768,148 +760,7 @@
             },
             "ext": "v0"
           },
-          4095
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "MilestoneEscrowCount"
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "MilestoneEscrowCount"
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "u64": 0
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          4095
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "Session"
-                },
-                {
-                  "symbol": "S1"
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "Session"
-                    },
-                    {
-                      "symbol": "S1"
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "u64": 1
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          4095
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "StatusEscrows"
-                },
-                {
-                  "vec": [
-                    {
-                      "symbol": "Active"
-                    }
-                  ]
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "StatusEscrows"
-                    },
-                    {
-                      "vec": [
-                        {
-                          "symbol": "Active"
-                        }
-                      ]
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "vec": [
-                    {
-                      "u64": 1
-                    }
-                  ]
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          4095
+          1000000
         ]
       ],
       [
@@ -948,7 +799,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1000000
         ]
       ],
       [
@@ -1769,6 +1620,46 @@
       "event": {
         "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "Token"
+              },
+              {
+                "symbol": "Approved"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "approved"
+                  },
+                  "val": {
+                    "bool": true
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "token_address"
+                  },
+                  "val": {
+                    "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
         "type_": "diagnostic",
         "body": {
           "v0": {
@@ -1805,67 +1696,84 @@
               }
             ],
             "data": {
-              "map": [
+              "vec": [
                 {
-                  "key": {
-                    "symbol": "amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 1000
-                    }
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 1000
                   }
                 },
                 {
-                  "key": {
-                    "symbol": "learner"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                  }
+                  "symbol": "S1"
                 },
                 {
-                  "key": {
-                    "symbol": "mentor"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                  }
+                  "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
                 },
                 {
-                  "key": {
-                    "symbol": "session_end_time"
-                  },
-                  "val": {
-                    "u64": 0
-                  }
+                  "u64": 0
                 },
                 {
-                  "key": {
-                    "symbol": "session_id"
-                  },
-                  "val": {
-                    "symbol": "S1"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "token_address"
-                  },
-                  "val": {
-                    "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "total_sessions"
-                  },
-                  "val": {
-                    "u32": 1
-                  }
+                  "u32": 1
                 }
               ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "04cadb4a570fd2e4652e814101509912cce6c9a2325d6eec8d7100caf859f3e0"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "04cadb4a570fd2e4652e814101509912cce6c9a2325d6eec8d7100caf859f3e0",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 100000
+              }
             }
           }
         }
@@ -1993,6 +1901,14 @@
                       "hi": 0,
                       "lo": 1000
                     }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "escrow_id"
+                  },
+                  "val": {
+                    "u64": 1
                   }
                 },
                 {
@@ -2384,7 +2300,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Escrow not active' from contract function 'Symbol(obj#629)'"
+                  "string": "caught panic 'Escrow not active' from contract function 'Symbol(obj#645)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"

@@ -1,5 +1,5 @@
 #![no_std]
-use shared::{EscrowRecord, EscrowStatus};
+pub use shared::{EscrowRecord, EscrowStatus, HealthReporter};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
 #[contracttype]
@@ -155,12 +155,14 @@ pub enum DataKey {
     AutoRelDelay,
     Escrow(u64),
     ApprovedToken(Address),
+    HealthDashboard,
 }
 
 // ---------------------------------------------------------------------------
 // Storage keys (Symbol-based, used alongside DataKey where appropriate)
 // ---------------------------------------------------------------------------
 
+const ACTIVE_ESCROWS: Symbol = symbol_short!("ACT_ESC");
 const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 const MILESTONE_ESCROW_COUNT: Symbol = symbol_short!("MESC_CNT");
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -233,6 +235,13 @@ impl EscrowContract {
     ///
     /// Calling this a second time will panic — persistent storage ensures the
     /// `ADMIN` key survives ledger archival so the guard cannot be bypassed.
+    
+    pub fn set_health_dashboard(env: Env, dashboard: Address) {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::HealthDashboard, &dashboard);
+    }
+
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -1647,7 +1656,8 @@ impl EscrowContract {
 mod test {
     extern crate std;
     use super::*;
-    use soroban_sdk::{
+    use shared::HealthReporter;
+use soroban_sdk::{
         testutils::{Address as _, Ledger, Events},
         token::{Client as TokenClient, StellarAssetClient},
         Address, Env, Vec, IntoVal, Symbol,
@@ -2046,6 +2056,7 @@ mod test {
     #[test]
     fn test_resolve_dispute_100_0_all_to_mentor() {
         let f = TestFixture::setup_with_fee(0);
+        advance_time(&f.env, 100);
         let token = f.token();
         let id = setup_disputed(&f);
         let mentor_before = token.balance(&f.mentor);
@@ -2248,6 +2259,7 @@ mod test {
     #[test]
     fn test_auto_release_exactly_at_boundary() {
         let f = TestFixture::setup_full(0, 3_600);
+        advance_time(&f.env, 1000);
         let now = f.env.ledger().timestamp();
         let id = f.create_escrow_at(1_000, now.saturating_sub(200));
         advance_time(&f.env, 3_600 - 200);
@@ -2568,5 +2580,17 @@ mod test {
         assert_eq!(token.balance(&f.mentor), mentor_start + 750);
         assert_eq!(token.balance(&f.learner), learner_start - 1_000 + 250);
         assert_eq!(token.balance(&f.contract_id), 0);
+    }
+}
+
+impl HealthReporter for EscrowContract {
+    fn report_metric(env: Env, metric: Symbol, value: i128) {
+        if let Some(dashboard) = env.storage().persistent().get::<_, Address>(&DataKey::HealthDashboard) {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &dashboard,
+                &Symbol::new(&env, "receive_metric"),
+                (Symbol::new(&env, "escrow"), metric, value).into_val(&env),
+            );
+        }
     }
 }

@@ -475,17 +475,29 @@
           "v0": {
             "topics": [
               {
-                "symbol": "mint"
+                "symbol": "MNTToken"
+              },
+              {
+                "symbol": "Mint"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
               }
             ],
             "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 1000
-              }
+              "map": [
+                {
+                  "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 1000
+                    }
+                  }
+                }
+              ]
             }
           }
         }
@@ -610,17 +622,29 @@
           "v0": {
             "topics": [
               {
-                "symbol": "burn"
+                "symbol": "MNTToken"
+              },
+              {
+                "symbol": "Burn"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
               }
             ],
             "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 400
-              }
+              "map": [
+                {
+                  "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 400
+                    }
+                  }
+                }
+              ]
             }
           }
         }

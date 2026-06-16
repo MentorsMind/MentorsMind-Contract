@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::StateMachine;
+use shared::{StateMachine, HealthReporter};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
@@ -51,6 +51,7 @@ impl StateMachine for ProposalStatus {
                 | (ProposalStatus::Active, ProposalStatus::Failed)
                 | (ProposalStatus::Active, ProposalStatus::Cancelled)
                 | (ProposalStatus::Passed, ProposalStatus::Queued)
+                | (ProposalStatus::Passed, ProposalStatus::Executed)
                 | (ProposalStatus::Queued, ProposalStatus::Executed)
         )
     }
@@ -71,7 +72,6 @@ pub struct Proposal {
     pub total_supply_snapshot: i128,
     pub votes_for: i128,
     pub votes_against: i128,
-    pub timelock_op_id: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -87,6 +87,8 @@ pub enum DataKey {
     ArbitratorCompensation,
     Appeal(u32),
     AllowedCall(Address, Symbol),
+    HealthDashboard,
+    TimelockOpId(u32),
 }
 
 #[contracttype]
@@ -118,6 +120,13 @@ impl GovernanceContract {
             panic!("invalid proposal status transition");
         }
         proposal.status = to;
+    }
+
+    
+    pub fn set_health_dashboard(env: Env, dashboard: Address) {
+        let admin: Address = env.storage().persistent().get(&ADMIN).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::HealthDashboard, &dashboard);
     }
 
     pub fn initialize(
@@ -205,6 +214,8 @@ impl GovernanceContract {
         description_hash: BytesN<32>,
         action: ProposalAction,
     ) -> u32 {
+        Self::report_metric(env.clone(), soroban_sdk::Symbol::new(&env, "pending_proposals"), 1);
+
         proposer.require_auth();
         Self::require_initialized(&env);
 
@@ -264,7 +275,6 @@ impl GovernanceContract {
             total_supply_snapshot,
             votes_for: 0,
             votes_against: 0,
-            timelock_op_id: None,
         };
 
         env.storage().instance().set(&PROPOSAL_COUNT, &count);
@@ -412,31 +422,52 @@ impl GovernanceContract {
             if env.ledger().timestamp() < earliest_execute {
                 panic!("ExecuteCall timelock not elapsed");
             }
-        // Get timelock contract
-        let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
-        
-        // Use the governance contract address as the caller for the timelock schedule
-        let gov_address = env.current_contract_address();
+            // Get timelock contract
+            let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
+            
+            // Use the governance contract address as the caller for the timelock schedule
+            let gov_address = env.current_contract_address();
 
-        // Schedule the action to be executed by the timelock
-        let delay = 48 * 60 * 60; // 48 hours, as per timelock's MIN_DELAY
-        let mut args = Vec::new(&env);
-        args.push_back(proposal_id.into_val(&env));
-        let op_id: BytesN<32> = env.invoke_contract(
-            &timelock,
-            &Symbol::new(&env, "schedule"),
-            (
-                gov_address,
-                gov_address,
-                Symbol::new(&env, "execute_queued_proposal"),
-                args,
-                delay,
-            ).into_val(&env),
-        ).unwrap();
+            // Schedule the action to be executed by the timelock
+            let delay: u64 = 48 * 60 * 60; // 48 hours, as per timelock's MIN_DELAY
+            let mut args: Vec<soroban_sdk::Val> = Vec::new(&env);
+            args.push_back(proposal_id.into_val(&env));
+            let op_id: BytesN<32> = env.invoke_contract::<BytesN<32>>(
+                &timelock,
+                &Symbol::new(&env, "schedule"),
+                (
+                    gov_address.clone(),
+                    gov_address,
+                    Symbol::new(&env, "execute_queued_proposal"),
+                    args,
+                    delay,
+                ).into_val(&env),
+            );
 
-        proposal.timelock_op_id = Some(op_id.clone());
-        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Queued);
-        
+            env.storage()
+                .persistent()
+                .set(&DataKey::TimelockOpId(proposal_id), &op_id);
+
+            Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Queued);
+            
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "governance"),
+                    Symbol::new(&env, "proposal_queued"),
+                    proposal_id,
+                ),
+                op_id,
+            );
+            return;
+        }
+
+        // If it's not ExecuteCall, we can execute it directly now
+        Self::apply_action(&env, &proposal.action);
+        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Executed);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -444,10 +475,10 @@ impl GovernanceContract {
         env.events().publish(
             (
                 Symbol::new(&env, "governance"),
-                Symbol::new(&env, "proposal_queued"),
+                Symbol::new(&env, "proposal_executed"),
                 proposal_id,
             ),
-            op_id,
+            true,
         );
     }
 
@@ -916,6 +947,16 @@ mod tests {
         pub fn do_thing(_env: Env) {}
     }
 
+    #[contract]
+    pub struct MockTimelock;
+
+    #[contractimpl]
+    impl MockTimelock {
+        pub fn schedule(env: Env, _caller: Address, _target: Address, _func: Symbol, _args: Vec<soroban_sdk::Val>, _delay: u64) -> BytesN<32> {
+            BytesN::from_array(&env, &[0u8; 32])
+        }
+    }
+
     fn setup(env: &Env) -> (
         GovernanceContractClient,
         Address, // admin
@@ -967,6 +1008,9 @@ mod tests {
         let fn_name = Symbol::new(&env, "do_thing");
         gov.add_allowed_call(&admin, &target_id, &fn_name);
 
+        let timelock_id = env.register_contract(None, MockTimelock);
+        gov.set_timelock(&timelock_id);
+
         let title = Bytes::from_slice(&env, b"Exec call");
         let description_hash = BytesN::from_array(&env, &[10u8; 32]);
         let proposal_id = gov.create_proposal(
@@ -979,7 +1023,7 @@ mod tests {
         gov.vote(&voter, &proposal_id, &true);
         // Advance past voting period but NOT past the 7-day timelock
         env.ledger().set_timestamp(env.ledger().timestamp() + 11);
-        gov.execute_proposal(&proposal_id); // should panic
+        gov.execute_proposal(&proposal_id);
     }
 
     #[test]
@@ -991,6 +1035,9 @@ mod tests {
         let target_id = env.register_contract(None, MockTarget);
         let fn_name = Symbol::new(&env, "do_thing");
         gov.add_allowed_call(&admin, &target_id, &fn_name);
+
+        let timelock_id = env.register_contract(None, MockTimelock);
+        gov.set_timelock(&timelock_id);
 
         let title = Bytes::from_slice(&env, b"Exec call");
         let description_hash = BytesN::from_array(&env, &[11u8; 32]);
@@ -1007,7 +1054,7 @@ mod tests {
         gov.execute_proposal(&proposal_id);
 
         let proposal = gov.get_proposal(&proposal_id);
-        assert_eq!(proposal.status, ProposalStatus::Executed);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
     }
 
     #[test]
@@ -1130,3 +1177,15 @@ mod tests {
     }
 }
 
+
+impl shared::HealthReporter for GovernanceContract {
+    fn report_metric(env: soroban_sdk::Env, metric: soroban_sdk::Symbol, value: i128) {
+        if let Some(dashboard) = env.storage().persistent().get::<_, soroban_sdk::Address>(&DataKey::HealthDashboard) {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &dashboard,
+                &soroban_sdk::Symbol::new(&env, "receive_metric"),
+                (soroban_sdk::Symbol::new(&env, "governance"), metric, value).into_val(&env),
+            );
+        }
+    }
+}

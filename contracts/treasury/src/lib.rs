@@ -1,4 +1,5 @@
 #![no_std]
+use shared::HealthReporter;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
@@ -43,6 +44,7 @@ pub enum DataKey {
     Allocation(u32),
     /// Token whitelist: DataKey::ApprovedToken(token_address) → bool
     ApprovedToken(Address),
+    HealthDashboard
 }
 
 #[contract]
@@ -51,6 +53,13 @@ pub struct TreasuryContract;
 #[contractimpl]
 impl TreasuryContract {
     /// Initialize treasury contract with admin and staking contract address
+    
+    pub fn set_health_dashboard(env: soroban_sdk::Env, dashboard: soroban_sdk::Address) {
+        let admin: soroban_sdk::Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::HealthDashboard, &dashboard);
+    }
+
     pub fn initialize(env: Env, admin: Address, staking_contract: Address) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -578,5 +587,17 @@ mod tests {
         assert!(treasury_client.is_token_approved(&token));
         treasury_client.set_approved_token(&token, &false);
         assert!(!treasury_client.is_token_approved(&token));
+    }
+}
+
+impl shared::HealthReporter for TreasuryContract {
+    fn report_metric(env: soroban_sdk::Env, metric: soroban_sdk::Symbol, value: i128) {
+        if let Some(dashboard) = env.storage().persistent().get::<_, soroban_sdk::Address>(&DataKey::HealthDashboard) {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &dashboard,
+                &soroban_sdk::Symbol::new(&env, "receive_metric"),
+                (soroban_sdk::Symbol::new(&env, "treasury"), metric, value).into_val(&env),
+            );
+        }
     }
 }

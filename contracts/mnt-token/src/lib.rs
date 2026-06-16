@@ -185,6 +185,15 @@ impl MNTToken {
             panic!("Insufficient balance");
         }
 
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(from.clone()), &(balance - amount));
+
+        let total_supply = Self::total_supply(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalSupply, &(total_supply - amount));
+
         env.events().publish(
             (
                 Symbol::new(&env, "MNTToken"),
@@ -411,6 +420,10 @@ impl TokenInterface for MNTToken {
             ),
             BurnEventData { amount },
         );
+        env.storage().persistent().set(
+            &DataKey::Allowance(from.clone(), spender.clone()),
+            &(allowance - amount),
+        );
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
@@ -592,7 +605,7 @@ mod test {
         assert_eq!(client.allowance(&user1, &user2), 300);
 
         let events2 = env.events().all();
-        last_event = events2.last().unwrap();
+        last_event = events2.get(events2.len() - 2).unwrap();
 
         assert_eq!(last_event.0, contract_id.clone());
         assert_eq!(

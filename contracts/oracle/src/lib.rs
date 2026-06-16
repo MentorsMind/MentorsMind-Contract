@@ -1,4 +1,5 @@
 #![no_std]
+use shared::HealthReporter;
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
     Map, Symbol, Vec,
@@ -9,6 +10,7 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
+const HEALTH_DASHBOARD: Symbol = symbol_short!("HLTH_DB");
 const FEEDERS: Symbol = symbol_short!("FEEDERS");
 const RBAC: Symbol = symbol_short!("RBAC");
 
@@ -122,6 +124,13 @@ impl OracleContract {
     // -----------------------------------------------------------------------
     // Initialisation
     // -----------------------------------------------------------------------
+
+    
+    pub fn set_health_dashboard(env: Env, dashboard: Address) {
+        let admin: Address = env.storage().persistent().get(&ADMIN).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&HEALTH_DASHBOARD, &dashboard);
+    }
 
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&ADMIN) {
@@ -703,6 +712,18 @@ impl OracleContract {
         match env.storage().persistent().get::<_, Address>(&RBAC) {
             Some(rbac) => RbacContractClient::new(env, &rbac).has_role(&role, &account),
             None => false,
+        }
+    }
+}
+
+impl shared::HealthReporter for OracleContract {
+    fn report_metric(env: soroban_sdk::Env, metric: soroban_sdk::Symbol, value: i128) {
+        if let Some(dashboard) = env.storage().persistent().get::<_, soroban_sdk::Address>(&HEALTH_DASHBOARD) {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &dashboard,
+                &soroban_sdk::Symbol::new(&env, "receive_metric"),
+                (soroban_sdk::Symbol::new(&env, "oracle"), metric, value).into_val(&env),
+            );
         }
     }
 }

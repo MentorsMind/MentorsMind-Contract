@@ -1,8 +1,9 @@
 #![no_std]
+use shared::HealthReporter;
 
 use shared::ReentrancyGuard;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, IntoVal,
 };
 
 // ---------------------------------------------------------------------------
@@ -31,12 +32,8 @@ pub struct StakeRecord {
     pub mentor: Address,
     pub amount: i128,
     pub staked_at: u64,
-        // Add cooldown_until timestamp to lock out staking after unstake
-        pub unlock_cooldown_until: Option<u64> = None,
-
-        pub tier: u32,
-    }
-    }
+    pub unlock_at: u64,
+    pub tier: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -48,12 +45,8 @@ pub struct StakeRecord {
 pub struct StakedEventData {
     pub mentor: Address,
     pub amount: i128,
-        // Add cooldown_until timestamp to lock out staking after unstake
-        pub unlock_cooldown_until: Option<u64> = None,
-
-        pub tier: u32,
-    }
-    }
+    pub unlock_at: u64,
+    pub tier: u32,
 }
 
 #[contracttype]
@@ -76,6 +69,7 @@ pub enum DataKey {
     Stakers,
     TotalStaked,
     PendingRewards(Address),
+    HealthDashboard,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +104,13 @@ pub struct StakingContract;
 impl StakingContract {
     /// Initialize the staking contract.
     /// Must be called once before any other function.
+    
+    pub fn set_health_dashboard(env: Env, dashboard: Address) {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::HealthDashboard, &dashboard);
+    }
+
     pub fn initialize(env: Env, admin: Address, mnt_token: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -672,5 +673,17 @@ mod test {
         let f = Fixture::setup();
         let result = f.client().try_initialize(&f.admin, &f.mnt_id);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+}
+
+impl shared::HealthReporter for StakingContract {
+    fn report_metric(env: soroban_sdk::Env, metric: soroban_sdk::Symbol, value: i128) {
+        if let Some(dashboard) = env.storage().persistent().get::<_, soroban_sdk::Address>(&DataKey::HealthDashboard) {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &dashboard,
+                &soroban_sdk::Symbol::new(&env, "receive_metric"),
+                (soroban_sdk::Symbol::new(&env, "staking"), metric, value).into_val(&env),
+            );
+        }
     }
 }

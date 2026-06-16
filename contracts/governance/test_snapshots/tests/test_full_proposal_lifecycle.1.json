@@ -135,7 +135,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "u32": 1
+                  "u32": 0
                 }
               }
             },
@@ -599,10 +599,58 @@
                     "storage": [
                       {
                         "key": {
+                          "symbol": "ADMIN"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "FEE_BPS"
                         },
                         "val": {
                           "u32": 300
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "PROP_CNT"
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "QRM_BPS"
+                        },
+                        "val": {
+                          "u32": 1000
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "SNAPSHOT"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "TOKEN"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "VOT_PER"
+                        },
+                        "val": {
+                          "u64": 10
                         }
                       }
                     ]
