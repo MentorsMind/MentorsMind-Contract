@@ -1,4 +1,8 @@
 #![no_std]
+use shared::events::{
+    emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_refunded,
+    evt_escrow_released, evt_escrow_resolved,
+};
 use shared::{EscrowRecord, EscrowStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
@@ -914,6 +918,18 @@ impl EscrowContract {
         escrow.dispute_reason = reason.clone();
         env.storage().persistent().set(&key, &escrow);
 
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            &env,
+            evt_escrow_disputed(&env),
+            DisputeOpenedEventData {
+                escrow_id,
+                caller: caller.clone(),
+                reason: reason.clone(),
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeOpened"), escrow_id),
             DisputeOpenedEventData {
@@ -978,7 +994,20 @@ impl EscrowContract {
         escrow.resolved_at = now;
         env.storage().persistent().set(&key, &escrow);
 
-        // Emit event
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            &env,
+            evt_escrow_resolved(&env),
+            DisputeResolvedEventData {
+                escrow_id,
+                mentor_pct,
+                mentor_amount,
+                learner_amount,
+                token_address: escrow.token_address.clone(),
+                time: now,
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeResolved"), escrow_id),
             DisputeResolvedEventData {
@@ -1036,6 +1065,18 @@ impl EscrowContract {
         escrow.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&key, &escrow);
 
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            &env,
+            evt_escrow_refunded(&env),
+            EscrowRefundedEventData {
+                escrow_id,
+                learner: escrow.learner.clone(),
+                amount: escrow.amount,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Refunded"), escrow_id),
             EscrowRefundedEventData {
@@ -1606,6 +1647,20 @@ impl EscrowContract {
         escrow.amount = 0; // all remaining amount is released
         env.storage().persistent().set(key, escrow);
 
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            env,
+            evt_escrow_released(env),
+            EscrowReleasedEventData {
+                escrow_id: escrow.id,
+                mentor: escrow.mentor.clone(),
+                amount: release_amount,
+                net_amount,
+                platform_fee,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(env, "Escrow"), Symbol::new(env, "Released"), escrow.id),
             EscrowReleasedEventData {
@@ -1804,7 +1859,23 @@ impl EscrowContract {
             .persistent()
             .extend_ttl(&learner_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
-        // --- Emit event ---
+        // --- Emit events ---
+        // Standardized observability event (Issue #597): canonical
+        // (contract, version, event_type) topic layout for off-chain indexers.
+        emit_escrow_event(
+            &env,
+            evt_escrow_created(&env),
+            EscrowCreatedEventData {
+                escrow_id: count,
+                mentor: mentor.clone(),
+                learner: learner.clone(),
+                amount,
+                session_id: session_id.clone(),
+                token_address: token_address.clone(),
+                session_end_time,
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Created"), count),
             EscrowCreatedEventData {
@@ -2920,5 +2991,68 @@ mod test {
                 .any(|t| Symbol::try_from_val(&f.env, &t).map(|s| s == applied).unwrap_or(false))
         });
         assert!(found, "FeeApplied event must be emitted on graduated release");
+    }
+
+    // -----------------------------------------------------------------------
+    // Observability / standardized events (Issue #597)
+    // -----------------------------------------------------------------------
+
+    /// Count events whose topic uses the canonical
+    /// `(contract="escrow", version=1, event_type)` layout for `event_type`.
+    fn count_standard_escrow_events(f: &TestFixture, event_type: &str) -> u32 {
+        let contract_sym = Symbol::new(&f.env, "escrow");
+        let evt_sym = Symbol::new(&f.env, event_type);
+        let mut n = 0u32;
+        for (_addr, topics, _data) in f.env.events().all().iter() {
+            if topics.len() != 3 {
+                continue;
+            }
+            let c = Symbol::try_from_val(&f.env, &topics.get(0).unwrap());
+            let v = u32::try_from_val(&f.env, &topics.get(1).unwrap());
+            let e = Symbol::try_from_val(&f.env, &topics.get(2).unwrap());
+            if let (Ok(c), Ok(v), Ok(e)) = (c, v, e) {
+                if c == contract_sym && v == 1u32 && e == evt_sym {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn test_standard_created_and_released_events_emitted() {
+        let f = TestFixture::setup_with_fee(500);
+        let id = f.create_escrow_at(1_000, 0);
+        assert_eq!(
+            count_standard_escrow_events(&f, "created"),
+            1,
+            "one standardized 'created' event expected"
+        );
+
+        f.client().release_funds(&f.learner, &id);
+        assert_eq!(
+            count_standard_escrow_events(&f, "released"),
+            1,
+            "one standardized 'released' event expected"
+        );
+    }
+
+    #[test]
+    fn test_standard_dispute_and_resolve_events_emitted() {
+        let f = TestFixture::setup_with_fee(0);
+        let id = f.create_escrow_at(1_000, 0);
+        f.open_dispute(id);
+        assert_eq!(count_standard_escrow_events(&f, "disputed"), 1);
+
+        f.client().resolve_dispute(&id, &50u32);
+        assert_eq!(count_standard_escrow_events(&f, "resolved"), 1);
+    }
+
+    #[test]
+    fn test_standard_refunded_event_emitted() {
+        let f = TestFixture::setup_with_fee(0);
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().refund(&id);
+        assert_eq!(count_standard_escrow_events(&f, "refunded"), 1);
     }
 }
