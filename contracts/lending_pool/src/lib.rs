@@ -1,6 +1,21 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+};
+
+// ---------------------------------------------------------------------------
+// External contract interface: Credit Score
+//
+// The credit score contract exposes `get_score(env, address) -> u32`. We
+// describe it here as a trait so the SDK generates a strongly-typed
+// `CreditScoreClient` used for the cross-contract call in `borrow`.
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "CreditScoreClient")]
+pub trait CreditScoreContractTrait {
+    fn get_score(env: Env, address: Address) -> u32;
+}
 
 // ---------------------------------------------------------------------------
 // Storage Keys
@@ -32,6 +47,8 @@ pub enum DataKey {
     RateModelKinkBps,          // kink utilization in bps
     RateModelSlope1Bps,        // slope1 below kink in bps
     RateModelSlope2Bps,        // slope2 above kink in bps
+    /// Minimum credit score required to borrow (defaults to MIN_CREDIT_SCORE).
+    MinCreditScore,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +197,38 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::RateModelSlope2Bps, &slope2_bps);
 
         Ok(())
+    }
+
+    /// Update the minimum credit score required to borrow (admin only).
+    pub fn set_min_credit_score(env: Env, admin: Address, new_min: u32) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if stored_admin != admin {
+            return Err(Error::NotAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinCreditScore, &new_min);
+
+        env.events().publish(
+            (symbol_short!("min_score"),),
+            new_min,
+        );
+
+        Ok(())
+    }
+
+    /// Get the minimum credit score required to borrow (defaults to 600).
+    pub fn get_min_credit_score(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinCreditScore)
+            .unwrap_or(MIN_CREDIT_SCORE)
     }
 
     /// Get current interest rate based on pool utilization
@@ -426,6 +475,24 @@ impl LendingPool {
         }
 
         borrower.require_auth();
+
+        // --- Credit score gate ---
+        // Query the borrower's on-chain credit score via a cross-contract call
+        // and reject the borrow if it is below the configured minimum.
+        let credit_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CreditScoreContract)
+            .ok_or(Error::NotInitialized)?;
+        let min_credit_score: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinCreditScore)
+            .unwrap_or(MIN_CREDIT_SCORE);
+        let credit_score = CreditScoreClient::new(&env, &credit_contract).get_score(&borrower);
+        if credit_score < min_credit_score {
+            return Err(Error::LowCreditScore);
+        }
 
         let total_liquidity: i128 = env
             .storage()
@@ -741,5 +808,159 @@ impl LendingPool {
             (lender, amount),
         );
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Env;
+
+    // --- Mock USDC token (mint / balance / transfer) ---
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockTokKey {
+        Balance(Address),
+    }
+
+    #[contract]
+    pub struct MockToken;
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let bal: i128 = env
+                .storage()
+                .persistent()
+                .get(&MockTokKey::Balance(to.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&MockTokKey::Balance(to), &(bal + amount));
+        }
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockTokKey::Balance(id))
+                .unwrap_or(0)
+        }
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            let from_bal = Self::balance(env.clone(), from.clone());
+            assert!(from_bal >= amount, "Insufficient balance");
+            let to_bal = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .persistent()
+                .set(&MockTokKey::Balance(from), &(from_bal - amount));
+            env.storage()
+                .persistent()
+                .set(&MockTokKey::Balance(to), &(to_bal + amount));
+        }
+    }
+
+    // --- Mock CreditScore contract with a configurable global score ---
+    #[contract]
+    pub struct MockCreditScore;
+
+    #[contractimpl]
+    impl MockCreditScore {
+        pub fn set_score(env: Env, score: u32) {
+            env.storage().instance().set(&symbol_short!("score"), &score);
+        }
+        pub fn get_score(env: Env, _address: Address) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("score"))
+                .unwrap_or(0u32)
+        }
+    }
+
+    struct Fixture {
+        env: Env,
+        admin: Address,
+        pool: LendingPoolClient<'static>,
+        score: MockCreditScoreClient<'static>,
+    }
+
+    fn setup() -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+
+        let token_id = env.register_contract(None, MockToken);
+        let token = MockTokenClient::new(&env, &token_id);
+
+        let score_id = env.register_contract(None, MockCreditScore);
+        let score = MockCreditScoreClient::new(&env, &score_id);
+
+        let pool_id = env.register_contract(None, LendingPool);
+        let pool = LendingPoolClient::new(&env, &pool_id);
+        pool.initialize(&admin, &token_id, &score_id);
+
+        // Seed the pool with liquidity from a lender.
+        let lender = Address::generate(&env);
+        token.mint(&lender, &1_000_000);
+        pool.deposit(&lender, &1_000_000);
+
+        Fixture { env, admin, pool, score }
+    }
+
+    /// Attempt a borrow with a fresh borrower at the given credit score,
+    /// asserting it is rejected with `LowCreditScore`.
+    fn assert_borrow_rejected(f: &Fixture, score: u32) {
+        f.score.set_score(&score);
+        let borrower = Address::generate(&f.env);
+        let result = f.pool.try_borrow(&borrower, &1_000, &symbol_short!("s1"));
+        assert_eq!(result, Err(Ok(Error::LowCreditScore)));
+    }
+
+    /// Attempt a borrow with a fresh borrower at the given credit score,
+    /// asserting it succeeds.
+    fn assert_borrow_ok(f: &Fixture, score: u32) {
+        f.score.set_score(&score);
+        let borrower = Address::generate(&f.env);
+        let result = f.pool.try_borrow(&borrower, &1_000, &symbol_short!("s1"));
+        assert_eq!(result, Ok(Ok(())));
+    }
+
+    #[test]
+    fn test_default_min_credit_score_is_600() {
+        let f = setup();
+        assert_eq!(f.pool.get_min_credit_score(), 600);
+    }
+
+    #[test]
+    fn test_borrow_below_min_score_rejected() {
+        let f = setup();
+        assert_borrow_rejected(&f, 599); // 599 < 600
+    }
+
+    #[test]
+    fn test_borrow_at_min_score_allowed() {
+        let f = setup();
+        assert_borrow_ok(&f, 600); // 600 == 600
+    }
+
+    #[test]
+    fn test_borrow_above_min_score_allowed() {
+        let f = setup();
+        assert_borrow_ok(&f, 601); // 601 > 600
+    }
+
+    #[test]
+    fn test_set_min_credit_score_changes_gate() {
+        let f = setup();
+        f.pool.set_min_credit_score(&f.admin, &700);
+        assert_eq!(f.pool.get_min_credit_score(), 700);
+        // 650 now fails against the raised minimum.
+        assert_borrow_rejected(&f, 650);
+        // 700 passes.
+        assert_borrow_ok(&f, 700);
     }
 }

@@ -17,6 +17,8 @@ members = [
     "contracts/timelock",
     "contracts/payment_router",
     "contracts/dispute_evidence",
+    "contracts/lending_pool",
+    "contracts/credit_score",
     "tests",
 ]
 

@@ -22,7 +22,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use mentorminds_lending_pool::{Error as LpError, LendingPool, LendingPoolClient};
 use mentorminds_oracle::{OracleContract, OracleContractClient};
 use soroban_sdk::{
-    symbol_short,
+    contract, contractimpl, symbol_short,
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
     Address, Env,
@@ -31,6 +31,19 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Minimal credit-score contract that always returns a passing score, so that
+/// the lending pool's credit gate (issue #662) does not interfere with these
+/// flash-loan safeguard tests.
+#[contract]
+pub struct PassingCreditScore;
+
+#[contractimpl]
+impl PassingCreditScore {
+    pub fn get_score(_env: Env, _address: Address) -> u32 {
+        850
+    }
+}
 
 fn create_token<'a>(env: &'a Env, admin: &Address) -> (Address, StellarAssetClient<'a>) {
     let address = env
@@ -61,7 +74,7 @@ fn setup_pool<'a>(
 
     let admin = Address::generate(env);
     let lender = Address::generate(env);
-    let credit_score = Address::generate(env);
+    let credit_score = env.register_contract(None, PassingCreditScore);
     let (usdc, sac) = create_token(env, &admin);
     sac.mint(&lender, &pool_size);
 
