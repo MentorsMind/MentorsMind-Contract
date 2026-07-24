@@ -142,6 +142,44 @@ pub struct TokenApprovalEventData {
 }
 
 // ---------------------------------------------------------------------------
+// Graduated fee schedule (Issue #676)
+// ---------------------------------------------------------------------------
+
+/// Graduated platform-fee schedule.
+///
+/// The applicable base rate is selected by the mentor's staking tier
+/// (0 = none, 1 = Bronze, 2 = Silver, 3 = Gold). A session whose value exceeds
+/// `volume_discount_threshold` receives an additional `volume_discount_bps`
+/// reduction on the selected rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSchedule {
+    pub tier0_bps: u32,
+    pub tier1_bps: u32,
+    pub tier2_bps: u32,
+    pub tier3_bps: u32,
+    pub volume_discount_threshold: i128,
+    pub volume_discount_bps: u32,
+}
+
+/// Event data emitted whenever a graduated platform fee is applied on release.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeAppliedEventData {
+    pub mentor: Address,
+    pub tier: u32,
+    pub base_bps: u32,
+    pub effective_bps: u32,
+    pub fee_amount: i128,
+}
+
+/// Cross-contract view of the staking contract used to read a mentor's tier.
+#[soroban_sdk::contractclient(name = "StakingClient")]
+pub trait StakingTierTrait {
+    fn get_tier(env: Env, mentor: Address) -> u32;
+}
+
+// ---------------------------------------------------------------------------
 // DataKey enum — typed storage key for all persistent state
 // ---------------------------------------------------------------------------
 
@@ -155,6 +193,10 @@ pub enum DataKey {
     AutoRelDelay,
     Escrow(u64),
     ApprovedToken(Address),
+    /// Graduated fee schedule (Issue #676). When set, overrides the flat FeeBps.
+    FeeSchedule,
+    /// Address of the staking contract used to read mentor tiers.
+    StakingContract,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +508,145 @@ impl EscrowContract {
                     approved: false,
                 },
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Graduated fee schedule (Issue #676)
+    // -----------------------------------------------------------------------
+
+    /// Set the graduated fee schedule (admin only). Once set, releases use the
+    /// tier-based rates instead of the flat `FeeBps`.
+    pub fn set_fee_schedule(env: Env, admin: Address, schedule: FeeSchedule) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        // Each tier rate is capped at the same maximum as the flat fee.
+        if schedule.tier0_bps > MAX_FEE_BPS
+            || schedule.tier1_bps > MAX_FEE_BPS
+            || schedule.tier2_bps > MAX_FEE_BPS
+            || schedule.tier3_bps > MAX_FEE_BPS
+        {
+            panic!("Fee exceeds maximum (1000 bps)");
+        }
+
+        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    /// Get the current fee schedule, if one has been set.
+    pub fn get_fee_schedule(env: Env) -> Option<FeeSchedule> {
+        env.storage().persistent().get(&DataKey::FeeSchedule)
+    }
+
+    /// Set the staking contract address used to read mentor tiers (admin only).
+    pub fn set_staking_contract(env: Env, admin: Address, staking: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage().persistent().set(&DataKey::StakingContract, &staking);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::StakingContract, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    /// Read the mentor's staking tier via a cross-contract call. Returns 0 when
+    /// no staking contract is configured.
+    fn _mentor_tier(env: &Env, mentor: &Address) -> u32 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::StakingContract)
+        {
+            Some(staking) => StakingClient::new(env, &staking).get_tier(mentor),
+            None => 0,
+        }
+    }
+
+    /// Select the base bps for a tier from the schedule.
+    fn _tier_bps(schedule: &FeeSchedule, tier: u32) -> u32 {
+        match tier {
+            1 => schedule.tier1_bps,
+            2 => schedule.tier2_bps,
+            3 => schedule.tier3_bps,
+            _ => schedule.tier0_bps,
+        }
+    }
+
+    /// Compute the graduated platform fee for `mentor` on a session worth
+    /// `amount`, returning `(fee, tier, base_bps, effective_bps)`.
+    ///
+    /// The mentor's tier selects the base rate; a session whose value exceeds
+    /// the schedule's `volume_discount_threshold` receives an additional
+    /// `volume_discount_bps` reduction (never below zero).
+    fn _compute_fee_with_meta(
+        env: &Env,
+        schedule: &FeeSchedule,
+        mentor: &Address,
+        amount: i128,
+    ) -> (i128, u32, u32, u32) {
+        let tier = Self::_mentor_tier(env, mentor);
+        let base_bps = Self::_tier_bps(schedule, tier);
+        let effective_bps = if amount > schedule.volume_discount_threshold {
+            base_bps.saturating_sub(schedule.volume_discount_bps)
+        } else {
+            base_bps
+        };
+        let fee = amount
+            .checked_mul(effective_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        (fee, tier, base_bps, effective_bps)
+    }
+
+    /// Public view: compute the graduated platform fee for a mentor/amount.
+    ///
+    /// Falls back to the flat `FeeBps` rate when no fee schedule is configured.
+    pub fn compute_platform_fee(env: Env, mentor: Address, amount: i128) -> i128 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
+        {
+            Some(schedule) => {
+                let (fee, _, _, _) = Self::_compute_fee_with_meta(&env, &schedule, &mentor, amount);
+                fee
+            }
+            None => {
+                let fee_bps: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::FeeBps)
+                    .unwrap_or(DEFAULT_FEE_BPS);
+                amount
+                    .checked_mul(fee_bps as i128)
+                    .expect("Overflow")
+                    .checked_div(10_000)
+                    .expect("Division error")
+            }
         }
     }
 
@@ -1365,20 +1546,39 @@ impl EscrowContract {
     /// Shared release logic used by both `release_funds` and `try_auto_release`.
     fn _do_release(env: &Env, escrow: &mut Escrow, key: &(Symbol, u64)) {
         let release_amount = escrow.amount;
-        let fee_bps: u32 = env
+
+        // Prefer the graduated fee schedule (Issue #676) when configured;
+        // otherwise fall back to the flat FeeBps rate for backward compat.
+        let platform_fee: i128;
+        let mut fee_meta: Option<(u32, u32, u32)> = None; // (tier, base_bps, effective_bps)
+        if let Some(schedule) = env
             .storage()
             .persistent()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(DEFAULT_FEE_BPS);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
+        {
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            let (fee, tier, base_bps, effective_bps) =
+                Self::_compute_fee_with_meta(env, &schedule, &escrow.mentor, release_amount);
+            platform_fee = fee;
+            fee_meta = Some((tier, base_bps, effective_bps));
+        } else {
+            let fee_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::FeeBps)
+                .unwrap_or(DEFAULT_FEE_BPS);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            platform_fee = release_amount
+                .checked_mul(fee_bps as i128)
+                .expect("Overflow")
+                .checked_div(10_000)
+                .expect("Division error");
+        }
 
-        let platform_fee: i128 = release_amount
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
         let net_amount: i128 = release_amount
             .checked_sub(platform_fee)
             .expect("Underflow");
@@ -1428,6 +1628,21 @@ impl EscrowContract {
                 token_address: escrow.token_address.clone(),
             },
         );
+
+        // Graduated-fee observability: emit FeeApplied whenever the schedule
+        // was used to price this release (Issue #676).
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(env, "Escrow"), Symbol::new(env, "FeeApplied"), escrow.id),
+                FeeAppliedEventData {
+                    mentor: escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
     }
 
     /// Internal token whitelist setter. Stores approval state in persistent storage.
@@ -1650,7 +1865,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Ledger, Events},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, Vec, IntoVal, Symbol,
+        Address, Env, Vec, IntoVal, Symbol, TryFromVal,
     };
 
     // -----------------------------------------------------------------------
@@ -2568,5 +2783,142 @@ mod test {
         assert_eq!(token.balance(&f.mentor), mentor_start + 750);
         assert_eq!(token.balance(&f.learner), learner_start - 1_000 + 250);
         assert_eq!(token.balance(&f.contract_id), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Graduated fee schedule tests (Issue #676)
+    // -----------------------------------------------------------------------
+
+    #[contract]
+    pub struct MockStaking;
+
+    #[contractimpl]
+    impl MockStaking {
+        pub fn set_tier(env: Env, mentor: Address, tier: u32) {
+            env.storage().persistent().set(&mentor, &tier);
+        }
+        pub fn get_tier(env: Env, mentor: Address) -> u32 {
+            env.storage().persistent().get(&mentor).unwrap_or(0)
+        }
+    }
+
+    fn sample_schedule() -> FeeSchedule {
+        // tier0 highest, tier3 lowest; +100 bps discount above 10_000.
+        FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 10_000,
+            volume_discount_bps: 100,
+        }
+    }
+
+    /// Register a mock staking contract and install the sample fee schedule.
+    fn setup_graduated(f: &TestFixture) -> MockStakingClient<'static> {
+        let staking_id = f.env.register_contract(None, MockStaking);
+        let staking = MockStakingClient::new(&f.env, &staking_id);
+        let staking = unsafe {
+            core::mem::transmute::<MockStakingClient<'_>, MockStakingClient<'static>>(staking)
+        };
+        f.client().set_staking_contract(&f.admin, &staking_id);
+        f.client().set_fee_schedule(&f.admin, &sample_schedule());
+        staking
+    }
+
+    #[test]
+    fn test_gold_tier_pays_less_than_tier0() {
+        let f = TestFixture::setup();
+        let staking = setup_graduated(&f);
+
+        let gold = Address::generate(&f.env);
+        let none = Address::generate(&f.env);
+        staking.set_tier(&gold, &3);
+        staking.set_tier(&none, &0);
+
+        // Identical session value, below the discount threshold.
+        let amount = 1_000i128;
+        let fee_gold = f.client().compute_platform_fee(&gold, &amount);
+        let fee_none = f.client().compute_platform_fee(&none, &amount);
+
+        assert_eq!(fee_gold, 20); // 1000 * 200 / 10000
+        assert_eq!(fee_none, 50); // 1000 * 500 / 10000
+        assert!(fee_gold < fee_none, "Gold tier must pay a lower fee");
+    }
+
+    #[test]
+    fn test_volume_discount_applied_above_threshold() {
+        let f = TestFixture::setup();
+        let staking = setup_graduated(&f);
+
+        let mentor = Address::generate(&f.env);
+        staking.set_tier(&mentor, &0); // tier0 = 500 bps
+
+        // At/below threshold: full 500 bps.
+        let fee_below = f.client().compute_platform_fee(&mentor, &10_000);
+        assert_eq!(fee_below, 500); // 10_000 * 500 / 10000
+
+        // Above threshold: 500 - 100 = 400 effective bps.
+        let fee_above = f.client().compute_platform_fee(&mentor, &20_000);
+        assert_eq!(fee_above, 800); // 20_000 * 400 / 10000
+
+        // Same rate without discount would be 20_000 * 500 / 10000 = 1000.
+        assert!(fee_above < 1_000, "volume discount must reduce the fee");
+    }
+
+    #[test]
+    fn test_fee_never_exceeds_max_bps() {
+        // Property: fee <= amount * max_fee_bps / 10000 across tiers/amounts.
+        let f = TestFixture::setup();
+        let staking = setup_graduated(&f);
+        let schedule = sample_schedule();
+        let max_bps = schedule
+            .tier0_bps
+            .max(schedule.tier1_bps)
+            .max(schedule.tier2_bps)
+            .max(schedule.tier3_bps);
+
+        let mentor = Address::generate(&f.env);
+        for tier in 0u32..=3 {
+            staking.set_tier(&mentor, &tier);
+            for amount in [1i128, 100, 9_999, 10_000, 10_001, 50_000, 1_000_000] {
+                let fee = f.client().compute_platform_fee(&mentor, &amount);
+                let bound = amount * (max_bps as i128) / 10_000;
+                assert!(fee >= 0, "fee must be non-negative");
+                assert!(
+                    fee <= bound,
+                    "fee {} exceeded bound {} (tier {}, amount {})",
+                    fee,
+                    bound,
+                    tier,
+                    amount
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_graduated_release_charges_tier_fee_and_emits_event() {
+        // setup() uses flat fee_bps = 0, so a non-zero fee here proves the
+        // graduated schedule path was taken end-to-end through release.
+        let f = TestFixture::setup();
+        let staking = setup_graduated(&f);
+        staking.set_tier(&f.mentor, &3); // 200 bps
+
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().release_funds(&f.learner, &id);
+
+        // 1000 * 200 / 10000 = 20 fee to treasury; 980 to mentor.
+        assert_eq!(f.token().balance(&f.treasury), 20);
+        assert_eq!(f.token().balance(&f.mentor), 980);
+
+        // A FeeApplied event must have been emitted.
+        let applied = Symbol::new(&f.env, "FeeApplied");
+        let found = f.env.events().all().iter().any(|(_, topics, _)| {
+            topics
+                .iter()
+                .any(|t| Symbol::try_from_val(&f.env, &t).map(|s| s == applied).unwrap_or(false))
+        });
+        assert!(found, "FeeApplied event must be emitted on graduated release");
     }
 }
