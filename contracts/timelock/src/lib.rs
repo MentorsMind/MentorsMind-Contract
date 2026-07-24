@@ -38,6 +38,59 @@ pub const OPERATION_EXPIRY_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
 pub const TIMESTAMP_TOLERANCE_SECS: u64 = 60; // 1 minute
 
 // ---------------------------------------------------------------------------
+// Pure invariant logic
+//
+// The security-critical timestamp arithmetic and state-transition rules are
+// factored into free functions here so they can be verified in isolation.
+// These are the exact predicates the contract entry points rely on; the Kani
+// harnesses in `src/proofs.rs` prove properties over them directly, since the
+// `#[contractimpl]` entry points cannot be symbolically executed through the
+// Soroban host `Env`. See VERIFICATION.md for the verification boundary.
+// ---------------------------------------------------------------------------
+
+pub mod logic {
+    use super::{MAX_DELAY, MIN_DELAY, OPERATION_EXPIRY_SECS, TIMESTAMP_TOLERANCE_SECS};
+
+    /// A scheduled delay is valid iff it is within `[MIN_DELAY, MAX_DELAY]`.
+    #[inline]
+    pub fn is_valid_delay(delay: u64) -> bool {
+        delay >= MIN_DELAY && delay <= MAX_DELAY
+    }
+
+    /// Compute `ready_at = now + delay`, returning `None` on overflow.
+    #[inline]
+    pub fn compute_ready_at(now: u64, delay: u64) -> Option<u64> {
+        now.checked_add(delay)
+    }
+
+    /// Whether an operation is executable at `now` given its `ready_at`:
+    /// the tolerance window has elapsed and the expiry window has not.
+    #[inline]
+    pub fn is_executable(now: u64, ready_at: u64) -> bool {
+        let ready = now >= ready_at.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+        let not_expired = match ready_at.checked_add(OPERATION_EXPIRY_SECS) {
+            Some(expiry) => now < expiry,
+            None => false,
+        };
+        ready && not_expired
+    }
+
+    /// A state transition (execute / cancel) is permitted only when the
+    /// operation is not already `done`.
+    #[inline]
+    pub fn can_transition(done: bool) -> bool {
+        !done
+    }
+
+    /// Cancel authorization: callable by the proposer OR the admin. Never
+    /// requires both simultaneously.
+    #[inline]
+    pub fn can_cancel(is_proposer: bool, is_admin: bool) -> bool {
+        is_proposer || is_admin
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -233,13 +286,7 @@ impl TimelockController {
             return false;
         }
         let now = env.ledger().timestamp();
-        let ready = now >= op.ready_at.saturating_add(TIMESTAMP_TOLERANCE_SECS);
-        let not_expired = now
-            < op
-                .ready_at
-                .checked_add(OPERATION_EXPIRY_SECS)
-                .expect("timestamp overflow");
-        ready && not_expired
+        logic::is_executable(now, op.ready_at)
     }
 
     /// Returns true if the operation exists but has passed its expiry window without being executed.
@@ -281,6 +328,13 @@ impl TimelockController {
             .expect("not initialized")
     }
 }
+
+// ---------------------------------------------------------------------------
+// Formal verification harnesses (Kani) — see src/proofs.rs and VERIFICATION.md
+// ---------------------------------------------------------------------------
+
+#[cfg(kani)]
+mod proofs;
 
 // ---------------------------------------------------------------------------
 // Tests

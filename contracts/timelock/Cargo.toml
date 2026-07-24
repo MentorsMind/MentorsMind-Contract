@@ -14,5 +14,17 @@ shared = { path = "../shared" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
+# Kani formal-verification harness (Issue #622).
+#
+# NOTE ON THE KANI DEPENDENCY: the `kani` library crate is NOT a normal
+# crates.io dependency — it is injected automatically by the `cargo kani`
+# driver when it compiles this crate under `--cfg kani`. Adding a resolvable
+# `kani = "..."` entry would force `cargo build`/`cargo test` to resolve a
+# package that does not exist on the registry and break the normal build, so it
+# is intentionally omitted. The proofs in `src/proofs.rs` are gated behind
+# `#[cfg(kani)]` and only compile under the driver. Install it with
+# `cargo install kani-verifier` and run `cargo kani` from this crate.
+# See VERIFICATION.md for details.
+
 [features]
 testutils = ["soroban-sdk/testutils"]

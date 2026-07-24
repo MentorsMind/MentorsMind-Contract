@@ -1,0 +1,56 @@
+name: Kani Formal Verification (Timelock)
+
+# Optional / non-blocking formal-verification job for the TimelockController
+# (Issue #622). It proves the timelock's timestamp-arithmetic and
+# state-transition invariants with the Kani model checker.
+#
+# This job is intentionally NOT a required check: `continue-on-error: true`
+# means a failure here never blocks a PR's required status checks. It exists to
+# surface regressions in the verified invariants without gating merges.
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'contracts/timelock/**'
+      - '.github/workflows/kani.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'contracts/timelock/**'
+      - '.github/workflows/kani.yml'
+  workflow_dispatch: {}
+
+jobs:
+  kani:
+    name: Verify timelock invariants (optional)
+    runs-on: ubuntu-latest
+    # Non-blocking: this job may fail without failing the overall workflow's
+    # required checks.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+
+      - name: Run Kani proofs
+        working-directory: contracts/timelock
+        run: cargo kani --output-format terse
