@@ -1,0 +1,42 @@
+# MentorMinds Contract Repository Test Inventory
+
+This file documents the current test files that have been added to the repository.
+
+## Run tests
+
+- `cargo test --workspace`
+- `cargo test --manifest-path escrow/Cargo.toml`
+
+## Root workspace test files
+
+- `tests/upgrade_test.rs`
+- `tests/state_machine_tests.rs`
+- `tests/sig_validation_tests.rs`
+- `tests/oracle_manipulation_tests.rs`
+- `tests/integration_test.rs`
+- `tests/flash_loan_tests.rs`
+- `tests/economic_attacks.rs`
+- `tests/benchmarks.rs`
+
+## Root workspace test modules
+
+- `tests/multi_mentor/mod.rs`
+- `tests/interoperability/mod.rs`
+- `tests/interoperability/reputation_escrow.rs`
+- `tests/interoperability/lending_credit.rs`
+- `tests/interoperability/health_dashboard.rs`
+- `tests/interoperability/governance_chain.rs`
+- `tests/interoperability/escrow_token.rs`
+- `tests/interoperability/escrow_compliance.rs`
+- `tests/cancellation/mod.rs`
+
+## Contract-specific test files
+
+- `escrow/tests/escrow_test.rs`
+- `contracts/kyc_registry/src/test.rs`
+
+## Notes
+
+- This inventory includes the test files currently present in the repository.
+- Some test helper modules (for example, `contracts/escrow_factory/src/testutils.rs`) are not listed here because they are helpers, not standalone test cases.
+- If new tests are added later, add them to this file to keep the repository test inventory up to date.

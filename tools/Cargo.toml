@@ -1,0 +1,16 @@
+[package]
+name = "state-transition-analyzer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[bin]]
+name = "analyze-transitions"
+path = "src/main.rs"
+
+[lib]
+name = "state_transition_analyzer"
+path = "src/lib.rs"

@@ -1,0 +1,119 @@
+[
+  {
+    "contract": "escrow",
+    "entry_point": "create_escrow",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "release_funds",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "dispute",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "resolve_dispute",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "staking",
+    "entry_point": "stake",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "staking",
+    "entry_point": "unstake",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "staking",
+    "entry_point": "distribute_revenue_batch",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "staking",
+    "entry_point": "claim_rewards",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "governance",
+    "entry_point": "create_proposal",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "governance",
+    "entry_point": "vote",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "governance",
+    "entry_point": "execute_proposal",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "timelock",
+    "entry_point": "schedule",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "timelock",
+    "entry_point": "execute",
+    "cpu_instructions": 0,
+    "mem_bytes": 0,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  }
+]

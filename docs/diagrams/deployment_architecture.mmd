@@ -1,0 +1,12 @@
+flowchart TB
+    subgraph testnet[Testnet]
+      t1[deploy.sh --network testnet]
+      t2[deployed/testnet.json]
+      t1 --> t2
+    end
+
+    subgraph mainnet[Mainnet]
+      m1[deploy.sh --network mainnet]
+      m2[deployed/mainnet.json]
+      m1 --> m2
+    end

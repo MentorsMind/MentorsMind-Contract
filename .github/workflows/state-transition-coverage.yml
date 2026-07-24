@@ -1,0 +1,90 @@
+name: State Transition Coverage Analysis
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'contracts/**'
+      - 'tests/**'
+      - 'tools/**'
+      - '.github/workflows/state-transition-coverage.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'contracts/**'
+      - 'tests/**'
+      - 'tools/**'
+
+jobs:
+  analyze-coverage:
+    runs-on: ubuntu-latest
+    name: Analyze State Transition Coverage
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85'
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run state transition analyzer
+        run: |
+          bash scripts/analyze-state-transitions.sh
+        env:
+          COVERAGE_GATE: 40
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: state-transition-coverage-reports
+          path: analysis_output/
+          retention-days: 30
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const coverage = JSON.parse(fs.readFileSync('analysis_output/coverage_report.json', 'utf8'));
+            const report = fs.readFileSync('analysis_output/coverage_report.md', 'utf8');
+            
+            const comment = `## 📊 State Transition Coverage Analysis
+
+            **Overall Coverage**: ${coverage.overall_coverage.toFixed(2)}%
+
+            ${report}
+
+            *Generated at ${coverage.generated_at}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

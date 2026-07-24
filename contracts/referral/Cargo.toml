@@ -1,0 +1,20 @@
+[package]
+name = "mentorminds-referral"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+shared = { path = "../shared" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+mentorminds-mnt-token = { path = "../mnt-token" }
+mentorminds-referral-leaderboard = { path = "../referral_leaderboard" }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

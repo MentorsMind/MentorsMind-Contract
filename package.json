@@ -1,0 +1,55 @@
+{
+  "name": "mentorminds-contracts",
+  "version": "1.0.0",
+  "description": "MentorMinds Stellar Smart Contracts - Local Development Environment",
+  "main": "index.js",
+  "scripts": {
+    "local:start": "bash scripts/setup-local.sh",
+    "local:start:windows": "scripts\\setup-local.bat",
+    "local:stop": "docker-compose down",
+    "local:reset": "pnpm run local:stop && docker volume rm mentorminds-contract_stellar_data 2>/dev/null || true && pnpm run local:start",
+    "local:seed": "bash scripts/seed-local.sh",
+    "local:status": "docker-compose ps && echo '--- Horizon: http://localhost:8000' && echo '--- Soroban RPC: http://localhost:8003' && echo '--- Friendbot: http://localhost:8002'",
+    "local:logs": "docker-compose logs -f",
+    "build": "cargo build --workspace --target wasm32-unknown-unknown --release",
+    "build:escrow": "cd escrow && cargo build --target wasm32-unknown-unknown --release",
+    "build:verification": "cd contracts/verification && cargo build --target wasm32-unknown-unknown --release",
+    "build:oracle": "cd contracts/oracle && cargo build --target wasm32-unknown-unknown --release",
+    "build:timelock": "cd contracts/timelock && cargo build --target wasm32-unknown-unknown --release",
+    "optimize": "soroban contract optimize --wasm escrow/target/wasm32-unknown-unknown/release/mentorminds_escrow.wasm && soroban contract optimize --wasm contracts/verification/target/wasm32-unknown-unknown/release/mentorminds_verification.wasm && soroban contract optimize --wasm contracts/oracle/target/wasm32-unknown-unknown/release/mentorminds_oracle.wasm && soroban contract optimize --wasm contracts/timelock/target/wasm32-unknown-unknown/release/mentorminds_timelock.wasm",
+    "test": "cargo test --workspace",
+    "clean": "cargo clean && rm -rf deployed/*.json deployed/*.wasm"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "smart-contracts",
+    "escrow",
+    "blockchain",
+    "mentoring",
+    "local-development"
+  ],
+  "dependencies": {
+    "@stellar/freighter-api": "^1.7.1",
+    "@stellar/stellar-sdk": "^14.6.1",
+    "node-fetch": "^3.3.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "author": "MentorMinds Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MentorsMind/MentorsMind-Contract.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.19.37",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.2"
+  }
+}

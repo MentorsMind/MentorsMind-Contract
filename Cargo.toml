@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "contracts/governance",
+    "contracts/staking",
     "escrow",
     "shared",
     "rbac",
@@ -11,6 +13,19 @@ members = [
     "upgrade_registry",
     # "multisig",
     # "payment-router",
+    "multisig",
+    "tools",
+    "contracts/health_dashboard",
+    "contracts/mnt-token",
+    "contracts/shared",
+    "contracts/verification",
+    "contracts/referral",
+    "contracts/referral_leaderboard",
+    "benchmarks",
+    "contracts/treasury",
+    "contracts/timelock",
+    "contracts/payment_router",
+    "contracts/dispute_evidence",
 ]
 
 [workspace.package]
@@ -20,6 +35,8 @@ rust-version = "1.70"
 
 [workspace.dependencies]
 soroban-sdk = "21.7.7"
+soroban-sdk = "21.0.0"
+soroban-token-sdk = "21.0.0"
 
 [profile.release]
 opt-level = "z"

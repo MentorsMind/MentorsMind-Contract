@@ -1,0 +1,5 @@
+flowchart LR
+    users[Learner/Mentor Clients] --> backend[MentorMinds Backend]
+    backend --> contracts[Soroban Contracts]
+    contracts --> stellar[Stellar Network]
+    deploy[Deployment Scripts] --> contracts

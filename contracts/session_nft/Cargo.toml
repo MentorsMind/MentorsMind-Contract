@@ -1,0 +1,17 @@
+[package]
+name = "mentorminds-session-nft"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

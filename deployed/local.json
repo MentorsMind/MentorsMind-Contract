@@ -1,0 +1,22 @@
+{
+  "network": "standalone",
+  "deployed_at": "2024-01-01T00:00:00Z",
+  "contracts": {
+    "escrow": {
+      "contract_id": "",
+      "wasm_path": "escrow/target/wasm32-unknown-unknown/release/mentorminds_escrow.wasm"
+    },
+    "verification": {
+      "contract_id": "",
+      "wasm_path": "contracts/verification/target/wasm32-unknown-unknown/release/mentorminds_verification.wasm"
+    },
+    "oracle": {
+      "contract_id": "",
+      "wasm_path": "contracts/oracle/target/wasm32-unknown-unknown/release/mentorminds_oracle.wasm"
+    },
+    "timelock": {
+      "contract_id": "",
+      "wasm_path": "contracts/timelock/target/wasm32-unknown-unknown/release/mentorminds_timelock.wasm"
+    }
+  }
+}

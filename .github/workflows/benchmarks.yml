@@ -1,0 +1,179 @@
+name: Soroban Benchmarks
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'escrow/**'
+      - 'contracts/staking/**'
+      - 'contracts/governance/**'
+      - 'contracts/timelock/**'
+      - 'contracts/shared/**'
+      - 'benchmarks/**'
+      - '.github/workflows/benchmarks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'escrow/**'
+      - 'contracts/staking/**'
+      - 'contracts/governance/**'
+      - 'contracts/timelock/**'
+      - 'contracts/shared/**'
+      - 'benchmarks/**'
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: 'Write results as new baseline (overrides baselines.json)'
+        required: false
+        default: 'false'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85'
+          targets: wasm32-unknown-unknown
+
+      # Layered caching: registry index, downloaded crates, compiled artifacts
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-reg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-reg-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('benchmarks/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-build-bench-
+
+      # Build WASM binaries first so wasm_bytes metrics are populated
+      - name: Build WASM binaries (release)
+        run: |
+          cargo build \
+            --target wasm32-unknown-unknown \
+            --release \
+            -p mentorminds-escrow \
+            -p mentorminds-staking \
+            -p mentorminds-governance \
+            -p mentorminds-timelock
+
+      # Run the benchmark binary; exits 1 on >10% regression
+      - name: Run benchmarks
+        id: bench
+        run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
+
+      # On workflow_dispatch with update_baseline=true, commit the new baseline
+      - name: Update baseline (manual trigger only)
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.update_baseline == 'true'
+        run: |
+          cp benchmarks/results/report.json benchmarks/baselines.json
+          echo "Baseline updated from latest run."
+
+      - name: Commit updated baseline
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.update_baseline == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(bench): update performance baselines'
+          file_pattern: benchmarks/baselines.json
+
+      # Always upload reports so they're accessible from the Actions summary
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report-${{ github.sha }}
+          path: |
+            benchmarks/results/report.json
+            benchmarks/results/report.html
+            benchmarks/results/bench.log
+          retention-days: 90
+
+      # Post a summary table to the PR as a comment
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'benchmarks/results/report.json';
+            if (!fs.existsSync(reportPath)) {
+              console.log('No report.json found — skipping comment');
+              return;
+            }
+
+            const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+            const passed = '${{ steps.bench.outcome }}' === 'success';
+            const icon = passed ? '✅' : '❌';
+
+            // Build markdown table
+            let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | WASM Size |\n';
+            table    += '|----------|-------------|-----------------|---------------|----------|\n';
+
+            let prevContract = '';
+            for (const r of results) {
+              const sep = r.contract !== prevContract ? `**${r.contract}**` : '';
+              prevContract = r.contract;
+              const wasm = r.wasm_bytes > 0
+                ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
+                : 'N/A';
+              table += `| ${sep} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${wasm} |\n`;
+            }
+
+            const body = `## ${icon} Soroban Benchmark Results
+
+            ${table}
+
+            > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+            > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Soroban Benchmark Results')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

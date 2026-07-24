@@ -1,0 +1,10 @@
+{
+  "_template": true,
+  "_comment": "Copy this file to testnet.json / mainnet.json. Real files are gitignored.",
+  "network": "",
+  "admin": "",
+  "deployed_at": "",
+  "escrow": "",
+  "verification": "",
+  "mnt_token": ""
+}

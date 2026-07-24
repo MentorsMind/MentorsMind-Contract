@@ -1,0 +1,3 @@
+# Ignore real deployment outputs; keep only the template.
+testnet.json
+mainnet.json

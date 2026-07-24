@@ -1,0 +1,195 @@
+﻿cargo : warning: 
+profiles for the non 
+root package will be 
+ignored, specify 
+profiles at the 
+workspace root:
+At line:1 char:1
++ cargo build --target 
+wasm32-unknown-unknown 
+--release -p 
+mentorminds- ...
++ ~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (warning: prof   
+ il...workspace roo    
+t::String) [], Rem    
+oteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\escrow\Cargo.
+toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\int
+erface_registry\Cargo.t
+oml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\ver
+ification\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\pay
+ment_router\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\ref
+erral\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\mnt
+-token\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\sta
+king\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\tre
+asury\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+warning: profiles for 
+the non root package 
+will be ignored, 
+specify profiles at 
+the workspace root:
+package:   C:\Users\USE
+R\Documents\MentorsMind
+-Contract\contracts\ves
+ting\Cargo.toml
+workspace: C:\Users\USE
+R\Documents\MentorsMind
+-Contract\Cargo.toml
+   Compiling 
+proc-macro2 v1.0.106
+   Compiling quote 
+v1.0.45
+   Compiling 
+serde_core v1.0.228
+   Compiling zmij 
+v1.0.21
+   Compiling serde 
+v1.0.228
+   Compiling 
+serde_json v1.0.149
+   Compiling strsim 
+v0.11.1
+   Compiling 
+ident_case v1.0.1
+error: linker 
+`link.exe` not found
+  |
+  = note: program not 
+found
+
+note: the msvc targets 
+depend on the msvc 
+linker but `link.exe` 
+was not found
+
+note: please ensure 
+that Visual Studio 
+2017 or later, or 
+Build Tools for Visual 
+Studio were installed 
+with the Visual C++ 
+option.
+
+note: VS Code is a 
+different product, and 
+is not sufficient.
+
+error: could not 
+compile `serde_json` 
+(build script) due to 
+1 previous error
+warning: build failed, 
+waiting for other jobs 
+to finish...
+error: could not 
+compile `zmij` (build 
+script) due to 1 
+previous error
+error: could not 
+compile `quote` (build 
+script) due to 1 
+previous error
+error: could not 
+compile `serde` (build 
+script) due to 1 
+previous error
+error: could not 
+compile `serde_core` 
+(build script) due to 
+1 previous error
+error: could not 
+compile `proc-macro2` 
+(build script) due to 
+1 previous error

@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  stellar:
+    image: stellar/quickstart:latest
+    container_name: mentorminds-stellar
+    ports:
+      - "8000:8000"   # Horizon API
+      - "8001:8001"   # Stellar RPC
+      - "8002:8002"   # Friendbot (for funding accounts)
+      - "8003:8003"   # Soroban RPC
+    environment:
+      - STELLAR_NETWORK=standalone
+      - CATCHUP_COMPLETE=true
+      - ENABLE_SOROBAN_RPC=true
+      - ENABLE_SOROBAN_HTTP=true
+      - ENABLE_FRIENDBOT=true
+      - FRIENDBOT_URL=http://localhost:8002
+      - HORIZON_URL=http://localhost:8000
+      - RPC_URL=http://localhost:8001
+      - SOROBAN_RPC_URL=http://localhost:8003
+    volumes:
+      - stellar_data:/opt/stellar
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  stellar_data:

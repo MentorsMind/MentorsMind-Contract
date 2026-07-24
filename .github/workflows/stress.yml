@@ -1,0 +1,29 @@
+name: Stress Tests
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  stress-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r tests/stress/requirements.txt
+      - name: Run small stress sample
+        run: |
+          # CI runs a small-sample check only (100 requests) to validate the harness
+          ./scripts/stress_test.sh --endpoint http://127.0.0.1:1317 --count 100 --concurrency 10 --create-path /escrow/create --query-path /escrow/list || true
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-results
+          path: tests/stress/results || ''

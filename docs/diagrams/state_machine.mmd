@@ -1,0 +1,10 @@
+stateDiagram-v2
+    [*] --> Active: create_escrow
+    Active --> Released: release_funds
+    Active --> Released: try_auto_release
+    Active --> Disputed: dispute
+    Active --> Refunded: refund
+    Disputed --> Resolved: resolve_dispute
+    Released --> [*]
+    Refunded --> [*]
+    Resolved --> [*]

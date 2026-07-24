@@ -1,0 +1,23 @@
+{
+  "name": "@mentorminds/contracts-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "generate": "npm run generate:escrow && npm run generate:reputation && npm run generate:session_registry && npm run generate:token && npm run generate:staking",
+    "generate:escrow": "stellar contract bindings typescript --wasm ../../target/wasm32-unknown-unknown/release/mentorminds_escrow.wasm --output-dir ./src/generated/escrow --overwrite --contract-id CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEZV --network testnet",
+    "generate:reputation": "stellar contract bindings typescript --wasm ../../target/wasm32-unknown-unknown/release/mentorminds_verification.wasm --output-dir ./src/generated/reputation --overwrite --contract-id CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEZV --network testnet",
+    "generate:session_registry": "stellar contract bindings typescript --wasm ../../target/wasm32-unknown-unknown/release/mentorminds_session_nft.wasm --output-dir ./src/generated/session_registry --overwrite --contract-id CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEZV --network testnet",
+    "generate:token": "stellar contract bindings typescript --wasm ../../target/wasm32-unknown-unknown/release/mentorminds_mnt_token.wasm --output-dir ./src/generated/token --overwrite --contract-id CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEZV --network testnet",
+    "generate:staking": "stellar contract bindings typescript --wasm ../../target/wasm32-unknown-unknown/release/mentorminds_staking.wasm --output-dir ./src/generated/staking --overwrite --contract-id CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEZV --network testnet",
+    "build": "npm run generate && tsc"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^12.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vitest": "^3.2.4"
+  }
+}
