@@ -1,6 +1,14 @@
 [workspace]
+resolver = "2"
 members = [
     "escrow",
+    "shared",
+    "rbac",
+    "treasury",
+    "staking",
+    "governance",
+    "timelock",
+    "upgrade_registry",
     # "multisig",
     # "payment-router",
 ]
@@ -11,7 +19,7 @@ edition = "2021"
 rust-version = "1.70"
 
 [workspace.dependencies]
-soroban-sdk = "21.0.0"
+soroban-sdk = "21.7.7"
 
 [profile.release]
 opt-level = "z"
