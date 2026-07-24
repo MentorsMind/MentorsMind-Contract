@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::contracterror;
+use soroban_sdk::{contracterror, contracttype, Address, Symbol};
 
 /// Shared contract primitives reused across multiple Soroban modules.
 ///
@@ -23,6 +23,17 @@ pub use sig_validation::{
 pub use state_machine::StateMachine;
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
+
+/// Slash record for tracking slashing events across the protocol
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashRecord {
+    pub amount: i128,
+    pub slash_bps: u32,
+    pub reason: Symbol,
+    pub timestamp: u64,
+    pub governance_proposal_id: Option<u32>,
+}
 
 /// Common error codes shared across all MentorsMind contracts.
 ///

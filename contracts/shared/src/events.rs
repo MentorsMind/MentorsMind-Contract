@@ -235,6 +235,7 @@ pub fn evt_gov_appeal_resolved(env: &Env)   -> Symbol { Symbol::new(env, "appeal
 // --- staking ---
 pub fn evt_staking_staked(env: &Env)    -> Symbol { Symbol::new(env, "staked") }
 pub fn evt_staking_unstaked(env: &Env)  -> Symbol { Symbol::new(env, "unstaked") }
+pub fn evt_staking_slashed(env: &Env)   -> Symbol { Symbol::new(env, "slashed") }
 
 // --- timelock ---
 pub fn evt_timelock_init(env: &Env)     -> Symbol { Symbol::new(env, "initialized") }
