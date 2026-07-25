@@ -1,0 +1,19 @@
+[package]
+name = "mentorminds-treasury"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+mentorminds-shared = { path = "../shared" }
+mentorminds-rbac = { path = "../rbac" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
