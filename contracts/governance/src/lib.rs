@@ -17,6 +17,7 @@ use soroban_sdk::{
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const TOKEN: Symbol = symbol_short!("TOKEN");
 const SNAPSHOT: Symbol = symbol_short!("SNAPSHOT");
+const DELEGATION: Symbol = symbol_short!("DELEGATN");
 const PROPOSAL_COUNT: Symbol = symbol_short!("PROP_CNT");
 const VOTING_PERIOD_SECS: Symbol = symbol_short!("VOT_PER");
 const QUORUM_BPS: Symbol = symbol_short!("QRM_BPS");
@@ -87,6 +88,7 @@ pub enum DataKey {
     Vote(u32, Address),
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
+    DelegationContract,
     Timelock,
     Arbitrator(Address),
     ArbitratorAt(u32),
@@ -135,6 +137,7 @@ impl GovernanceContract {
         admin: Address,
         mnt_token: Address,
         snapshot_contract: Address,
+        delegation_contract: Option<Address>,
         voting_period_secs: Option<u64>,
         quorum_bps: Option<u32>,
     ) {
@@ -169,6 +172,10 @@ impl GovernanceContract {
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
 
+        if let Some(del_addr) = delegation_contract {
+            env.storage().instance().set(&DELEGATION, &del_addr);
+            env.storage().persistent().set(&DELEGATION, &del_addr);
+        }
     }
 
     pub fn set_timelock(env: Env, timelock: Address) {
@@ -295,11 +302,31 @@ impl GovernanceContract {
             .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
-        let weight: i128 = env.invoke_contract(
+        let snapshot_weight: i128 = env.invoke_contract(
             &snapshot_contract,
             &Symbol::new(&env, "get_voting_power"),
             (proposal_id, voter.clone()).into_val(&env),
         );
+
+        // Include delegated voting power if delegation contract is configured
+        let delegated_power: i128 = if env.storage().instance().has(&DELEGATION) {
+            let delegation_contract: Address = env
+                .storage()
+                .instance()
+                .get(&DELEGATION)
+                .expect("delegation not set");
+            env.invoke_contract(
+                &delegation_contract,
+                &Symbol::new(&env, "get_delegated_power_at_snapshot"),
+                (voter.clone(), proposal.snapshot_ledger).into_val(&env),
+            )
+        } else {
+            0
+        };
+
+        let weight = snapshot_weight
+            .checked_add(delegated_power)
+            .expect("weight overflow");
 
         if weight <= 0 {
             panic!("no voting power");
@@ -820,6 +847,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -864,6 +892,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -908,6 +937,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -951,7 +981,7 @@ mod tests {
         snapshot.set_token(&token_id);
         let admin = Address::generate(env);
         let voter = Address::generate(env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(&admin, &token_id, &snapshot_id, &None, &Some(10u64), &Some(1_000u32));
         token.set_total_supply(&1_000i128);
         token.set_balance(&voter, &600i128);
         (gov, admin, voter, token_id, snapshot_id)
@@ -1042,7 +1072,7 @@ mod tests {
         let gov = GovernanceContractClient::new(&env, &gov_id);
 
         let admin = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(&admin, &token_id, &snapshot_id, &None, &Some(10u64), &Some(1_000u32));
 
         let a1 = Address::generate(&env);
         let a2 = Address::generate(&env);
@@ -1076,6 +1106,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1124,6 +1155,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1182,14 +1214,16 @@ mod tests {
 
         let admin = Address::generate(&env);
         let proposer = Address::generate(&env);
-        gov.initialize(
+gov.initialize(
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
 
+        // Token values aren't used for cancellation of an Active proposal.
         token.set_total_supply(&1_000i128);
         token.set_balance(&proposer, &200i128);
 
@@ -1235,11 +1269,10 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &None,
             &Some(10u64),
             &Some(1_000u32),
         );
-        
-        // Admin needs auth to set timelock
         gov.set_timelock(&timelock_id);
 
         token.set_total_supply(&1_000i128);
@@ -1269,6 +1302,178 @@ mod tests {
 
         let proposal = gov.get_proposal(&proposal_id);
         assert_eq!(proposal.status, ProposalStatus::Queued);
+    }
+
+    #[contract]
+    pub struct MockDelegationForGov;
+
+    #[contractimpl]
+    impl MockDelegationForGov {
+        pub fn set_delegated_power(env: Env, delegate: Address, snapshot_id: u32, amount: i128) {
+            env.storage().persistent().set(&(symbol_short!("DEL_POW"), snapshot_id, delegate), &amount);
+        }
+        pub fn set_delegated_away(env: Env, voter: Address, snapshot_id: u32) {
+            env.storage().persistent().set(&(symbol_short!("DEL_AWAY"), snapshot_id, voter), &true);
+        }
+        pub fn get_delegated_power_at_snapshot(env: Env, delegate: Address, snapshot_id: u32) -> i128 {
+            // If this address delegated away at snapshot time, return 0
+            if env.storage().persistent().has(&(symbol_short!("DEL_AWAY"), snapshot_id, delegate.clone())) {
+                return 0;
+            }
+            env.storage().persistent().get(&(symbol_short!("DEL_POW"), snapshot_id, delegate)).unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn test_delegation_weighted_vote() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let del_id = env.register_contract(None, MockDelegationForGov);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let del = MockDelegationForGovClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let delegator = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(del_id),
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        token.set_total_supply(&10_000i128);
+        token.set_balance(&voter, &100i128);
+        token.set_balance(&delegator, &200i128);
+
+        // Setup: voter has 100 own + 200 delegated = 300 weight
+        del.set_delegated_power(&voter, &1, &200i128);
+
+        let title = Bytes::from_slice(&env, b"Delegate-weighted vote");
+        let description_hash = BytesN::from_array(&env, &[14u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(300),
+        );
+
+        // proposal_id = 1, snapshot_ledger should be 1 (from record_snapshot call)
+        gov.vote(&voter, &proposal_id, &true);
+
+        let weight = gov.get_vote_weight(&proposal_id, &voter);
+        assert_eq!(weight, 300i128);
+
+        // Verify total votes
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.votes_for, 300i128);
+    }
+
+    #[test]
+    fn test_delegated_away_voter_has_zero_weight() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let del_id = env.register_contract(None, MockDelegationForGov);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let del = MockDelegationForGovClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(del_id),
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        token.set_total_supply(&10_000i128);
+        token.set_balance(&voter, &100i128);
+
+        // Voter delegated away at snapshot time
+        del.set_delegated_away(&voter, &1);
+
+        let title = Bytes::from_slice(&env, b"Delegated away vote");
+        let description_hash = BytesN::from_array(&env, &[15u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(400),
+        );
+
+        gov.try_vote(&voter, &proposal_id, &true).unwrap_err();
+    }
+
+    #[test]
+    fn test_delegation_changes_after_snapshot_do_not_affect_vote() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let del_id = env.register_contract(None, MockDelegationForGov);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let del = MockDelegationForGovClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(del_id),
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        token.set_total_supply(&10_000i128);
+        token.set_balance(&voter, &100i128);
+
+        // Delegated power at snapshot 1: 200
+        del.set_delegated_power(&voter, &1, &200i128);
+
+        let title = Bytes::from_slice(&env, b"Snapshot isolation test");
+        let description_hash = BytesN::from_array(&env, &[16u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(500),
+        );
+
+        // Change delegation AFTER snapshot (simulate by changing mock data)
+        del.set_delegated_power(&voter, &1, &9999i128); // Should not affect vote
+
+        gov.vote(&voter, &proposal_id, &true);
+
+        // Weight should still be 300 (100 own + 200 delegated at snapshot), not 100+9999
+        let weight = gov.get_vote_weight(&proposal_id, &voter);
+        assert_eq!(weight, 300i128);
     }
 }
 

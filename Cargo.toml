@@ -1,9 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
+    "contracts/delegation",
     "contracts/governance",
+    "contracts/snapshot",
     "contracts/staking",
     "escrow",
+<<<<<<< Updated upstream
+=======
+    "shared",
+    "rbac",
+>>>>>>> Stashed changes
     "multisig",
     "tools",
     "contracts/health_dashboard",
@@ -26,7 +33,11 @@ edition = "2021"
 rust-version = "1.70"
 
 [workspace.dependencies]
+<<<<<<< Updated upstream
 soroban-sdk = "21.0.0"
+=======
+soroban-sdk = "21.7.7"
+>>>>>>> Stashed changes
 soroban-token-sdk = "21.0.0"
 
 [profile.release]

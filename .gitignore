@@ -36,3 +36,4 @@ analysis_output/
 issue.md
 node_modules/
 package-lock.json.bk
+.opencode
