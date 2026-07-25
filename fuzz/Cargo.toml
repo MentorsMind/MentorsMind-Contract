@@ -1,0 +1,57 @@
+[package]
+name = "mentormind-fuzz"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+# Intentionally excluded from the workspace members list so it does not
+# affect the production build or CI artifact sizes.
+#
+# Run all property-based fuzz tests (10 000 iterations each) with:
+#   cargo test --manifest-path fuzz/Cargo.toml
+#
+# Run individual fuzz targets with:
+#   cargo test --manifest-path fuzz/Cargo.toml --test fuzz_proposal_creation
+#   cargo test --manifest-path fuzz/Cargo.toml --test fuzz_signature_aggregation
+#   cargo test --manifest-path fuzz/Cargo.toml --test fuzz_threshold_modifications
+#   cargo test --manifest-path fuzz/Cargo.toml --test fuzz_proposal_expiration
+#   cargo test --manifest-path fuzz/Cargo.toml --test fuzz_timelock_schedule_exec
+#   cargo test --manifest-path fuzz/Cargo.toml --test fuzz_stateful_harness
+#
+# Run with more iterations for deeper coverage:
+#   PROPTEST_CASES=100000 cargo test --manifest-path fuzz/Cargo.toml
+#
+# Enable cargo-fuzz (libFuzzer) coverage-guided fuzzing:
+#   cargo install cargo-fuzz
+#   cargo fuzz run --manifest-path fuzz/Cargo.toml <target>
+
+[dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[[test]]
+name = "fuzz_proposal_creation"
+path = "fuzz_targets/fuzz_proposal_creation.rs"
+
+[[test]]
+name = "fuzz_signature_aggregation"
+path = "fuzz_targets/fuzz_signature_aggregation.rs"
+
+[[test]]
+name = "fuzz_threshold_modifications"
+path = "fuzz_targets/fuzz_threshold_modifications.rs"
+
+[[test]]
+name = "fuzz_proposal_expiration"
+path = "fuzz_targets/fuzz_proposal_expiration.rs"
+
+[[test]]
+name = "fuzz_timelock_schedule_exec"
+path = "fuzz_targets/fuzz_timelock_schedule_exec.rs"
+
+[[test]]
+name = "fuzz_stateful_harness"
+path = "fuzz_targets/fuzz_stateful_harness.rs"
+
+[profile.release]
+opt-level = 3
+debug = 1
+overflow-checks = true

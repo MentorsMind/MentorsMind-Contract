@@ -415,4 +415,24 @@ mod tests {
         assert_eq!(f.velocity().get_tier(&f.user), LimitTier::Enhanced);
         assert!(f.velocity().check_and_record(&f.user, &2_000));
     }
+
+    #[test]
+    fn test_kyc_expiry_drops_velocity_tier_to_basic() {
+        // Simulates issue #678: an Enhanced-tier user whose KYC expires mid-test
+        // must immediately fall back to Basic limits on the next check, since
+        // velocity_limits re-queries kyc_level_for on every call (no caching).
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(1_000);
+
+        f.kyc().set_level(&f.user, &KycLevel::Enhanced);
+        assert_eq!(f.velocity().get_tier(&f.user), LimitTier::Enhanced);
+        assert!(f.velocity().check_and_record(&f.user, &5_000));
+
+        // Simulate KYC expiry: mock registry now reports None once "expired".
+        f.kyc().set_level(&f.user, &KycLevel::None);
+
+        assert_eq!(f.velocity().get_tier(&f.user), LimitTier::Basic);
+        // Enhanced-tier amount now exceeds the Basic per-tx limit (500).
+        assert!(!f.velocity().check_and_record(&f.user, &600));
+    }
 }

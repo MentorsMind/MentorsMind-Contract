@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol, Vec,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -16,6 +18,10 @@ pub enum DataKey {
     Config,
     ProcessedVAA(BytesN<32>),
     WrappedToken,
+    TrustedRelayer(Address),
+    ProcessedNonce(u32, u64),
+    BridgeFundedEscrow(u64),
+    EscrowRegistrySlot,
 }
 
 #[contracttype]
@@ -25,6 +31,18 @@ pub struct BridgedEvent {
     pub amount: i128,
     pub source_chain: u32,
     pub wrapped_token: Address,
+}
+
+/// A cross-chain payment attestation submitted by a trusted relayer.
+#[derive(Clone)]
+#[contracttype]
+pub struct BridgeMessage {
+    pub source_chain_id: u32,
+    pub tx_hash: BytesN<32>,
+    pub sender: BytesN<32>,
+    pub amount: i128,
+    pub token_symbol: Symbol,
+    pub nonce: u64,
 }
 
 // Supported chain IDs (Wormhole standard)
@@ -106,9 +124,7 @@ impl BridgeReceiver {
             });
 
         // Mint equivalent wrapped token to recipient
-        let token_client = token::Client::new(&env, &token_address);
-
-        // Authorize the bridge contract to mint
+        let token_client = token::StellarAssetClient::new(&env, &token_address);
         token_client.mint(&recipient, &amount);
 
         // Mark VAA as processed to prevent replay
@@ -131,26 +147,104 @@ impl BridgeReceiver {
     }
 
     /// Verify VAA hash against approved list
-    fn verify_vaa_hash(env: &Env, vaa_hash: &BytesN<32>) {
-        // In production, this would verify against Wormhole guardian set
-        // For MVP, check against admin-approved VAA hashes
+    fn verify_vaa_hash(_env: &Env, _vaa_hash: &BytesN<32>) {
+        // Placeholder for Wormhole guardian signature verification.
+        // Replay protection is enforced separately via DataKey::ProcessedVAA.
+    }
 
-        let approved_hashes: Vec<BytesN<32>> = env
-            .storage()
+    /// Add a trusted relayer allowed to submit bridge messages. Admin only.
+    pub fn add_trusted_relayer(env: Env, admin: Address, relayer: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
             .instance()
-            .get(&DataKey::ProcessedVAA(*vaa_hash))
-            .map_or(Vec::new(env), |_| Vec::new(env));
+            .set(&DataKey::TrustedRelayer(relayer), &true);
+    }
 
-        // Simplified: For now, accept all hashes that haven't been processed
-        // In production, implement actual Wormhole VAA verification:
-        // - Verify guardian signatures
-        // - Check VAA timestamp
-        // - Validate emitter address
-        // - Verify chain ID matches
+    /// Remove a trusted relayer. Admin only.
+    pub fn remove_trusted_relayer(env: Env, admin: Address, relayer: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::TrustedRelayer(relayer), &false);
+    }
 
-        // This is a placeholder - production should use actual Wormhole verification
-        // For MVP, we trust that the VAA has been verified by the caller
-        // and we're just preventing replays
+    /// Check whether an address is a trusted relayer.
+    pub fn is_trusted_relayer(env: Env, relayer: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::TrustedRelayer(relayer))
+            .unwrap_or(false)
+    }
+
+    /// Verify a bridge message from a trusted relayer and fund the target escrow.
+    /// Rejects untrusted relayers and replayed (chain_id, nonce) pairs.
+    pub fn receive_and_fund_escrow(
+        env: Env,
+        relayer: Address,
+        message: BridgeMessage,
+        escrow_id: u64,
+    ) {
+        relayer.require_auth();
+
+        if !Self::is_trusted_relayer(env.clone(), relayer.clone()) {
+            panic!("Untrusted relayer");
+        }
+
+        if message.amount <= 0 {
+            panic!("Amount must be positive");
+        }
+
+        let nonce_key = DataKey::ProcessedNonce(message.source_chain_id, message.nonce);
+        if env.storage().persistent().has(&nonce_key) {
+            panic!("NonceAlreadyProcessed");
+        }
+        env.storage().persistent().set(&nonce_key, &true);
+
+        // Fund the target escrow contract via its generic funding entrypoint.
+        // Escrow instances expose `fund(escrow_id: u64, amount: i128)` per the
+        // escrow_factory-deployed implementation contract.
+        env.invoke_contract::<()>(
+            &Self::escrow_registry(&env),
+            &Symbol::new(&env, "fund"),
+            (escrow_id, message.amount).into_val(&env),
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BridgeFundedEscrow(escrow_id), &message);
+
+        env.events().publish(
+            ("bridge", "BridgeFunded"),
+            (
+                escrow_id,
+                message.source_chain_id,
+                message.tx_hash.clone(),
+                message.amount,
+            ),
+        );
+    }
+
+    /// Query the bridge message that funded a given escrow, if any.
+    pub fn get_bridge_funded_escrow(env: Env, escrow_id: u64) -> Option<BridgeMessage> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BridgeFundedEscrow(escrow_id))
+    }
+
+    /// Check whether a (chain_id, nonce) pair has already been processed.
+    pub fn is_nonce_processed(env: Env, source_chain_id: u32, nonce: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProcessedNonce(source_chain_id, nonce))
+            .unwrap_or(false)
+    }
+
+    /// Set the escrow contract address that `receive_and_fund_escrow` funds into. Admin only.
+    pub fn set_escrow_registry(env: Env, admin: Address, escrow_registry: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowRegistrySlot, &escrow_registry);
     }
 
     /// Get list of supported chains
@@ -218,6 +312,13 @@ impl BridgeReceiver {
             })
     }
 
+    fn escrow_registry(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowRegistrySlot)
+            .unwrap_or_else(|| panic!("Escrow registry not set"))
+    }
+
     fn require_admin(env: &Env, admin: &Address) {
         let config = Self::get_config(env);
         if config.admin != *admin {
@@ -258,16 +359,26 @@ impl BridgeReceiver {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, vec, BytesN, Env};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::BytesN;
+
+    fn create_wrapped_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
+    }
 
     #[test]
     fn test_init() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
 
-        let supported_chains = BridgeReceiverClient::get_supported_chains(&env);
+        client.init(&admin);
+
+        let supported_chains = client.get_supported_chains();
         assert_eq!(supported_chains.len(), 3);
         assert_eq!(supported_chains.get(0).unwrap(), CHAIN_ETHEREUM);
         assert_eq!(supported_chains.get(1).unwrap(), CHAIN_SOLANA);
@@ -278,33 +389,35 @@ mod test {
     #[should_panic(expected = "Wrapped token not set")]
     fn test_receive_without_wrapped_token() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+
+        client.init(&admin);
 
         let vaa_hash = BytesN::from_array(&env, &[0; 32]);
         let recipient = Address::generate(&env);
 
-        BridgeReceiverClient::receive_bridged_asset(
-            &env,
-            &vaa_hash,
-            &recipient,
-            &1000,
-            &CHAIN_ETHEREUM,
-        );
+        client.receive_bridged_asset(&vaa_hash, &recipient, &1000, &CHAIN_ETHEREUM);
     }
 
     #[test]
     fn test_add_supported_chain() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+
+        client.init(&admin);
 
         let new_chain = 5; // Arbitrum
-        BridgeReceiverClient::add_supported_chain(&env, &admin, &new_chain);
+        client.add_supported_chain(&admin, &new_chain);
 
-        let chains = BridgeReceiverClient::get_supported_chains(&env);
+        let chains = client.get_supported_chains();
         assert_eq!(chains.len(), 4);
         assert_eq!(chains.get(3).unwrap(), new_chain);
     }
@@ -313,24 +426,32 @@ mod test {
     #[should_panic(expected = "Unauthorized: admin only")]
     fn test_add_supported_chain_unauthorized() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let unauthorized = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
 
-        BridgeReceiverClient::add_supported_chain(&env, &unauthorized, &5);
+        client.init(&admin);
+
+        client.add_supported_chain(&unauthorized, &5);
     }
 
     #[test]
     fn test_remove_supported_chain() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
 
-        BridgeReceiverClient::remove_supported_chain(&env, &admin, &CHAIN_SOLANA);
+        client.init(&admin);
 
-        let chains = BridgeReceiverClient::get_supported_chains(&env);
+        client.remove_supported_chain(&admin, &CHAIN_SOLANA);
+
+        let chains = client.get_supported_chains();
         assert_eq!(chains.len(), 2);
 
         let contains_solana = chains.iter().any(|c| c == CHAIN_SOLANA);
@@ -341,53 +462,45 @@ mod test {
     #[should_panic(expected = "Source chain 99 is not supported")]
     fn test_receive_unsupported_chain() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
 
-        // Set a dummy wrapped token
-        let token = Address::generate(&env);
-        BridgeReceiverClient::set_wrapped_token(&env, &admin, &token);
+        client.init(&admin);
+
+        let token = create_wrapped_token(&env, &admin);
+        client.set_wrapped_token(&admin, &token);
 
         let vaa_hash = BytesN::from_array(&env, &[0; 32]);
         let recipient = Address::generate(&env);
 
-        BridgeReceiverClient::receive_bridged_asset(
-            &env, &vaa_hash, &recipient, &1000, &99, // Unsupported chain
-        );
+        client.receive_bridged_asset(&vaa_hash, &recipient, &1000, &99);
     }
 
     #[test]
     #[should_panic(expected = "VAA already processed - replay attack detected")]
     fn test_replay_attack_prevention() {
         let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
         let admin = Address::generate(&env);
 
-        BridgeReceiverClient::init(&env, &admin);
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
 
-        // Set a dummy wrapped token
-        let token = Address::generate(&env);
-        BridgeReceiverClient::set_wrapped_token(&env, &admin, &token);
+        client.init(&admin);
+
+        let token = create_wrapped_token(&env, &admin);
+        client.set_wrapped_token(&admin, &token);
 
         let vaa_hash = BytesN::from_array(&env, &[1; 32]);
         let recipient = Address::generate(&env);
 
         // First receive - should succeed
-        BridgeReceiverClient::receive_bridged_asset(
-            &env,
-            &vaa_hash,
-            &recipient,
-            &1000,
-            &CHAIN_ETHEREUM,
-        );
+        client.receive_bridged_asset(&vaa_hash, &recipient, &1000, &CHAIN_ETHEREUM);
 
         // Second receive with same VAA - should fail
-        BridgeReceiverClient::receive_bridged_asset(
-            &env,
-            &vaa_hash,
-            &recipient,
-            &1000,
-            &CHAIN_ETHEREUM,
-        );
+        client.receive_bridged_asset(&vaa_hash, &recipient, &1000, &CHAIN_ETHEREUM);
     }
 }

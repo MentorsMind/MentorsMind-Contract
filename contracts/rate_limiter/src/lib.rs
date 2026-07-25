@@ -133,7 +133,7 @@ impl RateLimiterContract {
         }
 
         // Increment counter
-        let new_count = current_count + 1;
+        let new_count = current_count.checked_add(1).expect("call count overflow");
         env.storage().temporary().set(&call_count_key, &new_count);
 
         // Extend TTL only for the remaining time in the window so the counter

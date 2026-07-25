@@ -133,3 +133,52 @@ fn test_require_operator_panics_on_missing_operator_role() {
         &provider_hash,
     );
 }
+
+#[test]
+fn test_renew_kyc_updates_expiry_and_clears_alert() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    let provider_hash = BytesN::from_array(&env, &[0; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &1000, &provider_hash);
+
+    // Enter the 30-day alert window (expiry - now <= window).
+    env.ledger().set_timestamp(1000 - 100);
+    assert!(client.check_expiry_alert(&user));
+    assert!(client.get_expiry_alert(&user));
+
+    // Renew before expiry.
+    client.renew_kyc(&admin, &user, &KycLevel::Enhanced, &5000);
+    assert_eq!(client.get_kyc_expiry(&user), Some(5000));
+    assert!(!client.get_expiry_alert(&user));
+    assert_eq!(client.get_kyc_level(&user), KycLevel::Enhanced);
+}
+
+#[test]
+fn test_expired_kyc_returns_none_and_expiry_query() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    assert_eq!(client.get_kyc_expiry(&user), None);
+
+    let provider_hash = BytesN::from_array(&env, &[0; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &1000, &provider_hash);
+    assert_eq!(client.get_kyc_expiry(&user), Some(1000));
+
+    env.ledger().set_timestamp(1001);
+    assert_eq!(client.get_kyc_level(&user), KycLevel::None);
+}

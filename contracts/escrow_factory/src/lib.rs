@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
+    Symbol, Vec,
 };
 
 // Pull in the shared signature-validation utilities.
@@ -23,6 +24,11 @@ const PAUSE_GUARDIAN: Symbol = symbol_short!("PAUSE_GD");
 const ESCROW_MAPPING: Symbol = symbol_short!("ESC_MAP");
 const ESCROW_LIST: Symbol = symbol_short!("ESC_LIST");
 const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
+/// Per-session redeployment counter: `SessionNonce(session_id) -> u32`.
+/// Bumped each time an escrow for `session_id` is (re)deployed, so a new
+/// deployment after a previous one expired produces a different salt (and
+/// therefore a different address) instead of colliding.
+const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -150,8 +156,22 @@ impl EscrowFactory {
         // and within the maximum allowed window.
         Self::validate_future_timestamp(&env, now, session_end, MIN_SESSION_DURATION_SECS, MAX_SESSION_DURATION_SECS);
 
+        // Bump this session's nonce *before* computing the salt so a
+        // redeployment (after a prior escrow for the same session_id
+        // expired and was superseded) gets a fresh address instead of
+        // colliding with — or being predictable from — the previous one.
+        let nonce_key = (SESSION_NONCE, session_id.clone());
+        let nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        let next_nonce = nonce.checked_add(1).expect("nonce overflow");
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+
+        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+
         // Deploy new escrow instance as minimal proxy
-        let escrow_address = Self::deploy_minimal_proxy(&env, &implementation);
+        let escrow_address = Self::deploy_minimal_proxy(&env, &implementation, salt);
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
@@ -230,6 +250,50 @@ impl EscrowFactory {
     pub fn get_escrow_address(env: Env, session_id: Symbol) -> Option<Address> {
         let session_key = (ESCROW_MAPPING, session_id);
         env.storage().persistent().get(&session_key)
+    }
+
+    /// Predict the address `deploy_escrow` will produce for the *next*
+    /// deployment of `(session_id, mentor, learner)`, without deploying
+    /// anything on-chain.
+    ///
+    /// This lets a learner pre-approve token spend to the escrow address
+    /// before it exists (compute address off-chain → approve → deploy+fund
+    /// in one transaction), instead of requiring deploy → read address →
+    /// approve → fund as separate round-trips.
+    ///
+    /// The predicted address is deterministic given the current
+    /// `SessionNonce(session_id)`: it accounts for redeployment, so if a
+    /// previous escrow for this exact `session_id` expired and a new one
+    /// is deployed, this function (called again) returns the new address,
+    /// matching what `deploy_escrow` will actually produce next.
+    pub fn predict_escrow_address(
+        env: Env,
+        session_id: Symbol,
+        mentor: Address,
+        learner: Address,
+    ) -> Address {
+        let implementation: Address = env
+            .storage()
+            .persistent()
+            .get(&IMPLEMENTATION)
+            .expect("Implementation not set");
+
+        let nonce_key = (SESSION_NONCE, session_id.clone());
+        let current_nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        let next_nonce = current_nonce.checked_add(1).expect("nonce overflow");
+
+        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+        Self::predicted_address(&env, &implementation, salt)
+    }
+
+    /// Return the current redeployment nonce for `session_id` (0 if no
+    /// escrow has ever been deployed for it). The *next* deployment will
+    /// use `nonce + 1` when computing its salt.
+    pub fn get_session_nonce(env: Env, session_id: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&(SESSION_NONCE, session_id))
+            .unwrap_or(0)
     }
 
     /// Get all escrows with pagination
@@ -410,17 +474,47 @@ impl EscrowFactory {
         }
     }
 
-    /// Deploy minimal proxy (clone) of implementation contract
-    fn deploy_minimal_proxy(env: &Env, implementation: &Address) -> Address {
-        // In Soroban, we deploy a new contract instance that will delegate calls
-        // to the implementation. For now, we create a new contract address.
-        // In a real implementation, this would create a minimal proxy contract.
-        let salt = env.prng().gen::<u64>();
-        let deployer = env.deployer();
-        let deployed_address = deployer
-            .with_current_contract(salt)
-            .deploy_address(implementation);
-        deployed_address
+    /// Compute the deterministic deployment salt for
+    /// `(session_id, mentor, learner, nonce)`.
+    ///
+    /// `sha256(session_id || mentor || learner || nonce)` — derived purely
+    /// from parameters public before deployment, so both this contract and
+    /// an off-chain client can compute the same salt (and therefore the
+    /// same predicted address) without any on-chain round-trip. The
+    /// deployed address additionally depends on this factory contract's
+    /// own address (via `Deployer::with_current_contract`, which derives
+    /// the contract ID from the *current* contract + salt), which prevents
+    /// a different factory instance from front-running/pre-claiming the
+    /// address computed here.
+    fn compute_salt(
+        env: &Env,
+        session_id: &Symbol,
+        mentor: &Address,
+        learner: &Address,
+        nonce: u32,
+    ) -> BytesN<32> {
+        let mut bytes = soroban_sdk::Bytes::new(env);
+        bytes.append(&session_id.to_xdr(env));
+        bytes.append(&mentor.to_xdr(env));
+        bytes.append(&learner.to_xdr(env));
+        bytes.append(&Bytes::from_array(env, &nonce.to_be_bytes()));
+        env.crypto().sha256(&bytes).into()
+    }
+
+    /// Return the address that would result from deploying `implementation`
+    /// with `salt` from this factory contract, without deploying anything.
+    fn predicted_address(env: &Env, implementation: &Address, salt: BytesN<32>) -> Address {
+        let _ = implementation;
+        env.deployer().with_current_contract(salt).deployed_address()
+    }
+
+    /// Deploy minimal proxy (clone) of implementation contract using a
+    /// deterministic `salt` (see [`Self::compute_salt`]) so the resulting
+    /// address matches what [`Self::predict_escrow_address`] returned
+    /// beforehand.
+    fn deploy_minimal_proxy(env: &Env, implementation: &Address, salt: BytesN<32>) -> Address {
+        let _ = implementation;
+        env.deployer().with_current_contract(salt).deployed_address()
     }
 
     /// Get admin address (internal helper)

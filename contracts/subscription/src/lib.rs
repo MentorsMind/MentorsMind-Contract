@@ -24,6 +24,10 @@ pub const RENEWAL_GRACE_SECS: u64 = 60; // 1 minute
 /// learner never renews.
 pub const SUBSCRIPTION_EXPIRY_GRACE_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 
+/// Platform fee taken from every subscribe/renew payment, in basis points
+/// (10_000 bps = 100%). Deducted before the remainder is routed to escrow.
+pub const DEFAULT_PLATFORM_FEE_BPS: i128 = 250; // 2.5%
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -77,6 +81,15 @@ pub enum DataKey {
     StreamPlan(u32),
     /// A live streaming subscription keyed by subscription ID.
     StreamSub(u32),
+    /// Whitelist of tokens plans may be denominated in. Key: token address.
+    ApprovedToken(Address),
+    /// Address that receives the platform's fee split on subscribe/renew.
+    Treasury,
+    /// Platform fee, in basis points, taken from each subscribe/renew payment.
+    PlatformFeeBps,
+    /// Cumulative revenue paid to a mentor, denominated per token.
+    /// Key: (mentor, token) → i128 total received (net of platform fee).
+    MentorRevenue(Address, Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +166,8 @@ pub struct SubscriptionContract;
 #[contractimpl]
 impl SubscriptionContract {
     /// One-time initialization. Sets admin and escrow wallet.
+    /// Treasury defaults to `admin` and the platform fee defaults to
+    /// `DEFAULT_PLATFORM_FEE_BPS`; both can be changed later by the admin.
     pub fn initialize(env: Env, admin: Address, escrow: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
@@ -161,6 +176,134 @@ impl SubscriptionContract {
         env.storage().persistent().set(&DataKey::Escrow, &escrow);
         env.storage().persistent().set(&DataKey::PlanCounter, &0u32);
         env.storage().persistent().set(&DataKey::SubCounter, &0u32);
+        env.storage().persistent().set(&DataKey::Treasury, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &DEFAULT_PLATFORM_FEE_BPS);
+    }
+
+    // -----------------------------------------------------------------------
+    // Token whitelist / fee configuration (admin only)
+    // -----------------------------------------------------------------------
+
+    /// Approve or revoke a token for use in new plans. Does not affect plans
+    /// or subscriptions already created with that token.
+    pub fn set_approved_token(env: Env, admin: Address, token: Address, approved: bool) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovedToken(token.clone()), &approved);
+
+        env.events().publish(
+            (Symbol::new(&env, "token_appr"),),
+            (token, approved),
+        );
+    }
+
+    /// Returns whether `token` is currently approved for new plans.
+    pub fn is_token_approved(env: Env, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovedToken(token))
+            .unwrap_or(false)
+    }
+
+    /// Update the treasury address that receives the platform fee split.
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+        env.storage().persistent().set(&DataKey::Treasury, &treasury);
+    }
+
+    /// Update the platform fee (basis points, 0-10000) taken from each
+    /// subscribe/renew payment.
+    pub fn set_platform_fee_bps(env: Env, admin: Address, fee_bps: i128) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+        if !(0..=10_000).contains(&fee_bps) {
+            panic!("fee_bps must be 0-10000");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &fee_bps);
+    }
+
+    /// View the cumulative revenue (net of platform fee) a mentor has
+    /// received in a given token across all subscribe/renew payments.
+    pub fn get_mentor_revenue(env: Env, mentor: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MentorRevenue(mentor, token))
+            .unwrap_or(0)
+    }
+
+    /// Splits `amount` into (treasury_fee, escrow_remainder) using the
+    /// current platform fee in bps, and routes/records the payment:
+    /// `amount * platform_fee_bps / 10000` to treasury, remainder to escrow.
+    /// Updates the (mentor, token) revenue accumulator with the remainder.
+    fn route_payment(env: &Env, payer: &Address, mentor: &Address, token: &Address, amount: i128) {
+        let treasury: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Treasury)
+            .expect("not initialized");
+        let fee_bps: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(DEFAULT_PLATFORM_FEE_BPS);
+        let escrow: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow)
+            .expect("not initialized");
+
+        let fee = amount
+            .checked_mul(fee_bps)
+            .expect("fee overflow")
+            .checked_div(10_000)
+            .expect("fee division error");
+        let remainder = amount - fee;
+
+        let token_client = token::Client::new(env, token);
+        if fee > 0 {
+            token_client.transfer(payer, &treasury, &fee);
+        }
+        token_client.transfer(payer, &escrow, &remainder);
+
+        let revenue_key = DataKey::MentorRevenue(mentor.clone(), token.clone());
+        let prior: i128 = env.storage().persistent().get(&revenue_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&revenue_key, &(prior + remainder));
+
+        env.events().publish(
+            (Symbol::new(env, "fee_split"),),
+            (mentor.clone(), token.clone(), fee, remainder),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -181,6 +324,14 @@ impl SubscriptionContract {
         }
         if sessions_per_month == 0 {
             panic!("sessions_per_month must be > 0");
+        }
+        let approved: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovedToken(token.clone()))
+            .unwrap_or(false);
+        if !approved {
+            panic!("token not approved");
         }
 
         let plan_id: u32 = env
@@ -219,18 +370,8 @@ impl SubscriptionContract {
             .get(&DataKey::Plan(plan_id))
             .expect("plan not found");
 
-        let escrow: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow)
-            .expect("not initialized");
-
-        // Transfer first month payment from learner to escrow
-        token::Client::new(&env, &plan.token).transfer(
-            &learner,
-            &escrow,
-            &plan.price_per_month,
-        );
+        // Split first month payment: platform fee to treasury, remainder to escrow.
+        Self::route_payment(&env, &learner, &plan.mentor, &plan.token, plan.price_per_month);
 
         let now = env.ledger().timestamp();
         let sub_id: u32 = env
@@ -322,12 +463,6 @@ impl SubscriptionContract {
             .get(&DataKey::Plan(record.plan_id))
             .expect("plan not found");
 
-        let escrow: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow)
-            .expect("not initialized");
-
         // -----------------------------------------------------------------------
         // Allowance pull: deduct from pre-authorized allowance, then verify the
         // learner has sufficient balance before transferring.
@@ -370,8 +505,8 @@ impl SubscriptionContract {
             .persistent()
             .set(&DataKey::RenewalAllowance(subscription_id), &new_allowance);
 
-        // Pull payment: learner → escrow.
-        token_client.transfer(&record.learner, &escrow, &required);
+        // Pull payment, split between treasury (fee) and escrow (remainder).
+        Self::route_payment(&env, &record.learner, &record.mentor, &plan.token, required);
 
         record.next_billing_date += SECONDS_PER_MONTH;
         record.sessions_used = 0;
@@ -883,7 +1018,11 @@ mod test {
         (env, client, admin, escrow, mentor, learner)
     }
 
-    fn create_token(env: &Env, admin: &Address) -> (Address, TokenClient, StellarAssetClient) {
+    fn create_token<'a>(
+        env: &'a Env,
+        admin: &Address,
+        client: &SubscriptionContractClient<'a>,
+    ) -> (Address, TokenClient<'a>, StellarAssetClient<'a>) {
         let token_id = env.register_stellar_asset_contract_v2(admin.clone());
         let token_address = token_id.address();
         let token = TokenClient::new(env, &token_address);
@@ -891,10 +1030,22 @@ mod test {
         (token_address, token, token_admin)
     }
 
+    /// Approve `token_address` on `client` using `admin`. Kept separate from
+    /// `create_token` so asset-contract setup (register → mint) is not
+    /// interleaved with a subscription-contract call.
+    fn approve_token(env: &Env, client: &SubscriptionContractClient, admin: &Address, token_address: &Address) {
+        client.set_approved_token(admin, token_address, &true);
+        // Re-arm auth mocking: recording an explicit require_auth call above
+        // otherwise leaves later implicit (escrow) transfers unauthorized
+        // under `mock_all_auths()` in this SDK version.
+        env.mock_all_auths();
+    }
+
     #[test]
     fn test_subscribe() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &1000);
 
@@ -903,7 +1054,10 @@ mod test {
 
         assert_eq!(sub_id, 0);
         assert_eq!(token.balance(&learner), 900);
-        assert_eq!(token.balance(&escrow), 100);
+        // 2.5% platform fee (2) goes to treasury (defaults to admin); remainder (98) to escrow.
+        assert_eq!(token.balance(&escrow), 98);
+        assert_eq!(token.balance(&admin), 2);
+        assert_eq!(client.get_mentor_revenue(&mentor, &token_address), 98);
 
         let record = client.get_subscription(&sub_id);
         assert_eq!(record.status, SubscriptionStatus::Active);
@@ -914,7 +1068,8 @@ mod test {
     #[test]
     fn test_renew() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &1000);
 
@@ -942,7 +1097,8 @@ mod test {
     fn test_renew_within_grace_period() {
         // Renewal should succeed up to RENEWAL_GRACE_SECS before billing date.
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &1000);
 
@@ -965,7 +1121,8 @@ mod test {
     #[should_panic(expected = "billing date not reached")]
     fn test_renew_too_early_panics() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -980,7 +1137,8 @@ mod test {
         // When the subscription has lapsed beyond SUBSCRIPTION_EXPIRY_GRACE_SECS,
         // renew transitions to Expired and returns — it does NOT panic.
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1006,7 +1164,8 @@ mod test {
     #[should_panic(expected = "subscription expired")]
     fn test_use_session_after_expiry_panics() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1023,7 +1182,8 @@ mod test {
     #[test]
     fn test_check_expiry_transitions_to_expired() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1043,7 +1203,8 @@ mod test {
     #[test]
     fn test_check_expiry_no_op_when_active() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1062,7 +1223,8 @@ mod test {
     #[should_panic(expected = "billing date not reached")]
     fn test_manipulated_timestamp_cannot_renew_early() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1082,7 +1244,8 @@ mod test {
     #[test]
     fn test_cancel_mid_period() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1103,7 +1266,8 @@ mod test {
     #[test]
     fn test_session_count_enforcement() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &2u32);
@@ -1120,7 +1284,8 @@ mod test {
     #[should_panic(expected = "session limit reached")]
     fn test_session_limit_exceeded_panics() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &1u32);
@@ -1133,7 +1298,8 @@ mod test {
     #[test]
     fn test_pause() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1154,7 +1320,8 @@ mod test {
     #[test]
     fn test_auto_renewal_two_months_then_expires() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         // Mint enough for the initial subscribe + 2 renewals = 300.
         token_admin.mint(&learner, &300);
@@ -1211,7 +1378,8 @@ mod test {
     #[test]
     fn test_renewal_fails_on_insufficient_balance() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         // Mint only enough for the initial subscribe; nothing left for renewals.
         token_admin.mint(&learner, &100);
@@ -1231,8 +1399,8 @@ mod test {
 
         let record = client.get_subscription(&sub_id);
         assert_eq!(record.status, SubscriptionStatus::Expired);
-        // Escrow balance unchanged.
-        assert_eq!(token.balance(&escrow), 100);
+        // Escrow balance unchanged since subscribe (98 = 100 - 2.5% fee).
+        assert_eq!(token.balance(&escrow), 98);
         assert_eq!(token.balance(&learner), 0);
     }
 
@@ -1240,7 +1408,8 @@ mod test {
     #[test]
     fn test_get_renewal_status_initial() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &500);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1263,7 +1432,8 @@ mod test {
     #[test]
     fn test_authorize_renewal_replace() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &500);
 
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
@@ -1287,7 +1457,8 @@ mod test {
     #[test]
     fn test_streaming_cancel_at_40s() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &1000);
 
@@ -1319,7 +1490,8 @@ mod test {
     #[test]
     fn test_streaming_withdraw_earned_exact() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &600);
 
@@ -1349,7 +1521,8 @@ mod test {
     #[test]
     fn test_streaming_withdraw_capped_at_deposit() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &50);
 
@@ -1370,7 +1543,8 @@ mod test {
     #[test]
     fn test_streaming_cancel_after_partial_withdraw() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
 
         token_admin.mint(&learner, &1000);
 
@@ -1444,7 +1618,8 @@ mod test {
     #[should_panic(expected = "stream already cancelled")]
     fn test_streaming_double_cancel_panics() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
-        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_streaming_plan(&mentor, &10i128, &token_address);
@@ -1460,7 +1635,8 @@ mod test {
     #[test]
     fn test_streaming_withdraw_after_cancel() {
         let (env, client, admin, escrow, mentor, learner) = setup();
-        let (token_address, token, token_admin) = create_token(&env, &admin);
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
         token_admin.mint(&learner, &1000);
 
         let plan_id = client.create_streaming_plan(&mentor, &10i128, &token_address);

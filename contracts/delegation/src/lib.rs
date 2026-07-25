@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
 
 #[contracttype]
 #[derive(Clone)]
@@ -13,10 +15,21 @@ pub enum DataKey {
     SnapshotContract,
     DelegationSnapshotPower(u32, Address), // (snapshot_id, delegate) -> i128
     DelegationSnapshotMapping(u32, Address), // (snapshot_id, delegator) -> Address
+    Delegate(Address),             // mapping: delegator -> delegate
+    Delegators,                    // Vec<Address>
+    MaxDelegationDepth,            // u32: configurable max depth for cycle detection
+    DelegatedPowerCache(Address),  // eager cache: ultimate delegate -> sum of delegator balances
+    /// Eager subtree weight: `SubtreeWeight(X)` = own balance (if X is a
+    /// delegator) + the subtree weight of everyone whose delegate link
+    /// points directly at X. This lets a re-delegation move an entire
+    /// subtree of followers to a new ultimate target in O(1), instead of
+    /// having to walk every follower.
+    SubtreeWeight(Address),
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum DelegationError {
     CircularDelegation = 1,
     DepthExceeded = 2,
@@ -145,6 +158,21 @@ impl DelegationContract {
             }
         }
 
+        let max_depth = Self::get_max_delegation_depth(env.clone());
+
+        // `delegator`'s own balance plus everyone already delegating through
+        // it (its subtree) is what needs to move to the new chain. Moving
+        // this single stored number is O(depth), not O(followers) — a
+        // re-delegation never needs to touch each individual follower.
+        let weight = Self::get_subtree_weight(&env, &delegator);
+
+        let previous_delegate: Option<Address> =
+            env.storage().persistent().get(&DataKey::Delegate(delegator.clone()));
+
+        if let Some(prev) = previous_delegate {
+            Self::propagate_weight_change(&env, &prev, -weight, max_depth);
+        }
+
         env.storage().persistent().set(
             &DataKey::Delegate(delegator.clone()),
             &delegate.clone(),
@@ -161,6 +189,8 @@ impl DelegationContract {
             env.storage().persistent().set(&DataKey::Delegators, &delegators);
         }
 
+        Self::propagate_weight_change(&env, &delegate, weight, max_depth);
+
         env.events().publish(
             (
                 Symbol::new(&env, "delegation"),
@@ -173,13 +203,16 @@ impl DelegationContract {
 
     pub fn undelegate(env: Env, delegator: Address) {
         delegator.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Delegate(delegator.clone()))
-        {
-            return;
-        }
+        let existing: Option<Address> =
+            env.storage().persistent().get(&DataKey::Delegate(delegator.clone()));
+        let delegate = match existing {
+            Some(d) => d,
+            None => return,
+        };
+
+        let max_depth = Self::get_max_delegation_depth(env.clone());
+        let weight = Self::get_subtree_weight(&env, &delegator);
+
         env.storage()
             .persistent()
             .remove(&DataKey::Delegate(delegator.clone()));
@@ -194,6 +227,8 @@ impl DelegationContract {
             delegators.remove(index);
             env.storage().persistent().set(&DataKey::Delegators, &delegators);
         }
+
+        Self::propagate_weight_change(&env, &delegate, -weight, max_depth);
 
         env.events().publish(
             (
@@ -211,34 +246,12 @@ impl DelegationContract {
             .get(&DataKey::Delegate(delegator))
     }
 
+    /// O(1) read of cached delegated power for `delegate`.
     pub fn get_delegated_power(env: Env, delegate: Address) -> i128 {
-        let mut total: i128 = 0;
-        let delegators: soroban_sdk::Vec<Address> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&DataKey::Delegators)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MNTToken)
-            .expect("token not set");
-        let client = soroban_sdk::token::Client::new(&env, &token);
-
-        let max_depth = Self::get_max_delegation_depth(env.clone());
-
-        for i in 0..delegators.len() {
-            if let Some(d) = delegators.get(i) {
-                if let Some(ult) = Self::resolve_delegate_internal(&env, d.clone(), max_depth) {
-                    if ult == delegate {
-                        let bal = client.balance(&d);
-                        total = total.checked_add(bal).expect("overflow");
-                    }
-                }
-            }
-        }
-        total
+            .get(&DataKey::DelegatedPowerCache(delegate))
+            .unwrap_or(0)
     }
 
     pub fn get_effective_power(env: Env, voter: Address) -> i128 {
@@ -250,15 +263,41 @@ impl DelegationContract {
         {
             return 0;
         }
+        let own = Self::token_balance(&env, &voter);
+        let delegated = Self::get_delegated_power(env.clone(), voter.clone());
+        own.checked_add(delegated).expect("overflow")
+    }
+
+    /// Callable by the MNT token contract on balance change (transfer hook) to
+    /// keep the eager delegated-power cache consistent with actual balances.
+    /// `old_balance`/`new_balance` describe `delegator`'s balance before/after
+    /// the change; the delta is propagated up `delegator`'s chain, updating
+    /// every ancestor's subtree weight and the ultimate delegate's cache.
+    pub fn invalidate_power_cache(env: Env, delegator: Address, old_balance: i128, new_balance: i128) {
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::MNTToken)
             .expect("token not set");
-        let client = soroban_sdk::token::Client::new(&env, &token);
-        let own = client.balance(&voter);
-        let delegated = Self::get_delegated_power(env.clone(), voter.clone());
-        own.checked_add(delegated).expect("overflow")
+        token.require_auth();
+
+        let delta = new_balance.checked_sub(old_balance).expect("overflow");
+        if delta == 0 {
+            return;
+        }
+
+        // The delegator's own subtree weight includes its own balance, so it
+        // must be adjusted too, not just the ancestors above it.
+        Self::adjust_subtree_weight(&env, &delegator, delta);
+
+        if let Some(delegate) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Delegate(delegator))
+        {
+            let max_depth = Self::get_max_delegation_depth(env.clone());
+            Self::propagate_weight_change(&env, &delegate, delta, max_depth);
+        }
     }
 
     pub fn set_snapshot_contract(env: Env, admin: Address, snapshot_contract: Address) {
@@ -343,17 +382,78 @@ impl DelegationContract {
         let mut cur = addr;
         for _ in 0..depth {
             if let Some(next) = env
+    /// Subtree weight of `addr`: its own token balance plus the subtree
+    /// weight of everyone whose delegate link points directly at it.
+    fn get_subtree_weight(env: &Env, addr: &Address) -> i128 {
+        let own_balance = Self::token_balance(env, addr);
+        let followers: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubtreeWeight(addr.clone()))
+            .unwrap_or(0);
+        own_balance.checked_add(followers).expect("overflow")
+    }
+
+    fn adjust_subtree_weight(env: &Env, addr: &Address, delta: i128) {
+        if delta == 0 {
+            return;
+        }
+        let key = DataKey::SubtreeWeight(addr.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = current.checked_add(delta).expect("overflow");
+        env.storage().persistent().set(&key, &updated);
+    }
+
+    fn adjust_power_cache(env: &Env, delegate: &Address, delta: i128) {
+        if delta == 0 {
+            return;
+        }
+        let key = DataKey::DelegatedPowerCache(delegate.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = current.checked_add(delta).expect("overflow");
+        env.storage().persistent().set(&key, &updated);
+    }
+
+    /// Walk the delegation chain starting at `start`, applying `delta` to
+    /// each ancestor's `SubtreeWeight` (so their own subtree total stays
+    /// correct if they are later re-delegated) and to the ultimate
+    /// delegate's `DelegatedPowerCache`. Bounded by `max_depth` — never
+    /// proportional to the number of delegators in the system.
+    fn propagate_weight_change(env: &Env, start: &Address, delta: i128, max_depth: u32) {
+        if delta == 0 {
+            return;
+        }
+        let mut cur = start.clone();
+        for _ in 0..max_depth {
+            Self::adjust_subtree_weight(env, &cur, delta);
+            match env
                 .storage()
                 .persistent()
                 .get::<_, Address>(&DataKey::Delegate(cur.clone()))
             {
-                cur = next;
-            } else {
-                return Some(cur);
+                Some(next) => cur = next,
+                None => {
+                    // `cur` is the ultimate delegate: also update its
+                    // publicly-read cache.
+                    Self::adjust_power_cache(env, &cur, delta);
+                    return;
+                }
             }
         }
-        // After max depth, return current
-        Some(cur)
+        // Depth exhausted without finding an end (shouldn't happen given
+        // validate_delegation_chain enforces max_depth at write time) —
+        // treat `cur` as the ultimate as a defensive fallback.
+        Self::adjust_power_cache(env, &cur, delta);
+    }
+
+    fn token_balance(env: &Env, addr: &Address) -> i128 {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MNTToken)
+            .expect("token not set");
+        let client = soroban_sdk::token::Client::new(env, &token);
+        client.balance(addr)
     }
 }
 
@@ -607,6 +707,44 @@ mod tests {
 
     #[test]
     fn test_delegation_snapshot_and_get_delegated_power_at_snapshot() {
+    // -----------------------
+    // Eager cache correctness tests (#658)
+    // -----------------------
+
+    #[test]
+    fn test_get_delegated_power_is_o1_cache_read() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let del_id = env.register_contract(None, DelegationContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let target = Address::generate(&env);
+        let mut expected_total: i128 = 0;
+        for i in 0..20 {
+            let d = Address::generate(&env);
+            let bal = 10i128 + i as i128;
+            token.set_balance(&d, &bal);
+            del.delegate(&d, &target);
+            expected_total += bal;
+        }
+
+        env.budget().reset_unlimited();
+        let power = del.get_delegated_power(&target);
+        assert_eq!(power, expected_total);
+        // Cache read must not scale with delegator count: cheap enough to assert
+        // instruction count stays well below what a linear scan of 20
+        // cross-contract calls would cost.
+        let cpu = env.budget().cpu_instruction_cost();
+        assert!(cpu < 200_000, "cache read too expensive: {}", cpu);
+    }
+
+    #[test]
+    fn test_cache_consistent_after_redelegate() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -661,6 +799,106 @@ mod tests {
 
     #[test]
     fn test_delegation_snapshot_chain() {
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let a = Address::generate(&env);
+        let target1 = Address::generate(&env);
+        let target2 = Address::generate(&env);
+        token.set_balance(&a, &50i128);
+
+        del.delegate(&a, &target1);
+        assert_eq!(del.get_delegated_power(&target1), 50i128);
+        assert_eq!(del.get_delegated_power(&target2), 0i128);
+
+        // Re-delegate directly to a new target: cache must move, not double-count.
+        del.delegate(&a, &target2);
+        assert_eq!(del.get_delegated_power(&target1), 0i128);
+        assert_eq!(del.get_delegated_power(&target2), 50i128);
+    }
+
+    #[test]
+    fn test_cache_consistent_after_balance_change_hook() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let del_id = env.register_contract(None, DelegationContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let a = Address::generate(&env);
+        let target = Address::generate(&env);
+        token.set_balance(&a, &50i128);
+        del.delegate(&a, &target);
+        assert_eq!(del.get_delegated_power(&target), 50i128);
+
+        // Simulate a token transfer hook: balance increases from 50 to 120.
+        token.set_balance(&a, &120i128);
+        del.invalidate_power_cache(&a, &50i128, &120i128);
+        assert_eq!(del.get_delegated_power(&target), 120i128);
+
+        // Balance decreases from 120 to 30.
+        token.set_balance(&a, &30i128);
+        del.invalidate_power_cache(&a, &120i128, &30i128);
+        assert_eq!(del.get_delegated_power(&target), 30i128);
+    }
+
+    #[test]
+    fn test_property_cache_equals_sum_of_delegator_balances() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let del_id = env.register_contract(None, DelegationContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let target = Address::generate(&env);
+        let mut delegators: std::vec::Vec<Address> = std::vec::Vec::new();
+        let mut expected: i128 = 0;
+
+        // delegate a set of accounts to target
+        for i in 0..10 {
+            let d = Address::generate(&env);
+            let bal = (i as i128 + 1) * 7;
+            token.set_balance(&d, &bal);
+            del.delegate(&d, &target);
+            expected += bal;
+            delegators.push(d);
+        }
+        assert_eq!(del.get_delegated_power(&target), expected);
+
+        // undelegate a couple, changing the sum
+        del.undelegate(&delegators[2]);
+        expected -= 3 * 7; // i=2 -> bal = 21
+        assert_eq!(del.get_delegated_power(&target), expected);
+
+        del.undelegate(&delegators[5]);
+        expected -= 6 * 7; // i=5 -> bal = 42
+        assert_eq!(del.get_delegated_power(&target), expected);
+
+        // balance change via hook for a still-delegating account
+        let d0 = delegators[0].clone();
+        let old_bal = 7i128;
+        let new_bal = 100i128;
+        token.set_balance(&d0, &new_bal);
+        del.invalidate_power_cache(&d0, &old_bal, &new_bal);
+        expected += new_bal - old_bal;
+        assert_eq!(del.get_delegated_power(&target), expected);
+    }
+
+    #[test]
+    fn test_intermediate_redelegation_moves_entire_subtree() {
+        // a -> b -> c, then b re-delegates to d. a's balance (which was
+        // cached under b's original ultimate, c) must move to d along with
+        // b's own balance — not get left stranded on c.
         let env = Env::default();
         env.mock_all_auths();
 
@@ -672,6 +910,8 @@ mod tests {
         let token = MockMntTokenClient::new(&env, &token_id);
         let snap = MockSnapshotForDelClient::new(&env, &snap_id);
 
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
         let admin = Address::generate(&env);
         del.initialize(&admin, &token_id);
 
@@ -704,6 +944,66 @@ mod tests {
 
     #[test]
     fn test_set_snapshot_contract() {
+        let d = Address::generate(&env);
+
+        token.set_balance(&a, &10i128);
+        token.set_balance(&b, &20i128);
+
+        del.delegate(&a, &b);
+        del.delegate(&b, &c);
+        assert_eq!(del.get_delegated_power(&c), 30i128); // a(10) + b(20)
+
+        // b re-delegates to d; a's 10 must follow, not stay stuck on c.
+        del.delegate(&b, &d);
+        assert_eq!(del.get_delegated_power(&c), 0i128);
+        assert_eq!(del.get_delegated_power(&d), 30i128);
+    }
+
+    #[test]
+    fn test_deep_chain_redelegation_moves_whole_subtree() {
+        // a -> b -> c -> e (ultimate). Then c re-delegates to f.
+        // Both a's and b's balances must move to f.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let del_id = env.register_contract(None, DelegationContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let e = Address::generate(&env);
+        let f = Address::generate(&env);
+
+        token.set_balance(&a, &5i128);
+        token.set_balance(&b, &7i128);
+        token.set_balance(&c, &11i128);
+
+        del.delegate(&a, &b);
+        del.delegate(&b, &c);
+        del.delegate(&c, &e);
+        assert_eq!(del.get_delegated_power(&e), 23i128); // 5+7+11
+
+        del.delegate(&c, &f);
+        assert_eq!(del.get_delegated_power(&e), 0i128);
+        assert_eq!(del.get_delegated_power(&f), 23i128);
+
+        // a and b's individual undelegate/re-delegate still work correctly
+        // after the subtree moved.
+        del.undelegate(&a);
+        assert_eq!(del.get_delegated_power(&f), 18i128); // 23 - 5
+    }
+
+    #[test]
+    fn test_get_delegated_power_o1_with_500_delegators() {
+        // Directly exercises the #658 acceptance criterion: reading
+        // delegated power must not scale with delegator count, unlike the
+        // original lazy implementation which made one cross-contract
+        // token::Client::balance() call per delegator.
         let env = Env::default();
         env.mock_all_auths();
 
@@ -717,3 +1017,35 @@ mod tests {
         let snap_addr = Address::generate(&env);
         del.set_snapshot_contract(&admin, &snap_addr);
     }
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        env.budget().reset_unlimited();
+        let target = Address::generate(&env);
+        let mut expected: i128 = 0;
+        for _ in 0..500 {
+            let d = Address::generate(&env);
+            token.set_balance(&d, &1i128);
+            del.delegate(&d, &target);
+            expected += 1;
+        }
+
+        let before = env.budget().cpu_instruction_cost();
+        let power = del.get_delegated_power(&target);
+        let after = env.budget().cpu_instruction_cost();
+        assert_eq!(power, expected);
+        let incremental_cpu = after - before;
+        // A single storage read; must be orders of magnitude below what 500
+        // cross-contract balance() calls would cost (each balance() call
+        // alone typically costs well over 1M instructions under the
+        // Soroban cost model once cross-contract invocation overhead is
+        // included, so 500 of them would exceed the entire ledger budget).
+        assert!(
+            incremental_cpu < 500_000,
+            "get_delegated_power cost scaled with delegator count: {}",
+            incremental_cpu
+        );
+    }
+}

@@ -23,6 +23,9 @@ jobs:
   analyze-coverage:
     runs-on: ubuntu-latest
     name: Analyze State Transition Coverage
+    permissions:
+      issues: write
+      pull-requests: write
 
     steps:
       - name: Checkout code

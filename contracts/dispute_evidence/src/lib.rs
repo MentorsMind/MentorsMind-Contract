@@ -7,7 +7,12 @@
 //! # Workflow
 //! 1. Learner or mentor opens a dispute on the escrow contract.
 //! 2. Either party calls [`DisputeEvidenceContract::submit_evidence`] with a
-//!    `Symbol` pointing to an off-chain document (e.g. IPFS CID, content hash).
+//!    `content_hash: BytesN<32>` — a SHA-256/BLAKE3 commitment to the actual
+//!    off-chain document content — plus an `evidence_uri_hash: BytesN<32>`
+//!    committing to the IPFS CID or URL where that content is hosted. This
+//!    replaces the original `Symbol` reference (max 9 chars), which could
+//!    not hold a real content commitment and gave callers no way to prove a
+//!    submitted reference corresponds to specific content.
 //! 3. An arbitrator calls [`DisputeEvidenceContract::submit_resolution`] after
 //!    `MIN_RESOLUTION_DELAY_SECS` have elapsed since the dispute was opened.
 //! 4. The admin uses the on-chain resolution record to call `resolve_dispute`
@@ -15,7 +20,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 /// Default window (seconds) within which evidence may be submitted after session end.
@@ -74,7 +80,21 @@ pub struct Escrow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceItem {
     pub submitter: Address,
-    pub evidence_ref: Symbol,
+    /// SHA-256/BLAKE3 commitment to the actual off-chain evidence content.
+    pub content_hash: BytesN<32>,
+    /// Commitment to the IPFS CID or URL where `content_hash`'s content is
+    /// hosted, kept separate from `content_hash` so the location can change
+    /// (e.g. re-pinned to a different gateway) without invalidating the
+    /// content commitment itself.
+    pub evidence_uri_hash: BytesN<32>,
+    /// Optional signature from `submitter` over
+    /// `(escrow_id, content_hash, submitted_at)`, allowing later
+    /// off-chain/on-chain verification that the submitter themselves
+    /// attested to this exact content at this exact time. An all-zero value
+    /// means "no attestation provided" (soroban-sdk 21.7.7 cannot derive
+    /// `contracttype` for `Option<BytesN<64>>`, so a sentinel is used
+    /// instead of `Option`).
+    pub submitter_attestation: BytesN<64>,
     pub submitted_at: u64,
 }
 
@@ -125,6 +145,12 @@ pub enum Error {
     ResolutionTimelockActive = 8,
     /// Dispute opening has already been recorded for this escrow.
     AlreadyRecorded          = 9,
+    /// `content_hash` was all-zero, i.e. a null commitment that proves
+    /// nothing about the submitted content.
+    ZeroContentHash          = 10,
+    /// The same submitter already submitted this exact `content_hash` for
+    /// this escrow — duplicate commitments are rejected.
+    DuplicateContentHash     = 11,
 }
 
 #[contract]
@@ -221,6 +247,15 @@ impl DisputeEvidenceContract {
 
     /// Submit evidence for a disputed escrow.
     ///
+    /// `content_hash` must be a SHA-256/BLAKE3 hash of the actual evidence
+    /// document — a non-zero commitment that later lets any party verify
+    /// (via [`Self::verify_evidence_integrity`]) that a claimed document
+    /// matches what was originally submitted. `evidence_uri_hash` commits
+    /// separately to the off-chain location (e.g. IPFS CID) hosting that
+    /// content. `submitter_attestation`, if provided, is expected to be a
+    /// signature from `submitter` over `(escrow_id, content_hash,
+    /// submitted_at)`.
+    ///
     /// # Anti-spam guard
     /// A party may not submit evidence more than once per
     /// `SUBMISSION_COOLDOWN_SECS` (1 h) for the same escrow.
@@ -228,7 +263,9 @@ impl DisputeEvidenceContract {
         env: Env,
         escrow_id: u64,
         submitter: Address,
-        evidence_ref: Symbol,
+        content_hash: BytesN<32>,
+        evidence_uri_hash: BytesN<32>,
+        submitter_attestation: Option<BytesN<64>>,
     ) -> Result<(), Error> {
         submitter.require_auth();
         let escrow = Self::load_escrow(&env, escrow_id);
@@ -237,6 +274,10 @@ impl DisputeEvidenceContract {
         }
         if submitter != escrow.mentor && submitter != escrow.learner {
             return Err(Error::Unauthorized);
+        }
+
+        if content_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::ZeroContentHash);
         }
 
         let window_secs: u64 = env
@@ -278,9 +319,21 @@ impl DisputeEvidenceContract {
             return Err(Error::EvidenceLimitReached);
         }
 
+        // Reject a duplicate (submitter, content_hash) pair within the same
+        // escrow — two different evidence items from the same submitter
+        // must not share a content commitment.
+        for existing in evidence.iter() {
+            if existing.submitter == submitter && existing.content_hash == content_hash {
+                return Err(Error::DuplicateContentHash);
+            }
+        }
+
         let item = EvidenceItem {
             submitter: submitter.clone(),
-            evidence_ref: evidence_ref.clone(),
+            content_hash,
+            evidence_uri_hash,
+            submitter_attestation: submitter_attestation
+                .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 64])),
             submitted_at: env.ledger().timestamp(),
         };
         evidence.push_back(item.clone());
@@ -299,6 +352,24 @@ impl DisputeEvidenceContract {
 
     pub fn get_evidence_count(env: Env, escrow_id: u64) -> u32 {
         Self::get_evidence(env, escrow_id).len()
+    }
+
+    /// Verify that the evidence item at `index` for `escrow_id` was
+    /// submitted with exactly `expected_hash` as its `content_hash`.
+    /// Returns `false` (rather than erroring) if the index is out of range
+    /// or the hash does not match — callers checking whether a claimed
+    /// document has been tampered with should treat both as "not verified".
+    pub fn verify_evidence_integrity(
+        env: Env,
+        escrow_id: u64,
+        index: u32,
+        expected_hash: BytesN<32>,
+    ) -> bool {
+        let evidence = Self::get_evidence(env, escrow_id);
+        match evidence.get(index) {
+            Some(item) => item.content_hash == expected_hash,
+            None => false,
+        }
     }
 
     /// Submit a dispute resolution.
@@ -431,12 +502,24 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let escrow_contract = env.register(MockEscrow, ());
-        let contract_id = env.register(DisputeEvidenceContract, ());
+        let escrow_contract = env.register_contract(None, MockEscrow);
+        let contract_id = env.register_contract(None, DisputeEvidenceContract);
         let client = DisputeEvidenceContractClient::new(&env, &contract_id);
         client.initialize(&admin, &escrow_contract).unwrap();
         let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&1);
         (env, admin, escrow.mentor, escrow.learner, client)
+    }
+
+    /// Build a distinct, non-zero 32-byte hash for tests, seeded by `seed`.
+    fn hash32(env: &Env, seed: u8) -> BytesN<32> {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        bytes[31] = seed.wrapping_add(1).max(1); // ensure non-zero even if seed == 0/255
+        BytesN::from_array(env, &bytes)
+    }
+
+    fn zero_hash32(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0u8; 32])
     }
 
     fn advance_time(env: &Env, secs: u64) {
@@ -460,12 +543,110 @@ mod tests {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         // Disable cooldown to allow rapid sequential submissions for cap test
         client.set_cooldown_enabled(&_admin, &false).unwrap();
-        for e in ["e1", "e2", "e3", "e4", "e5"] {
+        for seed in 1u8..=5 {
             client
-                .submit_evidence(&1, &mentor, &Symbol::new(&env, e))
+                .submit_evidence(&1, &mentor, &hash32(&env, seed), &hash32(&env, seed.wrapping_add(100)), &None)
                 .unwrap();
         }
         assert_eq!(client.get_evidence_count(&1), MAX_EVIDENCE_ITEMS);
+    }
+
+    // ─── #651: content-hash commitment scheme ──────────────────────────────
+
+    #[test]
+    fn submit_evidence_rejects_zero_content_hash() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let result = client.try_submit_evidence(
+            &1,
+            &mentor,
+            &zero_hash32(&env),
+            &hash32(&env, 1),
+            &None,
+        );
+        assert!(result.is_err(), "zero content_hash must be rejected");
+    }
+
+    #[test]
+    fn submit_evidence_rejects_duplicate_hash_same_submitter() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+        let hash = hash32(&env, 7);
+        client
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 8), &None)
+            .unwrap();
+        let result = client.try_submit_evidence(&1, &mentor, &hash, &hash32(&env, 9), &None);
+        assert!(
+            result.is_err(),
+            "duplicate content_hash from same submitter must be rejected"
+        );
+    }
+
+    #[test]
+    fn submit_evidence_allows_same_hash_from_different_submitters() {
+        let (env, admin, mentor, learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+        let hash = hash32(&env, 7);
+        client
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 8), &None)
+            .unwrap();
+        // Different submitter, same content_hash — allowed (e.g. both
+        // parties independently attest to the same document).
+        client
+            .submit_evidence(&1, &learner, &hash, &hash32(&env, 8), &None)
+            .unwrap();
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn verify_evidence_integrity_matches_submitted_hash() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let hash = hash32(&env, 42);
+        client
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 43), &None)
+            .unwrap();
+        assert!(client.verify_evidence_integrity(&1, &0, &hash));
+    }
+
+    #[test]
+    fn verify_evidence_integrity_fails_on_tampered_hash() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 42), &hash32(&env, 43), &None)
+            .unwrap();
+        // A different (tampered) hash must not verify.
+        assert!(!client.verify_evidence_integrity(&1, &0, &hash32(&env, 99)));
+    }
+
+    #[test]
+    fn verify_evidence_integrity_false_for_out_of_range_index() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        assert!(!client.verify_evidence_integrity(&1, &0, &hash32(&env, 1)));
+    }
+
+    #[test]
+    fn submit_evidence_stores_optional_submitter_attestation() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[0] = 9;
+        let attestation = BytesN::from_array(&env, &sig_bytes);
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &Some(attestation.clone()))
+            .unwrap();
+        let items = client.get_evidence(&1);
+        assert_eq!(items.get(0).unwrap().submitter_attestation, attestation);
+    }
+
+    #[test]
+    fn submit_evidence_without_attestation_stores_zero_sentinel() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let items = client.get_evidence(&1);
+        assert_eq!(
+            items.get(0).unwrap().submitter_attestation,
+            BytesN::from_array(&env, &[0u8; 64])
+        );
     }
 
     // ─── #417: anti-spam cooldown ─────────────────────────────────────────
@@ -474,10 +655,10 @@ mod tests {
     fn second_submission_within_cooldown_fails() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "e1"))
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
             .unwrap();
         // Immediately retry (within cooldown) → must fail
-        let result = client.try_submit_evidence(&1, &mentor, &Symbol::new(&env, "e2"));
+        let result = client.try_submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None);
         assert!(result.is_err(), "second submission within cooldown must fail");
     }
 
@@ -485,11 +666,11 @@ mod tests {
     fn submission_allowed_after_cooldown_elapses() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "e1"))
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
             .unwrap();
         advance_time(&env, SUBMISSION_COOLDOWN_SECS + 1);
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "e2"))
+            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None)
             .unwrap();
         assert_eq!(client.get_evidence_count(&1), 2);
     }
@@ -499,11 +680,11 @@ mod tests {
         let (env, _admin, mentor, learner, client) = setup_disputed();
         // mentor submits
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "proof_a"))
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
             .unwrap();
         // learner submits in the same window — separate cooldown key
         client
-            .submit_evidence(&1, &learner, &Symbol::new(&env, "proof_b"))
+            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None)
             .unwrap();
         assert_eq!(client.get_evidence_count(&1), 2);
     }
@@ -513,10 +694,10 @@ mod tests {
         let (env, admin, mentor, _learner, client) = setup_disputed();
         client.set_cooldown_enabled(&admin, &false).unwrap();
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "x"))
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
             .unwrap();
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "y"))
+            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None)
             .unwrap();
         assert_eq!(client.get_evidence_count(&1), 2);
     }
@@ -676,8 +857,9 @@ mod tests {
     #[test]
     fn evidence_submitted_event_contains_correct_payload() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let hash = hash32(&env, 1);
         client
-            .submit_evidence(&1, &mentor, &Symbol::new(&env, "proof_a"))
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 2), &None)
             .unwrap();
         let events = env.events().all();
         let last = events.last().unwrap();
@@ -686,7 +868,7 @@ mod tests {
             (Symbol::new(&env, "evidence_submitted"), 1u64).into_val(&env)
         );
         let payload = EvidenceItem::try_from_val(&env, &last.2).unwrap();
-        assert_eq!(payload.evidence_ref, Symbol::new(&env, "proof_a"));
+        assert_eq!(payload.content_hash, hash);
     }
 
     #[test]

@@ -666,13 +666,13 @@
           "v0": {
             "topics": [
               {
-                "symbol": "Staking"
+                "symbol": "staking"
+              },
+              {
+                "u32": 1
               },
               {
                 "symbol": "staked"
-              },
-              {
-                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
               }
             ],
             "data": {
@@ -841,13 +841,13 @@
           "v0": {
             "topics": [
               {
-                "symbol": "Staking"
+                "symbol": "staking"
+              },
+              {
+                "u32": 1
               },
               {
                 "symbol": "unstaked"
-              },
-              {
-                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
               }
             ],
             "data": {

@@ -12,6 +12,7 @@ pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
 pub mod storage;
+pub mod staking;
 pub mod ttl_utils;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
@@ -21,6 +22,7 @@ pub use sig_validation::{
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
 };
 pub use state_machine::StateMachine;
+pub use staking::{StakeRecord, StakedEventData};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 
