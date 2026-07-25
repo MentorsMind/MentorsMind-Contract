@@ -9,6 +9,12 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     MNTToken,
+    Delegate(Address), // mapping: delegator -> delegate
+    Delegators,        // Vec<Address>
+    MaxDelegationDepth, // u32: configurable max depth for cycle detection
+    SnapshotContract,
+    DelegationSnapshotPower(u32, Address), // (snapshot_id, delegate) -> i128
+    DelegationSnapshotMapping(u32, Address), // (snapshot_id, delegator) -> Address
     Delegate(Address),             // mapping: delegator -> delegate
     Delegators,                    // Vec<Address>
     MaxDelegationDepth,            // u32: configurable max depth for cycle detection
@@ -294,6 +300,88 @@ impl DelegationContract {
         }
     }
 
+    pub fn set_snapshot_contract(env: Env, admin: Address, snapshot_contract: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+        env.storage().instance().set(&DataKey::SnapshotContract, &snapshot_contract);
+    }
+
+    /// Snapshots the current delegation state for a given snapshot_id.
+    /// Iterates all delegators, resolves ultimate delegates, and records:
+    /// - DelegationSnapshotPower: total delegated power each delegate received
+    /// - DelegationSnapshotMapping: who delegated to whom
+    pub fn snapshot_delegations(env: Env, snapshot_id: u32, snapshot_contract: Address) {
+        let delegators: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegators)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let max_depth = Self::get_max_delegation_depth(env.clone());
+
+        for i in 0..delegators.len() {
+            if let Some(delegator) = delegators.get(i) {
+                // Record delegation mapping for this snapshot
+                if let Some(delegate) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey::Delegate(delegator.clone()))
+                {
+                    env.storage().persistent().set(
+                        &DataKey::DelegationSnapshotMapping(snapshot_id, delegator.clone()),
+                        &delegate,
+                    );
+
+                    // Resolve ultimate delegate
+                    if let Some(ult) = Self::resolve_delegate_internal(&env, delegator.clone(), max_depth) {
+                        // Get delegator's staked balance at snapshot time
+                        let bal: i128 = env.invoke_contract(
+                            &snapshot_contract,
+                            &Symbol::new(&env, "get_voting_power"),
+                            (snapshot_id, delegator.clone()).into_val(&env),
+                        );
+                        if bal > 0 {
+                            let key = DataKey::DelegationSnapshotPower(snapshot_id, ult.clone());
+                            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+                            env.storage().persistent().set(
+                                &key,
+                                &current.checked_add(bal).expect("overflow"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the delegated voting power a delegate had at snapshot time.
+    /// If the voter had delegated away at snapshot time, returns 0.
+    pub fn get_delegated_power_at_snapshot(env: Env, delegate: Address, snapshot_id: u32) -> i128 {
+        // If this address delegated away at snapshot time, they get 0 delegated power
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::DelegationSnapshotMapping(snapshot_id, delegate.clone()))
+        {
+            return 0;
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationSnapshotPower(snapshot_id, delegate))
+            .unwrap_or(0)
+    }
+
+    // internal helper: resolve ultimate delegate up to depth limit
+    fn resolve_delegate_internal(env: &Env, mut addr: Address, depth: u32) -> Option<Address> {
+        let mut cur = addr;
+        for _ in 0..depth {
+            if let Some(next) = env
     /// Subtree weight of `addr`: its own token balance plus the subtree
     /// weight of everyone whose delegate link points directly at it.
     fn get_subtree_weight(env: &Env, addr: &Address) -> i128 {
@@ -604,6 +692,21 @@ mod tests {
         assert_eq!(del.get_max_delegation_depth(), 20u32);
     }
 
+    #[contract]
+    pub struct MockSnapshotForDel;
+
+    #[contractimpl]
+    impl MockSnapshotForDel {
+        pub fn set_voting_power(env: Env, snapshot_id: u32, voter: Address, amount: i128) {
+            env.storage().persistent().set(&(symbol_short!("SNAP"), snapshot_id, voter), &amount);
+        }
+        pub fn get_voting_power(env: Env, snapshot_id: u32, voter: Address) -> i128 {
+            env.storage().persistent().get(&(symbol_short!("SNAP"), snapshot_id, voter)).unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn test_delegation_snapshot_and_get_delegated_power_at_snapshot() {
     // -----------------------
     // Eager cache correctness tests (#658)
     // -----------------------
@@ -647,6 +750,55 @@ mod tests {
 
         let del_id = env.register_contract(None, DelegationContract);
         let token_id = env.register_contract(None, MockMntToken);
+        let snap_id = env.register_contract(None, MockSnapshotForDel);
+
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snap = MockSnapshotForDelClient::new(&env, &snap_id);
+
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let alice = Address::generate(&env); // delegator
+        let bob = Address::generate(&env);   // delegate
+        let charlie = Address::generate(&env); // independent voter
+
+        token.set_balance(&alice, &100i128);
+        token.set_balance(&bob, &50i128);
+        token.set_balance(&charlie, &30i128);
+
+        // Alice delegates to Bob
+        del.delegate(&alice, &bob);
+
+        // Setup snapshot: alice has 100 staked, bob has 50, charlie has 30
+        snap.set_voting_power(&1, &alice, &100i128);
+        snap.set_voting_power(&1, &bob, &50i128);
+        snap.set_voting_power(&1, &charlie, &30i128);
+
+        // Snapshot delegation state
+        del.snapshot_delegations(&1, &snap_id);
+
+        // Bob should have 100 delegated power at snapshot 1 (from Alice)
+        assert_eq!(del.get_delegated_power_at_snapshot(&bob, &1), 100i128);
+        // Alice delegated away, so her delegated power is 0
+        assert_eq!(del.get_delegated_power_at_snapshot(&alice, &1), 0i128);
+        // Charlie has no one delegating to him
+        assert_eq!(del.get_delegated_power_at_snapshot(&charlie, &1), 0i128);
+
+        // After snapshot, Alice undelegates
+        del.undelegate(&alice);
+
+        // Snapshot 1 should still show old state
+        assert_eq!(del.get_delegated_power_at_snapshot(&bob, &1), 100i128);
+        assert_eq!(del.get_delegated_power_at_snapshot(&alice, &1), 0i128);
+
+        // New snapshot 2 with updated state
+        del.snapshot_delegations(&2, &snap_id);
+        assert_eq!(del.get_delegated_power_at_snapshot(&bob, &2), 0i128);
+    }
+
+    #[test]
+    fn test_delegation_snapshot_chain() {
         let del = DelegationContractClient::new(&env, &del_id);
         let token = MockMntTokenClient::new(&env, &token_id);
         let admin = Address::generate(&env);
@@ -752,6 +904,12 @@ mod tests {
 
         let del_id = env.register_contract(None, DelegationContract);
         let token_id = env.register_contract(None, MockMntToken);
+        let snap_id = env.register_contract(None, MockSnapshotForDel);
+
+        let del = DelegationContractClient::new(&env, &del_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snap = MockSnapshotForDelClient::new(&env, &snap_id);
+
         let del = DelegationContractClient::new(&env, &del_id);
         let token = MockMntTokenClient::new(&env, &token_id);
         let admin = Address::generate(&env);
@@ -760,6 +918,32 @@ mod tests {
         let a = Address::generate(&env);
         let b = Address::generate(&env);
         let c = Address::generate(&env);
+
+        token.set_balance(&a, &10i128);
+        token.set_balance(&b, &20i128);
+        token.set_balance(&c, &30i128);
+
+        // Chain: a→b→c
+        del.delegate(&a, &b);
+        del.delegate(&b, &c);
+
+        // Setup snapshot balances
+        snap.set_voting_power(&1, &a, &10i128);
+        snap.set_voting_power(&1, &b, &20i128);
+        snap.set_voting_power(&1, &c, &30i128);
+
+        del.snapshot_delegations(&1, &snap_id);
+
+        // c receives a(10) + b(20) = 30 delegated
+        assert_eq!(del.get_delegated_power_at_snapshot(&c, &1), 30i128);
+        // b delegated away, gets 0
+        assert_eq!(del.get_delegated_power_at_snapshot(&b, &1), 0i128);
+        // a delegated away, gets 0
+        assert_eq!(del.get_delegated_power_at_snapshot(&a, &1), 0i128);
+    }
+
+    #[test]
+    fn test_set_snapshot_contract() {
         let d = Address::generate(&env);
 
         token.set_balance(&a, &10i128);
@@ -825,6 +1009,14 @@ mod tests {
 
         let del_id = env.register_contract(None, DelegationContract);
         let token_id = env.register_contract(None, MockMntToken);
+
+        let del = DelegationContractClient::new(&env, &del_id);
+        let admin = Address::generate(&env);
+        del.initialize(&admin, &token_id);
+
+        let snap_addr = Address::generate(&env);
+        del.set_snapshot_contract(&admin, &snap_addr);
+    }
         let del = DelegationContractClient::new(&env, &del_id);
         let token = MockMntTokenClient::new(&env, &token_id);
         let admin = Address::generate(&env);

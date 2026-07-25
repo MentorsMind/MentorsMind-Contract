@@ -10,6 +10,7 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     StakingContract,
+    DelegationContract,
     Snapshot(u32, Address), // (snapshot_id, voter)
     SnapshotTotalSupply(u32), // snapshot_id
 }
@@ -20,12 +21,13 @@ pub struct SnapshotContract;
 #[contractimpl]
 impl SnapshotContract {
     /// Initialize the snapshot contract.
-    pub fn initialize(env: Env, admin: Address, staking_contract: Address) {
+    pub fn initialize(env: Env, admin: Address, staking_contract: Address, delegation_contract: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::StakingContract, &staking_contract);
+        env.storage().persistent().set(&DataKey::DelegationContract, &delegation_contract);
     }
 
     /// records all staked MNT balances at current ledger
@@ -59,6 +61,14 @@ impl SnapshotContract {
         // Also extend TTL for total supply
         let ts_key = DataKey::SnapshotTotalSupply(snapshot_id);
         env.storage().persistent().extend_ttl(&ts_key, thirty_days_ledgers, thirty_days_ledgers);
+
+        // 3. Snapshot delegation power
+        let delegation_contract: Address = env.storage().persistent().get(&DataKey::DelegationContract).expect("delegation not set");
+        env.invoke_contract::<()>(
+            &delegation_contract,
+            &Symbol::new(&env, "snapshot_delegations"),
+            (snapshot_id, env.current_contract_address()).into_val(&env),
+        );
     }
 
     /// returns the voting power for a voter at a specific snapshot
@@ -144,6 +154,14 @@ mod test {
         }
     }
 
+    #[contract]
+    pub struct MockDelegationForSnapshot;
+
+    #[contractimpl]
+    impl MockDelegationForSnapshot {
+        pub fn snapshot_delegations(_env: Env, _snapshot_id: u32, _snapshot_contract: Address) {}
+    }
+
     #[test]
     fn test_snapshot_logic() {
         let env = Env::default();
@@ -151,11 +169,12 @@ mod test {
 
         let snapshot_id = env.register_contract(None, SnapshotContract);
         let staking_id = env.register_contract(None, MockStaking);
+        let delegation_id = env.register_contract(None, MockDelegationForSnapshot);
         let client = SnapshotContractClient::new(&env, &snapshot_id);
         let staking = MockStakingClient::new(&env, &staking_id);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin, &staking_id);
+        client.initialize(&admin, &staking_id, &delegation_id);
 
         let voter1 = Address::generate(&env);
         let voter2 = Address::generate(&env);
