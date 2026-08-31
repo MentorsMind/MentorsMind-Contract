@@ -4,7 +4,7 @@ use soroban_sdk::{contracttype, Address, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryState {
+pub struct CrossContractRecoveryState {
     pub contract_id: Address,
     pub action: Symbol,
     pub rollback_required: bool,
@@ -18,8 +18,8 @@ pub struct RollbackProtector {
     pub is_active: bool,
 }
 
-pub fn trigger_rollback(contract: Address, action: Symbol) -> RecoveryState {
-    RecoveryState {
+pub fn trigger_rollback(contract: Address, action: Symbol) -> CrossContractRecoveryState {
+    CrossContractRecoveryState {
         contract_id: contract,
         action,
         rollback_required: true,
@@ -31,7 +31,7 @@ pub fn execute_with_recovery<F, R>(
     contract: Address,
     action: Symbol,
     f: F,
-) -> Result<R, RecoveryState>
+) -> Result<R, CrossContractRecoveryState>
 where
     F: FnOnce() -> Result<R, ()>,
 {

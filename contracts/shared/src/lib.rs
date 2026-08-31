@@ -34,7 +34,6 @@ pub mod staking;
 pub mod storage;
 pub mod storage_compatibility;
 pub mod ttl_utils;
-pub mod interface_id;
 pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
@@ -42,10 +41,7 @@ pub mod atomic_state;
 pub mod community_protection;
 pub mod pricing_protection;
 pub mod privacy_protection;
-pub mod justice_protection;
-pub mod outcome_authenticity;
 pub mod scalability_protection;
-pub mod learner_protection;
 pub mod mev_protection;
 pub mod resource_management;
 pub mod platform_authenticity;
@@ -72,12 +68,9 @@ pub mod attack_detection;
 
 // Additional protection modules
 pub mod cartel_detection;
-pub mod key_management;
 pub mod transaction_guard;
 pub mod validator_accountability;
 pub mod cross_chain_sync;
-pub mod recording_integrity;
-pub mod session_privacy;
 pub mod payment_integrity;
 pub mod threat_intelligence;
 pub mod tokenomics_protection;
@@ -170,7 +163,6 @@ pub use privacy_protection::{
     FIELD_LEARNING_HISTORY, FIELD_PAYMENT, MAX_ACCESSES_PER_WINDOW, MINIMAL_SESSION_FIELDS,
     PRIVACY_RISK_THRESHOLD,
 };
-pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::{
     validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
     BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
@@ -222,10 +214,6 @@ pub use ttl_utils::{
     WARNING_THRESHOLD_LEDGERS,
 };
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
-pub use reputation::{
-    analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
-    ReputationProof, SybilDetection,
-};
 pub use failure_tracking::{
     ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
     calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
@@ -246,62 +234,6 @@ pub use community_protection::{
     NETWORK_DISTINCT_SOURCE_MIN_BPS, NETWORK_SUSPICIOUS_GROWTH_PER_DAY,
     SOCIAL_PROOF_BURST_WINDOW_SECS, SOCIAL_PROOF_MIN_DISTINCT_BPS,
     COMMUNITY_INTERVENTION_THRESHOLD,
-};
-pub use pricing_protection::{
-    detect_price_coordination, validate_market_rate, enforce_fair_pricing,
-    verify_demand_authenticity, compute_pricing_intervention, PriceCoordinationFlag,
-    MarketRateValidation, FairPricingResult, DemandAuthenticity, PricingInterventionRecord,
-    PRICE_COORDINATION_WINDOW_SECS, PRICE_MATCH_TOLERANCE_BPS, PRICING_RISK_THRESHOLD,
-    DEFAULT_MAX_MARKET_DEVIATION_BPS, MAX_MARKET_DEVIATION_CEILING_BPS,
-    DEMAND_BURST_WINDOW_SECS, DEMAND_MIN_DISTINCT_BPS,
-};
-pub use privacy_protection::{
-    check_access, minimize_to_need_to_know, detect_exploitation, compute_privacy_intervention,
-    ConsentRecord, AccessDecision, PrivacyMonitoringResult, PrivacyInterventionRecord,
-    FIELD_IDENTITY, FIELD_CONTACT, FIELD_LEARNING_HISTORY, FIELD_CAREER_DATA, FIELD_PAYMENT,
-    MINIMAL_SESSION_FIELDS, ALL_FIELDS, ACCESS_MONITORING_WINDOW_SECS,
-    MAX_ACCESSES_PER_WINDOW, PRIVACY_RISK_THRESHOLD,
-};
-pub use justice_protection::{
-    ensure_dispute_independence, validate_evidence_authenticity, protect_arbitration_fairness,
-    compute_justice_intervention, is_justice_restoration_eligible,
-    DisputeIndependenceFlag, EvidenceAuthenticity, ArbitrationBiasFlag, JusticeInterventionRecord,
-    DISPUTE_COORDINATION_WINDOW_SECS, DISPUTE_INDEPENDENCE_RISK_THRESHOLD,
-    EVIDENCE_DUPLICATE_WINDOW_SECS, EVIDENCE_TAMPER_RISK_THRESHOLD,
-    ARBITRATION_MIN_RULINGS_FOR_BIAS, ARBITRATION_BIAS_RATIO_BPS_THRESHOLD,
-    ARBITRATION_BIAS_RISK_THRESHOLD, JUSTICE_INTERVENTION_THRESHOLD,
-    JUSTICE_RESTORATION_COOLDOWN_SECS,
-};
-pub use outcome_authenticity::{
-    authenticate_learning_outcomes, protect_success_metrics, validate_assessment_criteria,
-    compute_outcome_intervention, is_outcome_restoration_eligible,
-    OutcomeAuthenticity, SuccessMetricProtection, AssessmentValidation, OutcomeInterventionRecord,
-    OUTCOME_BURST_WINDOW_SECS, OUTCOME_MIN_DISTINCT_BPS, OUTCOME_RISK_THRESHOLD,
-    METRIC_GAMING_DEVIATION_BPS, ASSESSMENT_COORDINATION_WINDOW_SECS, ASSESSMENT_RISK_THRESHOLD,
-    OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_RESTORATION_COOLDOWN_SECS,
-};
-pub use scalability_protection::{
-    detect_resource_competition, validate_load_pattern, distribute_resources_fairly,
-    compute_scalability_intervention, is_performance_restoration_eligible,
-    ResourceCompetitionFlag, LoadValidationResult, FairResourceAllocation,
-    PerformanceInterventionRecord,
-    RESOURCE_BURST_WINDOW_SECS, RESOURCE_MIN_DISTINCT_BPS, RESOURCE_COMPETITION_RISK_THRESHOLD,
-    LOAD_SUSPICIOUS_RATE_PER_MINUTE, FAIR_ALLOCATION_MAX_SHARE_BPS,
-    PERFORMANCE_INTERVENTION_THRESHOLD, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
-};
-pub use learner_protection::{
-    assess_vulnerability, detect_predatory_behavior, enforce_learner_fair_pricing,
-    identify_exploitation_patterns, compute_welfare_status,
-    compute_learner_protection_intervention, compute_emergency_intervention,
-    is_protection_restoration_eligible,
-    VulnerabilityAssessment, PredatoryBehaviorDetection, ExploitationPattern,
-    WelfareStatus, EmergencyIntervention, LearnerProtectionRecord,
-    VULNERABILITY_SESSION_WINDOW, VULNERABILITY_HIGH_RECURRENCE_THRESHOLD,
-    VULNERABILITY_RISK_THRESHOLD, AFFORDABILITY_DEVIATION_BPS,
-    FINANCIAL_PROTECTION_CAP_BPS, PREDATORY_LOW_QUALITY_THRESHOLD,
-    PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
-    EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
-    LEARNER_PROTECTION_COOLDOWN_SECS,
 };
 pub use mev_protection::{
     detect_atomic_arbitrage, enforce_protocol_isolation, compute_mev_redistribution, record_mev_monitoring,
@@ -323,7 +255,10 @@ pub use dynamic_fees::{
     DynamicFeeResult, FeeEvasionResult,
     BASE_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
 };
-pub use validation::{require_auth_and_validate, ValidationError, Validator};
+pub mod curriculum_validation;
+pub mod qualification_verification;
+pub mod proof_of_mentoring;
+pub mod cross_contract_recovery;
 pub use curriculum_validation::{
     validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute
 };
@@ -334,7 +269,7 @@ pub use proof_of_mentoring::{
     generate_mentoring_proof, check_session_authenticity, ProofOfMentoring, SessionAuthenticity, ReputationIntegrity
 };
 pub use cross_contract_recovery::{
-    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector
+    trigger_rollback, execute_with_recovery, CrossContractRecoveryState, RollbackProtector
 };
 
 // ---------------------------------------------------------------------------
@@ -349,83 +284,6 @@ pub use cross_chain_sync::{
     CrossChainInconsistency, CrossChainStateProof, FinalityTier, XChainPhase,
     XChainSyncError, MAX_PARTICIPATING_CHAINS, MIN_FINALITY_CONFIRMATIONS,
     REORG_SAFE_DEPTH, XCHAIN_OP_TIMEOUT_SECS,
-};
-pub use failure_tracking::{
-    ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
-    calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
-    MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD,
-};
-pub use atomic_state::{
-    StateTransitionContext, PreConditionCheck, PostConditionCheck, CrossContractStateCheck,
-    StateTransitionProof, InvalidStateRecord, AtomicStateValidator, compute_transition_proof_hash,
-    all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
-    STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
-};
-pub use community_protection::{
-    detect_coordination, detect_coordination_ring, validate_network_authenticity,
-    verify_social_proof, evaluate_fair_access, compute_community_intervention,
-    is_restoration_eligible, CoordinationFlag, NetworkEffectScore, SocialProofRecord,
-    FairAccessDecision, CommunityInterventionRecord, COORDINATION_MIN_INTERACTIONS,
-    COORDINATION_TIGHT_WINDOW_SECS, COORDINATION_RISK_THRESHOLD,
-    NETWORK_DISTINCT_SOURCE_MIN_BPS, NETWORK_SUSPICIOUS_GROWTH_PER_DAY,
-    SOCIAL_PROOF_BURST_WINDOW_SECS, SOCIAL_PROOF_MIN_DISTINCT_BPS,
-    COMMUNITY_INTERVENTION_THRESHOLD,
-};
-pub use pricing_protection::{
-    detect_price_coordination, validate_market_rate, enforce_fair_pricing,
-    verify_demand_authenticity, compute_pricing_intervention, PriceCoordinationFlag,
-    MarketRateValidation, FairPricingResult, DemandAuthenticity, PricingInterventionRecord,
-    PRICE_COORDINATION_WINDOW_SECS, PRICE_MATCH_TOLERANCE_BPS, PRICING_RISK_THRESHOLD,
-    DEFAULT_MAX_MARKET_DEVIATION_BPS, MAX_MARKET_DEVIATION_CEILING_BPS,
-    DEMAND_BURST_WINDOW_SECS, DEMAND_MIN_DISTINCT_BPS,
-};
-pub use privacy_protection::{
-    check_access, minimize_to_need_to_know, detect_exploitation, compute_privacy_intervention,
-    ConsentRecord, AccessDecision, PrivacyMonitoringResult, PrivacyInterventionRecord,
-    FIELD_IDENTITY, FIELD_CONTACT, FIELD_LEARNING_HISTORY, FIELD_CAREER_DATA, FIELD_PAYMENT,
-    MINIMAL_SESSION_FIELDS, ALL_FIELDS, ACCESS_MONITORING_WINDOW_SECS,
-    MAX_ACCESSES_PER_WINDOW, PRIVACY_RISK_THRESHOLD,
-};
-pub use justice_protection::{
-    ensure_dispute_independence, validate_evidence_authenticity, protect_arbitration_fairness,
-    compute_justice_intervention, is_justice_restoration_eligible,
-    DisputeIndependenceFlag, EvidenceAuthenticity, ArbitrationBiasFlag, JusticeInterventionRecord,
-    DISPUTE_COORDINATION_WINDOW_SECS, DISPUTE_INDEPENDENCE_RISK_THRESHOLD,
-    EVIDENCE_DUPLICATE_WINDOW_SECS, EVIDENCE_TAMPER_RISK_THRESHOLD,
-    ARBITRATION_MIN_RULINGS_FOR_BIAS, ARBITRATION_BIAS_RATIO_BPS_THRESHOLD,
-    ARBITRATION_BIAS_RISK_THRESHOLD, JUSTICE_INTERVENTION_THRESHOLD,
-    JUSTICE_RESTORATION_COOLDOWN_SECS,
-};
-pub use outcome_authenticity::{
-    authenticate_learning_outcomes, protect_success_metrics, validate_assessment_criteria,
-    compute_outcome_intervention, is_outcome_restoration_eligible,
-    OutcomeAuthenticity, SuccessMetricProtection, AssessmentValidation, OutcomeInterventionRecord,
-    OUTCOME_BURST_WINDOW_SECS, OUTCOME_MIN_DISTINCT_BPS, OUTCOME_RISK_THRESHOLD,
-    METRIC_GAMING_DEVIATION_BPS, ASSESSMENT_COORDINATION_WINDOW_SECS, ASSESSMENT_RISK_THRESHOLD,
-    OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_RESTORATION_COOLDOWN_SECS,
-};
-pub use scalability_protection::{
-    detect_resource_competition, validate_load_pattern, distribute_resources_fairly,
-    compute_scalability_intervention, is_performance_restoration_eligible,
-    ResourceCompetitionFlag, LoadValidationResult, FairResourceAllocation,
-    PerformanceInterventionRecord,
-    RESOURCE_BURST_WINDOW_SECS, RESOURCE_MIN_DISTINCT_BPS, RESOURCE_COMPETITION_RISK_THRESHOLD,
-    LOAD_SUSPICIOUS_RATE_PER_MINUTE, FAIR_ALLOCATION_MAX_SHARE_BPS,
-    PERFORMANCE_INTERVENTION_THRESHOLD, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
-};
-pub use learner_protection::{
-    assess_vulnerability, detect_predatory_behavior, enforce_learner_fair_pricing,
-    identify_exploitation_patterns, compute_welfare_status,
-    compute_learner_protection_intervention, compute_emergency_intervention,
-    is_protection_restoration_eligible,
-    VulnerabilityAssessment, PredatoryBehaviorDetection, ExploitationPattern,
-    WelfareStatus, EmergencyIntervention, LearnerProtectionRecord,
-    VULNERABILITY_SESSION_WINDOW, VULNERABILITY_HIGH_RECURRENCE_THRESHOLD,
-    VULNERABILITY_RISK_THRESHOLD, AFFORDABILITY_DEVIATION_BPS,
-    FINANCIAL_PROTECTION_CAP_BPS, PREDATORY_LOW_QUALITY_THRESHOLD,
-    PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
-    EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
-    LEARNER_PROTECTION_COOLDOWN_SECS,
 };
 
 // Key management exports  
@@ -448,6 +306,7 @@ pub use recording_integrity::{
     log_access, emergency_privacy_protection,
     SessionRecording, RecordingStatus, ConsentRecord as RecordingConsentRecord, AccessRole, RedactionRecord, 
     AccessLogEntry, IntegrityVerificationResult,
+    DEFAULT_RETENTION_DAYS, MAX_RECORDING_SIZE_MB, MIN_CONSENT_DURATION_HOURS,
 };
 
 // Payment integrity exports
@@ -493,6 +352,7 @@ pub use threat_intelligence::{
     assess_delegation_concentration, assess_token_velocity, correlate_attack_vectors, assess_review_quality,
     DelegationConcentrationReport, EconomicVelocityReport, MultiVectorThreatReport, ReviewQualityReport,
     CollusionDetection, GameTheoryState, IncentiveCompatibilityResult,
+    DEFAULT_DELEGATION_CAP_BPS,
 };
 
 // Tokenomics protection exports
@@ -629,13 +489,6 @@ pub use grade_inflation::{
 pub use assessment_security::{
     AssessmentMetrics, AssessmentRecord, AssessmentSecurity, AssessmentSecurityError,
     GamingDetectionResult, GamingFlag, ManipulationRecord, ProgressAuthenticityRecord,
-};
-pub use recording_integrity::{
-    apply_redaction, check_access_authorized, compute_merkle_root, create_recording,
-    emergency_privacy_protection, grant_consent, log_access, revoke_consent,
-    verify_recording_integrity, AccessLogEntry, AccessRole,
-    IntegrityVerificationResult, RecordingStatus, RedactionRecord, SessionRecording,
-    DEFAULT_RETENTION_DAYS, MAX_RECORDING_SIZE_MB, MIN_CONSENT_DURATION_HOURS,
 };
 pub use transfer_security::{
     CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer, CreditInflationRecord,

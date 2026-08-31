@@ -35,7 +35,7 @@
 /// 4. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
 #[allow(dead_code)]
 
-use soroban_sdk::{Env, IntoVal, Symbol, Val};
+use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.
@@ -94,6 +94,44 @@ pub fn emit<D: IntoVal<Env, Val>>(
 #[inline] pub fn contract_insurance(env: &Env)       -> Symbol { Symbol::new(env, "insurance") }
 #[inline] pub fn contract_lending(env: &Env)         -> Symbol { Symbol::new(env, "lending") }
 #[inline] pub fn contract_mnt_token(env: &Env)       -> Symbol { Symbol::new(env, "mnt_token") }
+#[inline] pub fn contract_delegation(env: &Env)      -> Symbol { Symbol::new(env, "delegation") }
+#[inline] pub fn contract_escrow_factory(env: &Env)  -> Symbol { Symbol::new(env, "esc_factory") }
+#[inline] pub fn contract_endorsements(env: &Env)    -> Symbol { Symbol::new(env, "endorsmnt") }
+#[inline] pub fn contract_isa(env: &Env)             -> Symbol { Symbol::new(env, "isa") }
+#[inline] pub fn contract_rate_limiter(env: &Env)    -> Symbol { Symbol::new(env, "rate_limit") }
+
+// ---------------------------------------------------------------------------
+// Standardized event payload structs — canonical definitions for cross-contract events.
+// ---------------------------------------------------------------------------
+
+/// Admin change proposal event, emitted by contracts that support admin transfer.
+/// Deduplicates the identical struct previously defined in 5+ contracts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+/// Admin change accepted event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeAcceptedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Proposal cancelled with cooldown event (governance).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCancelledWithCooldown {
+    pub proposal_id: u32,
+    pub canceler: Address,
+    pub cooldown_secs: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Typed emit helpers — one per contract family
@@ -187,6 +225,31 @@ pub fn emit_trs_analytics_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Sym
 /// Emit a standardized event for the `subscription_analytics` contract.
 pub fn emit_sub_analytics_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Symbol, data: D) {
     emit(env, contract_sub_analytics(env), event_type, data);
+}
+
+/// Emit a standardized event for the `delegation` contract.
+pub fn emit_delegation_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Symbol, data: D) {
+    emit(env, contract_delegation(env), event_type, data);
+}
+
+/// Emit a standardized event for the `escrow_factory` contract.
+pub fn emit_escrow_factory_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Symbol, data: D) {
+    emit(env, contract_escrow_factory(env), event_type, data);
+}
+
+/// Emit a standardized event for the `endorsements` contract.
+pub fn emit_endorsements_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Symbol, data: D) {
+    emit(env, contract_endorsements(env), event_type, data);
+}
+
+/// Emit a standardized event for the `isa` contract.
+pub fn emit_isa_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Symbol, data: D) {
+    emit(env, contract_isa(env), event_type, data);
+}
+
+/// Emit a standardized event for the `rate_limiter` contract.
+pub fn emit_rate_limiter_event<D: IntoVal<Env, Val>>(env: &Env, event_type: Symbol, data: D) {
+    emit(env, contract_rate_limiter(env), event_type, data);
 }
 
 /// Generic emit for any contract not yet assigned a typed helper.
@@ -329,6 +392,39 @@ pub fn evt_sub_anlyt_metrics(env: &Env) -> Symbol { Symbol::new(env, "metrics") 
 // --- referral ---
 pub fn evt_referral_registered(env: &Env)  -> Symbol { Symbol::new(env, "registered") }
 pub fn evt_referral_reward(env: &Env)      -> Symbol { Symbol::new(env, "reward") }
+
+// --- delegation ---
+pub fn evt_del_delegated(env: &Env)       -> Symbol { Symbol::new(env, "delegated") }
+pub fn evt_del_undelegated(env: &Env)     -> Symbol { Symbol::new(env, "undelegated") }
+pub fn evt_del_suspended(env: &Env)       -> Symbol { Symbol::new(env, "suspended") }
+
+// --- escrow_factory ---
+pub fn evt_ef_admin_proposed(env: &Env)   -> Symbol { Symbol::new(env, "admin_prop") }
+pub fn evt_ef_admin_accepted(env: &Env)   -> Symbol { Symbol::new(env, "admin_acc") }
+pub fn evt_ef_deployed(env: &Env)         -> Symbol { Symbol::new(env, "deployed") }
+pub fn evt_ef_impl_upgraded(env: &Env)    -> Symbol { Symbol::new(env, "impl_upg") }
+pub fn evt_ef_anomaly_warn(env: &Env)     -> Symbol { Symbol::new(env, "anom_warn") }
+
+// --- endorsements ---
+pub fn evt_end_endorsed(env: &Env)        -> Symbol { Symbol::new(env, "endorsed") }
+pub fn evt_end_removed(env: &Env)         -> Symbol { Symbol::new(env, "removed") }
+pub fn evt_end_reendorsed(env: &Env)      -> Symbol { Symbol::new(env, "re_endorsed") }
+
+// --- isa ---
+pub fn evt_isa_created(env: &Env)         -> Symbol { Symbol::new(env, "created") }
+pub fn evt_isa_completed(env: &Env)       -> Symbol { Symbol::new(env, "completed") }
+pub fn evt_isa_earning_shared(env: &Env)  -> Symbol { Symbol::new(env, "earning_shared") }
+pub fn evt_isa_payment_recorded(env: &Env)-> Symbol { Symbol::new(env, "payment_rec") }
+pub fn evt_isa_payment_missed(env: &Env)  -> Symbol { Symbol::new(env, "payment_missed") }
+pub fn evt_isa_defaulted(env: &Env)       -> Symbol { Symbol::new(env, "defaulted") }
+
+// --- rate_limiter ---
+pub fn evt_rl_exceeded(env: &Env)         -> Symbol { Symbol::new(env, "exceeded") }
+pub fn evt_rl_whitelist_added(env: &Env)  -> Symbol { Symbol::new(env, "wl_added") }
+pub fn evt_rl_whitelist_removed(env: &Env)-> Symbol { Symbol::new(env, "wl_removed") }
+
+// --- subscription analytics ---
+pub fn evt_sub_anlyt_metrics_updated(env: &Env) -> Symbol { Symbol::new(env, "metrics_upd") }
 
 // ---------------------------------------------------------------------------
 // Schema compliance test helpers (used by the indexer test module)
