@@ -14,6 +14,7 @@ use shared::{
     MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
     REWARD_MULTIPLIER_MIN_BPS, MIN_POSITION_DELTA_SECS,
     CollusionDetection, GameTheoryState, IncentiveCompatibilityResult, TokenomicsAuditResult,
+    Pagination,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,

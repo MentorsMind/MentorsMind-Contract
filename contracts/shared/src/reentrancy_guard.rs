@@ -268,18 +268,10 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum BatchOp {
-    Transfer {
-        token: Address,
-        from: Address,
-        to: Address,
-        amount: i128,
-        executed: bool,
-    },
-    Invoke {
-        contract: Address,
-        function: Symbol,
-        executed: bool,
-    },
+    /// (token, from, to, amount, executed)
+    Transfer(Address, Address, Address, i128, bool),
+    /// (contract, function, executed)
+    Invoke(Address, Symbol, bool),
 }
 
 /// Error returned by [`AtomicBatch::validate`].
@@ -334,23 +326,13 @@ impl<'a> AtomicBatch<'a> {
         amount: i128,
     ) -> u32 {
         let idx = self.ops.len();
-        self.ops.push_back(BatchOp::Transfer {
-            token,
-            from,
-            to,
-            amount,
-            executed: false,
-        });
+        self.ops.push_back(BatchOp::Transfer(token, from, to, amount, false));
         idx
     }
 
     pub fn add_invoke(&mut self, contract: Address, function: Symbol) -> u32 {
         let idx = self.ops.len();
-        self.ops.push_back(BatchOp::Invoke {
-            contract,
-            function,
-            executed: false,
-        });
+        self.ops.push_back(BatchOp::Invoke(contract, function, false));
         idx
     }
 
