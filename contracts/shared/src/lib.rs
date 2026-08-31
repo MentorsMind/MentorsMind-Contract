@@ -65,6 +65,7 @@ pub mod service_continuity;
 pub mod session_privacy;
 pub mod session_protection;
 pub mod attack_detection;
+pub mod health_reporter;
 
 // Additional protection modules
 pub mod cartel_detection;
@@ -261,6 +262,10 @@ pub mod proof_of_mentoring;
 pub mod cross_contract_recovery;
 pub use curriculum_validation::{
     validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute
+};
+pub use health_reporter::{
+    AlertSeverity, HealthMetric, HealthReporterError, HealthReporter, HealthStorageKey,
+    HealthThresholds, MetricCategory, SystemHealth, report_metric,
 };
 pub use qualification_verification::{
     verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment

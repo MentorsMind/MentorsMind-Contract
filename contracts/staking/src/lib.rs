@@ -2,6 +2,7 @@
 #![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
+use shared::health_reporter::{report_metric, MetricCategory};
 use shared::{
     action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
     compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
@@ -211,6 +212,8 @@ pub enum DataKey {
     StakeRollbackApproval(u32, Address),
     /// Auto-incremented staking rollback proposal counter.
     StakeRollbackProposalCount,
+    /// Address of the health dashboard for metric reporting.
+    HealthDashboard,
     // -----------------------------------------------------------------------
     // Snapshot-based reward + lockup + penalty keys
     // -----------------------------------------------------------------------
@@ -598,6 +601,19 @@ impl StakingContract {
             .set(&DataKey::SessionRegistryContract, &session_registry);
     }
 
+    /// Set the health dashboard address for metric reporting. Admin only.
+    pub fn set_health_dashboard(env: Env, health_dashboard: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::HealthDashboard, &health_dashboard);
+    }
+
     /// Adjust the stake/rating/session thresholds each tier requires.
     /// Admin (governance) only.
     pub fn set_tier_requirements(env: Env, admin: Address, requirements: TierRequirements) {
@@ -847,6 +863,26 @@ impl StakingContract {
                 tier,
             },
         );
+
+        // Report health metric for staking TVL
+        if let Some(dashboard) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            let new_total: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0);
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "total_staked"),
+                MetricCategory::Liquidity,
+                new_total,
+            );
+        }
 
         Ok(())
     }
@@ -1117,6 +1153,26 @@ impl StakingContract {
                 amount: record.amount,
             },
         );
+
+        // Report health metric for staking TVL after unstake
+        if let Some(dashboard) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            let new_total: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0);
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "total_staked"),
+                MetricCategory::Liquidity,
+                new_total,
+            );
+        }
 
         Ok(())
     }
