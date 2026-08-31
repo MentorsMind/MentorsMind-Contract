@@ -173,15 +173,15 @@ impl CartelDetection {
         let mut fairly_distributed = 0u32;
 
         // Count how many premium slots each mentor holds
-        let mut mentor_slot_count: Vec<(Address, u32)> = Vec::new(env);
+        let mentor_slot_count: Vec<(Address, u32)> = Vec::new(env);
 
         for slot in available_slots.iter() {
             if slot.price >= premium_threshold_price {
-                let mut found = false;
-                for (idx, (mentor, count)) in mentor_slot_count.iter().enumerate() {
+                let mut _found = false;
+                for (_idx, (mentor, _count)) in mentor_slot_count.iter().enumerate() {
                     if mentor == slot.mentor {
                         // Update count (simplified)
-                        found = true;
+                        _found = true;
                         break;
                     }
                 }
@@ -241,7 +241,7 @@ impl CartelDetection {
     /// Maintain scheduling equity and prevent manipulation
     pub fn maintain_scheduling_equity(
         env: &Env,
-        mentor: &Address,
+        _mentor: &Address,
         slot_allocation: &Vec<TimeSlotInfo>,
         historical_pattern: &Vec<TimeSlotInfo>,
     ) -> bool {
@@ -266,7 +266,7 @@ impl CartelDetection {
     /// Monitor availability for manipulation patterns
     pub fn monitor_availability_patterns(
         env: &Env,
-        mentor: &Address,
+        _mentor: &Address,
         availability_changes: &Vec<AvailabilityChange>,
     ) -> Vec<CoordinationPattern> {
         let mut suspicious_patterns: Vec<CoordinationPattern> = Vec::new(env);
@@ -312,9 +312,9 @@ impl CartelDetection {
 
     /// Apply corrective measures for cartel activity
     pub fn apply_cartel_correction(
-        env: &Env,
-        cartel_record: &CartelActivityRecord,
-        correction_type: Symbol,
+        _env: &Env,
+        _cartel_record: &CartelActivityRecord,
+        _correction_type: Symbol,
     ) -> bool {
         // Implementations could include:
         // - Force slot redistribution
@@ -327,9 +327,9 @@ impl CartelDetection {
 
     /// Restore fair access after cartel detection
     pub fn restore_fair_access(
-        env: &Env,
-        affected_time_period: (u64, u64),
-        all_mentors: &Vec<Address>,
+        _env: &Env,
+        _affected_time_period: (u64, u64),
+        _all_mentors: &Vec<Address>,
     ) -> bool {
         // Rebalance slot distribution
         // Restore fair pricing
@@ -341,8 +341,8 @@ impl CartelDetection {
     // Helper functions
 
     fn detect_synchronized_withdrawals(
-        env: &Env,
-        mentor: &Address,
+        _env: &Env,
+        _mentor: &Address,
         activity: &Vec<TimeSlotInfo>,
     ) -> bool {
         activity.iter().fold(0, |acc, slot| {
@@ -354,7 +354,7 @@ impl CartelDetection {
         }) > activity.len() as u32 / 2
     }
 
-    fn detect_uniform_pricing(env: &Env, slots: &Vec<TimeSlotInfo>) -> bool {
+    fn detect_uniform_pricing(_env: &Env, slots: &Vec<TimeSlotInfo>) -> bool {
         if slots.len() < 2 {
             return false;
         }
@@ -364,27 +364,27 @@ impl CartelDetection {
     }
 
     fn analyze_time_slot_coordination(
-        env: &Env,
-        mentor: &Address,
-        recent_activity: &Vec<TimeSlotInfo>,
-        other_mentors_activity: &Vec<(Address, Vec<TimeSlotInfo>)>,
+        _env: &Env,
+        _mentor: &Address,
+        _recent_activity: &Vec<TimeSlotInfo>,
+        _other_mentors_activity: &Vec<(Address, Vec<TimeSlotInfo>)>,
     ) -> Option<CoordinationPattern> {
         // Look for overlapping or complementary time slot patterns
         None
     }
 
     fn detect_complementary_patterns(
-        env: &Env,
-        mentor: &Address,
-        other_mentors_activity: &Vec<(Address, Vec<TimeSlotInfo>)>,
+        _env: &Env,
+        _mentor: &Address,
+        _other_mentors_activity: &Vec<(Address, Vec<TimeSlotInfo>)>,
     ) -> bool {
         false
     }
 
     fn detect_communication_correlation(
-        env: &Env,
-        mentor: &Address,
-        other_mentors_activity: &Vec<(Address, Vec<TimeSlotInfo>)>,
+        _env: &Env,
+        _mentor: &Address,
+        _other_mentors_activity: &Vec<(Address, Vec<TimeSlotInfo>)>,
     ) -> bool {
         false
     }
@@ -402,31 +402,31 @@ impl CartelDetection {
     }
 
     fn is_attempting_monopolization(
-        env: &Env,
-        current: &Vec<TimeSlotInfo>,
-        historical: &Vec<TimeSlotInfo>,
+        _env: &Env,
+        _current: &Vec<TimeSlotInfo>,
+        _historical: &Vec<TimeSlotInfo>,
     ) -> bool {
         // Check if concentration of premium slots is increasing
         false
     }
 
-    fn has_fair_slot_distribution(env: &Env, slots: &Vec<TimeSlotInfo>) -> bool {
+    fn has_fair_slot_distribution(_env: &Env, _slots: &Vec<TimeSlotInfo>) -> bool {
         true
     }
 
-    fn has_equitable_pricing(env: &Env, slots: &Vec<TimeSlotInfo>) -> bool {
+    fn has_equitable_pricing(_env: &Env, _slots: &Vec<TimeSlotInfo>) -> bool {
         true
     }
 
-    fn detect_simultaneous_changes(env: &Env, changes: &Vec<AvailabilityChange>) -> bool {
+    fn detect_simultaneous_changes(_env: &Env, _changes: &Vec<AvailabilityChange>) -> bool {
         false
     }
 
-    fn detect_strategic_windows(env: &Env, changes: &Vec<AvailabilityChange>) -> bool {
+    fn detect_strategic_windows(_env: &Env, _changes: &Vec<AvailabilityChange>) -> bool {
         false
     }
 
-    fn detect_coordinated_pricing(env: &Env, changes: &Vec<AvailabilityChange>) -> bool {
+    fn detect_coordinated_pricing(_env: &Env, _changes: &Vec<AvailabilityChange>) -> bool {
         false
     }
 }

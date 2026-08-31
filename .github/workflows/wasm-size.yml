@@ -29,8 +29,8 @@ jobs:
 
       - name: Install tools
         run: |
-          cargo install wasm-opt || true
           cargo install twiggy || true
+          sudo apt-get update && sudo apt-get install -y binaryen || true
 
       - name: Build all contracts (release)
         run: |

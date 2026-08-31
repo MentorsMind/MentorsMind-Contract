@@ -128,14 +128,9 @@ jobs:
         run: |
           echo "Running optimization validation..."
           if [ -f "benchmarks/baselines_before_optimization.json" ]; then
-            # Run validation script
-            ./performance_summary.ps1 > optimization_results.txt 2>&1 || true
             echo "validation_completed=true" >> $GITHUB_OUTPUT
-            if grep -q "TARGET EXCEEDED" optimization_results.txt; then
-              echo "validation_passed=true" >> $GITHUB_OUTPUT
-            else
-              echo "validation_passed=false" >> $GITHUB_OUTPUT
-            fi
+            echo "validation_passed=false" >> $GITHUB_OUTPUT
+            echo "Optimization validation: baselines_before_optimization.json found but validation script not implemented"
           else
             echo "No pre-optimization baselines found, skipping validation"
             echo "validation_completed=false" >> $GITHUB_OUTPUT

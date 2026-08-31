@@ -69,15 +69,23 @@ pub fn sustainability_ratio_ok(total_rewards: i128, total_staked: i128) -> bool 
 }
 
 /// Detect whether two timestamp-based actions suggest coordinated timing.
+/// Simple implementation that checks consecutive pairs without sorting.
 pub fn detect_coordinated_timing(timestamps: &[u64], window_secs: u64) -> bool {
     if timestamps.len() < 2 {
         return false;
     }
-    let mut sorted = timestamps.to_vec();
-    sorted.sort();
-    for pair in sorted.windows(2) {
-        if pair[1].saturating_sub(pair[0]) < window_secs / 10 {
-            return true;
+    
+    // Check all pairs for suspicious timing patterns
+    for i in 0..timestamps.len() {
+        for j in (i + 1)..timestamps.len() {
+            let diff = if timestamps[i] > timestamps[j] {
+                timestamps[i] - timestamps[j]
+            } else {
+                timestamps[j] - timestamps[i]
+            };
+            if diff < window_secs / 10 {
+                return true;
+            }
         }
     }
     false

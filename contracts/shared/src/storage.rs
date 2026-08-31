@@ -694,4 +694,52 @@ mod test {
             );
         });
     }
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum TestRootKey {
+        NamespaceRoot,
+        Value,
+    }
+
+    #[test]
+    fn namespace_is_contract_specific() {
+        let env = Env::default();
+        let scope = symbol_short!("test_ns");
+        let ns = SecureStorageAccess::install_namespace(&env, &TestRootKey::NamespaceRoot, scope);
+        StorageAccessControl::validate_namespace(&env, &ns).unwrap();
+        SecureStorageAccess::set_persistent_checked(
+            &env,
+            &TestRootKey::NamespaceRoot,
+            STORAGE_DERIVE_CTX,
+            &TestRootKey::Value,
+            &42u32,
+        )
+        .unwrap();
+        let loaded: u32 = SecureStorageAccess::get_persistent_checked(
+            &env,
+            &TestRootKey::NamespaceRoot,
+            &TestRootKey::Value,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded, 42);
+    }
+
+    #[test]
+    fn collision_detector_rejects_foreign_namespace() {
+        let env = Env::default();
+        let scope = symbol_short!("test_ns");
+        let ns = StorageKeyDerivation::namespace(&env, scope);
+        let foreign = StorageNamespace {
+            scope,
+            prefix: BytesN::from_array(&env, &[0xFFu8; 32]),
+        };
+        assert_eq!(
+            StorageAccessControl::reject_foreign_namespace(&env, &foreign),
+            Err(StorageSecurityError::CrossContractAccessDenied)
+        );
+        CollisionDetector::register(&env, &ns, STORAGE_DERIVE_CTX, &TestRootKey::Value).unwrap();
+        assert!(CollisionDetector::register(&env, &ns, STORAGE_DERIVE_CTX, &TestRootKey::Value).is_ok());
+    }
 }

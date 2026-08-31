@@ -381,16 +381,7 @@ impl TTLRecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contract, symbol_short, Address, Env};
-
-    #[contract]
-    struct TestTtlContract;
-
-    fn setup_env() -> (Env, Address) {
-        let env = Env::default();
-        let addr = env.register_contract(None, TestTtlContract);
-        (env, addr)
-    }
+    use soroban_sdk::{symbol_short, Address, Env};
 
     #[test]
     fn test_constants_and_safety_margins() {
@@ -463,49 +454,36 @@ mod tests {
 
     #[test]
     fn test_dependency_tracking_lifecycle() {
-        let (env, addr) = setup_env();
-        env.as_contract(&addr, || {
-            let op_id = symbol_short!("esc_101");
-            let sample_key = symbol_short!("data_key");
+        let env = Env::default();
+        let op_id = symbol_short!("esc_101");
+        let sample_key = symbol_short!("data_key");
 
-            assert!(!DataDependencyTracker::is_dependency_active(
-                &env, op_id.clone(), &sample_key
-            ));
+        assert!(!DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
 
-            DataDependencyTracker::register_dependency(&env, op_id.clone(), &sample_key);
-            assert!(DataDependencyTracker::is_dependency_active(
-                &env, op_id.clone(), &sample_key
-            ));
+        // Register dependency
+        DataDependencyTracker::register_dependency(&env, op_id, &sample_key);
+        assert!(DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
 
-            DataDependencyTracker::clear_dependency(&env, op_id.clone(), &sample_key);
-            assert!(!DataDependencyTracker::is_dependency_active(
-                &env, op_id, &sample_key
-            ));
-        });
+        // Clear dependency
+        DataDependencyTracker::clear_dependency(&env, op_id, &sample_key);
+        assert!(!DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
     }
 
     #[test]
     fn test_ttl_recovery_manager() {
-        let (env, addr) = setup_env();
-        env.as_contract(&addr, || {
-            let backup_id = symbol_short!("dr_01");
-            let key_hash = BytesN::from_array(&env, &[0xfe; 32]);
-            let mut sample_payload = Bytes::new(&env);
-            sample_payload.push_back(42);
-            sample_payload.push_back(99);
+        let env = Env::default();
+        let backup_id = symbol_short!("dr_01");
+        let key_hash = BytesN::from_array(&env, &[0xfe; 32]);
+        let mut sample_payload = Bytes::new(&env);
+        sample_payload.push_back(42);
+        sample_payload.push_back(99);
 
-            assert!(!TTLRecoveryManager::has_backup(&env, backup_id.clone(), &key_hash));
+        assert!(!TTLRecoveryManager::has_backup(&env, backup_id, &key_hash));
 
-            TTLRecoveryManager::backup_data(
-                &env,
-                backup_id.clone(),
-                key_hash.clone(),
-                sample_payload.clone(),
-            );
-            assert!(TTLRecoveryManager::has_backup(&env, backup_id.clone(), &key_hash));
+        TTLRecoveryManager::backup_data(&env, backup_id, key_hash.clone(), sample_payload.clone());
+        assert!(TTLRecoveryManager::has_backup(&env, backup_id, &key_hash));
 
-            let restored = TTLRecoveryManager::restore_data(&env, backup_id, &key_hash);
-            assert_eq!(restored, Some(sample_payload));
-        });
+        let restored = TTLRecoveryManager::restore_data(&env, backup_id, &key_hash);
+        assert_eq!(restored, Some(sample_payload));
     }
 }

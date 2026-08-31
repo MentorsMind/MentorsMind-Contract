@@ -9,11 +9,7 @@ use soroban_sdk::contracterror;
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod account_security;
 pub mod admin;
-pub mod atomic_state;
-pub mod cartel_detection;
-pub mod community_protection;
 pub mod cross_contract_auth;
-pub mod cross_chain_sync;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
@@ -21,7 +17,6 @@ pub mod economic_verification;
 pub mod error_context;
 pub mod escrow;
 pub mod events;
-pub mod failure_tracking;
 pub mod gas_estimation;
 pub mod governance_voting;
 pub mod interface_id;
@@ -31,21 +26,15 @@ pub mod learner_protection;
 pub mod outcome_authenticity;
 pub mod pagination;
 pub mod pause_guard;
-pub mod pricing_protection;
-pub mod privacy_protection;
 pub mod reentrancy_guard;
-pub mod reputation;
 pub mod safe_math;
-pub mod scalability_protection;
 pub mod sig_validation;
-pub mod staking;
 pub mod state_machine;
+pub mod staking;
 pub mod storage;
 pub mod storage_compatibility;
-pub mod threat_intelligence;
-pub mod transaction_guard;
 pub mod ttl_utils;
-pub mod validator_accountability;
+pub mod interface_id;
 pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
@@ -81,31 +70,26 @@ pub mod session_privacy;
 pub mod session_protection;
 pub mod attack_detection;
 
-use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec};
+// Additional protection modules
+pub mod cartel_detection;
+pub mod key_management;
+pub mod transaction_guard;
+pub mod validator_accountability;
+pub mod cross_chain_sync;
+pub mod recording_integrity;
+pub mod session_privacy;
+pub mod payment_integrity;
+pub mod threat_intelligence;
+pub mod tokenomics_protection;
+
+// Content protection modules 
+pub mod content_protection;
+pub mod ip_verification; 
+pub mod usage_rights_management;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
-pub use atomic_state::{
-    all_checkpoints_passed, compute_transition_proof_hash, is_transition_expired,
-    AtomicStateValidator, CrossContractStateCheck, InvalidStateRecord, PostConditionCheck,
-    PreConditionCheck, StateTransitionContext, StateTransitionProof, MAX_CHECKPOINT_COUNT,
-    STATE_TRANSITION_LOCK_TTL, STATE_TRANSITION_TIMEOUT_SECS,
-};
-pub use cartel_detection::{
-    AvailabilityChange, CartelActivityRecord, CartelDetection, CartelDetectionError,
-    CartelDetectionResult, CoordinationPattern, TimeSlotFairnessAnalysis, TimeSlotInfo,
-};
-pub use community_protection::{
-    compute_community_intervention, detect_coordination, detect_coordination_ring,
-    evaluate_fair_access, is_restoration_eligible, validate_network_authenticity,
-    verify_social_proof, CommunityInterventionRecord, CoordinationFlag, FairAccessDecision,
-    NetworkEffectScore, SocialProofRecord, COMMUNITY_INTERVENTION_THRESHOLD,
-    COORDINATION_MIN_INTERACTIONS, COORDINATION_RISK_THRESHOLD, COORDINATION_TIGHT_WINDOW_SECS,
-    NETWORK_DISTINCT_SOURCE_MIN_BPS, NETWORK_SUSPICIOUS_GROWTH_PER_DAY,
-    SOCIAL_PROOF_BURST_WINDOW_SECS, SOCIAL_PROOF_MIN_DISTINCT_BPS,
-};
-pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
@@ -130,11 +114,6 @@ pub use economic_verification::{
 };
 pub use error_context::{log_contract_error, ContractErrorContext};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
-pub use failure_tracking::{
-    calculate_backoff_delay, calculate_next_retry, classify_failure, compute_failure_hash,
-    ExponentialBackoff, FailureClassification, RecoveryState, ReleaseFailure,
-    MANUAL_RECOVERY_THRESHOLD, MAX_AUTO_RELEASE_ATTEMPTS,
-};
 pub use gas_estimation::GasEstimate;
 pub use governance_voting::{
     calculate_voting_weight, compute_commitment_hash, compute_random_deadline_extension,
@@ -191,6 +170,7 @@ pub use privacy_protection::{
     FIELD_LEARNING_HISTORY, FIELD_PAYMENT, MAX_ACCESSES_PER_WINDOW, MINIMAL_SESSION_FIELDS,
     PRIVACY_RISK_THRESHOLD,
 };
+pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::{
     validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
     BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
@@ -209,36 +189,29 @@ pub use scalability_protection::{
     RESOURCE_BURST_WINDOW_SECS, RESOURCE_COMPETITION_RISK_THRESHOLD, RESOURCE_MIN_DISTINCT_BPS,
 };
 pub use sig_validation::{
-    current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline, MetaTxAction,
-    MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
-};
-pub use staking::{
-    action_claim, action_stake, action_unstake, apply_bps_multiplier,
-    compute_early_unstake_penalty, compute_reward_multiplier_bps, detect_suspicious_pattern,
-    PenaltyCalculation, RewardLockup, StakeRecord, StakedEventData, StakingActionRecord,
-    StakingSnapshot, SuspiciousPatternFlag, BASIS_POINTS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
-    EARLY_UNSTAKE_PENALTY_MIN_BPS, MAX_SCALING_DURATION_SECS, MIN_STAKING_DURATION_SECS,
-    PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS, REWARD_MULTIPLIER_MAX_BPS,
-    REWARD_MULTIPLIER_MIN_BPS, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
+    current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
+    MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
 };
 pub use state_machine::StateMachine;
+pub use staking::{
+    StakeRecord, StakedEventData, StakingSnapshot, RewardLockup, PenaltyCalculation,
+    SuspiciousPatternFlag, StakingActionRecord, compute_reward_multiplier_bps,
+    compute_early_unstake_penalty, detect_suspicious_pattern, apply_bps_multiplier,
+    action_stake, action_unstake, action_claim,
+    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, MAX_SCALING_DURATION_SECS,
+    REWARD_MULTIPLIER_MIN_BPS, REWARD_MULTIPLIER_MAX_BPS,
+    EARLY_UNSTAKE_PENALTY_MIN_BPS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
+    BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
+};
+pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use storage::{
     CollisionDetector, CollisionDetector as CollisionDetection, SecureStorageAccess,
-    StorageAccessControl, StorageIntegrity, StorageIntegrityRecord, StorageKeyDerivation,
-    StorageKeyFingerprint, StorageNamespace, StorageSecurityError, STORAGE_DERIVE_CTX,
+    StorageAccessControl, StorageIntegrity, StorageKeyDerivation, StorageKeyFingerprint,
+    StorageIntegrityRecord, StorageNamespace, StorageSecurityError, STORAGE_DERIVE_CTX,
 };
-pub use storage::{EternalStorage, InstanceKey, PersistentKey, StorageType, TempKey};
 pub use storage_compatibility::{
-    detect_layout_tampering, CompatibilityError, CompatibilityReport, CompatibilityValidator,
-    GradualMigrationStatus, MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema,
-    StorageVersion,
-};
-pub use threat_intelligence::{
-    assess_delegation_concentration, assess_review_quality, assess_token_velocity,
-    correlate_attack_vectors, DelegationConcentrationReport, EconomicVelocityReport,
-    MultiVectorThreatReport, ReviewQualityReport, DEFAULT_DELEGATION_CAP_BPS,
-    ECONOMIC_VELOCITY_WARN_BPS, GOVERNANCE_CONCENTRATION_WARN_BPS, MULTI_VECTOR_RESPONSE_THRESHOLD,
-    REVIEW_MANIPULATION_THRESHOLD,
+    CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
+    MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,
 };
 pub use ttl_utils::{
     next_bump_interval, should_bump_ttl, AlertLevel, DataBackupRecord, DataDependencyTracker,
@@ -377,212 +350,156 @@ pub use cross_chain_sync::{
     XChainSyncError, MAX_PARTICIPATING_CHAINS, MIN_FINALITY_CONFIRMATIONS,
     REORG_SAFE_DEPTH, XCHAIN_OP_TIMEOUT_SECS,
 };
-
-// ---------------------------------------------------------------------------
-// #867 — Social Engineering / Transaction-Intent Protection
-// ---------------------------------------------------------------------------
-pub use transaction_guard::{
-    add_multisig_approval, create_multisig_requirement, evaluate_transaction_intent,
-    get_protection_state, is_multisig_satisfied, record_suspicious_pattern,
-    require_account_not_blocked, require_cooling_off_elapsed, unblock_account,
-    AccountProtectionState, MultiSigRequirement, RiskLevel, SuspiciousPattern,
-    TransactionIntent, AUTO_BLOCK_SCORE_THRESHOLD, COOLING_OFF_PERIOD_SECS,
-    EMERGENCY_COOLING_OFF_SECS, HIGH_VALUE_THRESHOLD_BPS, MAX_OPS_PER_WINDOW,
+pub use failure_tracking::{
+    ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
+    calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
+    MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD,
+};
+pub use atomic_state::{
+    StateTransitionContext, PreConditionCheck, PostConditionCheck, CrossContractStateCheck,
+    StateTransitionProof, InvalidStateRecord, AtomicStateValidator, compute_transition_proof_hash,
+    all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
+    STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
+};
+pub use community_protection::{
+    detect_coordination, detect_coordination_ring, validate_network_authenticity,
+    verify_social_proof, evaluate_fair_access, compute_community_intervention,
+    is_restoration_eligible, CoordinationFlag, NetworkEffectScore, SocialProofRecord,
+    FairAccessDecision, CommunityInterventionRecord, COORDINATION_MIN_INTERACTIONS,
+    COORDINATION_TIGHT_WINDOW_SECS, COORDINATION_RISK_THRESHOLD,
+    NETWORK_DISTINCT_SOURCE_MIN_BPS, NETWORK_SUSPICIOUS_GROWTH_PER_DAY,
+    SOCIAL_PROOF_BURST_WINDOW_SECS, SOCIAL_PROOF_MIN_DISTINCT_BPS,
+    COMMUNITY_INTERVENTION_THRESHOLD,
+};
+pub use pricing_protection::{
+    detect_price_coordination, validate_market_rate, enforce_fair_pricing,
+    verify_demand_authenticity, compute_pricing_intervention, PriceCoordinationFlag,
+    MarketRateValidation, FairPricingResult, DemandAuthenticity, PricingInterventionRecord,
+    PRICE_COORDINATION_WINDOW_SECS, PRICE_MATCH_TOLERANCE_BPS, PRICING_RISK_THRESHOLD,
+    DEFAULT_MAX_MARKET_DEVIATION_BPS, MAX_MARKET_DEVIATION_CEILING_BPS,
+    DEMAND_BURST_WINDOW_SECS, DEMAND_MIN_DISTINCT_BPS,
+};
+pub use privacy_protection::{
+    check_access, minimize_to_need_to_know, detect_exploitation, compute_privacy_intervention,
+    ConsentRecord, AccessDecision, PrivacyMonitoringResult, PrivacyInterventionRecord,
+    FIELD_IDENTITY, FIELD_CONTACT, FIELD_LEARNING_HISTORY, FIELD_CAREER_DATA, FIELD_PAYMENT,
+    MINIMAL_SESSION_FIELDS, ALL_FIELDS, ACCESS_MONITORING_WINDOW_SECS,
+    MAX_ACCESSES_PER_WINDOW, PRIVACY_RISK_THRESHOLD,
+};
+pub use justice_protection::{
+    ensure_dispute_independence, validate_evidence_authenticity, protect_arbitration_fairness,
+    compute_justice_intervention, is_justice_restoration_eligible,
+    DisputeIndependenceFlag, EvidenceAuthenticity, ArbitrationBiasFlag, JusticeInterventionRecord,
+    DISPUTE_COORDINATION_WINDOW_SECS, DISPUTE_INDEPENDENCE_RISK_THRESHOLD,
+    EVIDENCE_DUPLICATE_WINDOW_SECS, EVIDENCE_TAMPER_RISK_THRESHOLD,
+    ARBITRATION_MIN_RULINGS_FOR_BIAS, ARBITRATION_BIAS_RATIO_BPS_THRESHOLD,
+    ARBITRATION_BIAS_RISK_THRESHOLD, JUSTICE_INTERVENTION_THRESHOLD,
+    JUSTICE_RESTORATION_COOLDOWN_SECS,
+};
+pub use outcome_authenticity::{
+    authenticate_learning_outcomes, protect_success_metrics, validate_assessment_criteria,
+    compute_outcome_intervention, is_outcome_restoration_eligible,
+    OutcomeAuthenticity, SuccessMetricProtection, AssessmentValidation, OutcomeInterventionRecord,
+    OUTCOME_BURST_WINDOW_SECS, OUTCOME_MIN_DISTINCT_BPS, OUTCOME_RISK_THRESHOLD,
+    METRIC_GAMING_DEVIATION_BPS, ASSESSMENT_COORDINATION_WINDOW_SECS, ASSESSMENT_RISK_THRESHOLD,
+    OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_RESTORATION_COOLDOWN_SECS,
+};
+pub use scalability_protection::{
+    detect_resource_competition, validate_load_pattern, distribute_resources_fairly,
+    compute_scalability_intervention, is_performance_restoration_eligible,
+    ResourceCompetitionFlag, LoadValidationResult, FairResourceAllocation,
+    PerformanceInterventionRecord,
+    RESOURCE_BURST_WINDOW_SECS, RESOURCE_MIN_DISTINCT_BPS, RESOURCE_COMPETITION_RISK_THRESHOLD,
+    LOAD_SUSPICIOUS_RATE_PER_MINUTE, FAIR_ALLOCATION_MAX_SHARE_BPS,
+    PERFORMANCE_INTERVENTION_THRESHOLD, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+};
+pub use learner_protection::{
+    assess_vulnerability, detect_predatory_behavior, enforce_learner_fair_pricing,
+    identify_exploitation_patterns, compute_welfare_status,
+    compute_learner_protection_intervention, compute_emergency_intervention,
+    is_protection_restoration_eligible,
+    VulnerabilityAssessment, PredatoryBehaviorDetection, ExploitationPattern,
+    WelfareStatus, EmergencyIntervention, LearnerProtectionRecord,
+    VULNERABILITY_SESSION_WINDOW, VULNERABILITY_HIGH_RECURRENCE_THRESHOLD,
+    VULNERABILITY_RISK_THRESHOLD, AFFORDABILITY_DEVIATION_BPS,
+    FINANCIAL_PROTECTION_CAP_BPS, PREDATORY_LOW_QUALITY_THRESHOLD,
+    PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
+    EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
+    LEARNER_PROTECTION_COOLDOWN_SECS,
 };
 
-// ---------------------------------------------------------------------------
-// #868 — Advanced Cryptographic Key Management
-// ---------------------------------------------------------------------------
+// Key management exports  
 pub use key_management::{
-    approve_social_recovery, derive_child_key_commitment, emergency_revoke_key,
-    execute_key_rotation, execute_social_recovery, get_current_key, get_guardians,
-    initiate_social_recovery, is_key_revoked, is_registered_guardian,
-    is_reinstate_eligible, is_rotation_due, is_scheme_supported,
-    is_threshold_met, propose_key_rotation, register_guardian,
-    register_key, register_threshold_share, submit_threshold_share,
-    KeyRecord, KeyRevocationRecord, KeyRotationProposal, KeyScheme,
-    SocialRecoverySession, ThresholdKeyShare, DEFAULT_THRESHOLD_K, DEFAULT_THRESHOLD_N,
-    KEY_ROTATION_OVERLAP_SECS, KEY_ROTATION_PERIOD_SECS, MAX_GUARDIANS,
-    MAX_THRESHOLD_SHARES, REVOCATION_COOLDOWN_SECS, SOCIAL_RECOVERY_QUORUM,
+    register_key, propose_key_rotation, execute_key_rotation, is_rotation_due, 
+    emergency_revoke_key, is_key_revoked, get_current_key,
+    KeyRecord, KeyRotationProposal, KeyScheme,
 };
 
-// ---------------------------------------------------------------------------
-// #869 — Validator Accountability / Consensus Attack Resistance
-// ---------------------------------------------------------------------------
+// Transaction intent protection exports
+pub use transaction_guard::{
+    evaluate_transaction_intent, get_protection_state,
+    TransactionIntent, RiskLevel,
+};
+
+// Recording integrity exports
+pub use recording_integrity::{
+    create_recording, compute_merkle_root, verify_recording_integrity,
+    grant_consent, revoke_consent, check_access_authorized, apply_redaction,
+    log_access, emergency_privacy_protection,
+    SessionRecording, RecordingStatus, ConsentRecord as RecordingConsentRecord, AccessRole, RedactionRecord, 
+    AccessLogEntry, IntegrityVerificationResult,
+};
+
+// Payment integrity exports
+pub use payment_integrity::{
+    validate_evidence_sufficiency, detect_payment_timing_manipulation, check_multisig_threshold,
+    compute_emergency_isolation,
+    EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval, EmergencyFundLock, PaymentAuditEntry,
+};
+
+// Market protection exports (aliases for governance compatibility)
+pub use community_protection::{
+    validate_network_authenticity as detect_network_concentration,
+    evaluate_fair_access as assess_competition_barriers,
+    compute_community_intervention as analyze_market_networks,
+    is_restoration_eligible as audit_market_competition,
+    CoordinationFlag as DecentralizationMonitoring,
+    FairAccessDecision as MarketFairness,
+    CommunityInterventionRecord as MarketProtectionRecord,
+    COMMUNITY_INTERVENTION_THRESHOLD as MARKET_INTERVENTION_COOLDOWN_SECS,
+};
+pub use pricing_protection::{
+    detect_price_coordination as detect_pricing_coordination,
+    compute_pricing_intervention as compute_market_protection_intervention,
+    PricingInterventionRecord as CompetitionAuditRecord,
+};
+pub use scalability_protection::{
+    is_performance_restoration_eligible as is_market_restoration_eligible,
+};
+
+// Validator accountability exports
 pub use validator_accountability::{
-    activate_emergency_consensus, apply_slash, assess_incentive_alignment,
-    compute_network_anomaly_score, deactivate_emergency_consensus, detect_consensus_attack,
-    get_emergency_state, get_validator_record, graduated_slash_bps, is_emergency_active,
-    is_validator_ejected, record_epoch_participation, record_missed_epoch,
-    readmit_validator, register_validator, select_healthy_validators,
-    ConsensusAnomalyRecord, EmergencyConsensusState, IncentiveAlignmentScore,
-    SlashingEvent, ValidatorRecord, ViolationType,
-    ATTACK_EJECTION_THRESHOLD, EJECTION_COOLDOWN_SECS, EMERGENCY_TRIGGER_SCORE,
-    INITIAL_REPUTATION_SCORE, MAX_REPUTATION_SCORE, MIN_REPUTATION_SCORE,
-    REPUTATION_PENALTY_ATTACK, REPUTATION_PENALTY_EQUIVOCATION,
-    REPUTATION_PENALTY_MISSED, SLASH_CRITICAL_BPS, SLASH_MAJOR_BPS, SLASH_MINOR_BPS,
+    assess_incentive_alignment, get_validator_record, is_validator_ejected,
+    register_validator, IncentiveAlignmentScore, ValidatorRecord,
 };
 
-/// Layer-2 and state-channel integration metadata tracked by contracts that
-/// need to defer L1 commitment until the applicable challenge window ends.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct L2Integration {
-    pub network_id: u32,
-    pub finality_delay_secs: u64,
-    pub challenge_period_secs: u64,
-    pub last_l2_block: u64,
-    pub last_l1_commitment: u64,
-    pub emergency_shutdown: bool,
-}
+// Content protection exports
+pub use content_protection::{ContentProtection, ContentType, EncryptionKey, AccessLevel, ProtectedContent, AccessLog};
+pub use ip_verification::{IPVerification, IPRecord, OwnershipProof, IPUsageRecord, InfringementRecord, IPType, IPStatus};
+pub use usage_rights_management::{UsageRightsManager, LicenseType, ViolationPenalty, License, ViolationRecord};
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StateChannelRecord {
-    pub channel_id: BytesN<32>,
-    pub party_a: Address,
-    pub party_b: Address,
-    pub opened_at: u64,
-    pub dispute_deadline: u64,
-    pub force_closed: bool,
-}
+// Threat intelligence exports
+pub use threat_intelligence::{
+    assess_delegation_concentration, assess_token_velocity, correlate_attack_vectors, assess_review_quality,
+    DelegationConcentrationReport, EconomicVelocityReport, MultiVectorThreatReport, ReviewQualityReport,
+    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult,
+};
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CrossLayerAtomicityRecord {
-    pub operation_id: BytesN<32>,
-    pub l1_started: bool,
-    pub l2_started: bool,
-    pub committed: bool,
-    pub rolled_back: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FraudProof {
-    pub l2_network_id: u32,
-    pub state_root: BytesN<32>,
-    pub invalid_transition_hash: BytesN<32>,
-    pub challenger: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CrossLayerAuditLog {
-    pub operation_id: BytesN<32>,
-    pub contract_id: Address,
-    pub source_layer: Symbol,
-    pub target_layer: Symbol,
-    pub synchronized: bool,
-    pub observed_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GameTheoryState {
-    pub collusion_score_bps: u32,
-    pub audit_sample_rate_bps: u32,
-    pub penalty_multiplier_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IncentiveCompatibilityResult {
-    pub strategy_proof: bool,
-    pub honest_nash_equilibrium: bool,
-    pub confidence_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CollusionDetection {
-    pub suspicious: bool,
-    pub coordination_score_bps: u32,
-    pub evidence_count: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ZKProof {
-    pub scheme: Symbol,
-    pub circuit_hash: BytesN<32>,
-    pub proof_hash: BytesN<32>,
-    pub nullifier: BytesN<32>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrivacyAudit {
-    pub linkability_risk_bps: u32,
-    pub anonymity_breach: bool,
-    pub audited_at: u64,
-}
-
-pub fn l2_finality_reached(env: &Env, integration: &L2Integration, l2_block_age_secs: u64) -> bool {
-    !integration.emergency_shutdown
-        && l2_block_age_secs >= integration.finality_delay_secs + integration.challenge_period_secs
-        && env.ledger().timestamp() >= integration.last_l1_commitment
-}
-
-pub fn verify_l2_fraud_proof(proof: &FraudProof, expected_state_root: &BytesN<32>) -> bool {
-    &proof.state_root == expected_state_root
-}
-
-pub fn record_cross_layer_audit(
-    env: &Env,
-    contract_id: &Address,
-    operation_id: &BytesN<32>,
-    source_layer: Symbol,
-    target_layer: Symbol,
-    synchronized: bool,
-) -> CrossLayerAuditLog {
-    let log = CrossLayerAuditLog {
-        operation_id: operation_id.clone(),
-        contract_id: contract_id.clone(),
-        source_layer,
-        target_layer,
-        synchronized,
-        observed_at: env.ledger().timestamp(),
-    };
-    env.events().publish(
-        (symbol_short!("xl"), symbol_short!("audit")),
-        (
-            log.operation_id.clone(),
-            log.contract_id.clone(),
-            log.source_layer.clone(),
-            log.target_layer.clone(),
-            log.synchronized,
-            log.observed_at,
-        ),
-    );
-    log
-}
-
-pub fn compute_nullifier(
-    env: &Env,
-    address: &Address,
-    namespace: &str,
-    secret: &Bytes,
-    blinding: &BytesN<32>,
-) -> BytesN<32> {
-    let mut payload = Bytes::new(env);
-    payload.append(&address.to_xdr(env));
-    payload.append(&Bytes::from_slice(env, namespace.as_bytes()));
-    payload.append(secret);
-    let blind = Bytes::from_slice(env, &blinding.to_array());
-    payload.append(&blind);
-    env.crypto().sha256(&payload).into()
-}
-
-pub fn audit_privacy(proof: &ZKProof, signal_strength_bps: u32, audited_at: u64) -> PrivacyAudit {
-    let _ = proof;
-    let linkability_risk_bps = u32::min(10_000, signal_strength_bps.saturating_add(750));
-    PrivacyAudit {
-        linkability_risk_bps,
-        anonymity_breach: linkability_risk_bps > 7_500,
-        audited_at,
-    }
-}
+// Tokenomics protection exports
+pub use tokenomics_protection::{
+    exceeds_extraction_rate, detect_coordinated_timing,
+    ManipulationReason, TokenomicsAuditResult, MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO, MIN_POSITION_DELTA_SECS,
+};
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
 pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;
@@ -621,6 +538,16 @@ pub enum SharedError {
     ValidationError = 11,
     /// A cross-contract caller failed interface-registry verification.
     UnauthorizedContract = 12,
+    /// Content access is denied due to insufficient permissions or invalid license.
+    ContentAccessDenied = 13,
+    /// Intellectual property ownership cannot be verified or is disputed.
+    IPOwnershipInvalid = 14,
+    /// Usage rights have been violated or exceeded allowed limits.
+    UsageRightsViolation = 15,
+    /// Content encryption/decryption failed.
+    EncryptionError = 16,
+    /// Content piracy or unauthorized distribution detected.
+    PiracyDetected = 17,
 }
 
 // ---------------------------------------------------------------------------

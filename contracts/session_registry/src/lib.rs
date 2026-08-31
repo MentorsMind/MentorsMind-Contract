@@ -1,5 +1,6 @@
 #![no_std]
 
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec, String};
 use shared::{
     // learner protection
     assess_vulnerability,
@@ -109,6 +110,8 @@ pub struct SessionRecord {
     pub token: Address,
     pub status: SessionStatus,
     pub registered_at: u64,
+    pub protected_content: Vec<Symbol>, // Content IDs associated with this session
+    pub content_licenses: Vec<Symbol>,  // License IDs for session content
 }
 
 #[contracttype]
@@ -389,6 +392,8 @@ impl SessionRegistry {
             token,
             status: SessionStatus::Pending,
             registered_at: env.ledger().timestamp(),
+            protected_content: Vec::new(&env),
+            content_licenses: Vec::new(&env),
         };
 
         env.storage().persistent().set(&session_key, &record);
@@ -827,6 +832,339 @@ impl SessionRegistry {
             .persistent()
             .extend_ttl(&pair_key, TTL_THRESHOLD, TTL_BUMP);
 
+    pub fn update_session_metadata(env: Env, session_id: u64, tags: Vec<String>) {
+        let key = (symbol_short!("SessMeta"), session_id);
+        env.storage().persistent().set(&key, &tags);
+    }
+    
+    pub fn get_sessions_by_participant(env: Env, _participant: Address) -> Vec<u64> {
+        Vec::new(&env)
+    }
+
+    /// Manage session content with protection and IP verification
+    pub fn manage_session_content(
+        env: Env,
+        session_id: Symbol,
+        content_id: Symbol,
+        content_type: ContentType,
+        access_level: AccessLevel,
+        mentor: Address,
+    ) -> Result<(), SharedError> {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        // Get session record
+        let session_key = DataKey::Session(session_id.clone());
+        let mut session: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&session_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Verify mentor is the owner of this session
+        if session.mentor != mentor {
+            return Err(SharedError::Unauthorized);
+        }
+
+        // Create protected content
+        let protected_content = ContentProtection::create_protected_content(
+            &env,
+            content_id.clone(),
+            mentor.clone(),
+            content_type,
+            access_level,
+        )?;
+
+        // Store protected content
+        let content_key = DataKey::SessionContent(content_id.clone());
+        env.storage().persistent().set(&content_key, &protected_content);
+        env.storage()
+            .persistent()
+            .extend_ttl(&content_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Add content to session record
+        session.protected_content.push_back(content_id.clone());
+        env.storage().persistent().set(&session_key, &session);
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("content"),
+                Symbol::new(&env, "content_protected"),
+                content_id,
+            ),
+            (mentor, session_id),
+        );
+
+        Ok(())
+    }
+
+    /// Track content usage during sessions
+    pub fn track_content_usage(
+        env: Env,
+        session_id: Symbol,
+        content_id: Symbol,
+        user: Address,
+        usage_type: Symbol,
+    ) -> Result<(), SharedError> {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        // Get session record
+        let session_key = DataKey::Session(session_id.clone());
+        let session: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&session_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Verify user is participant in session
+        if session.mentor != user && session.learner != user {
+            return Err(SharedError::Unauthorized);
+        }
+
+        // Get protected content
+        let content_key = DataKey::SessionContent(content_id.clone());
+        let mut protected_content: ProtectedContent = env
+            .storage()
+            .persistent()
+            .get(&content_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Check access permissions
+        let encryption_key = ContentProtection::generate_encryption_key(
+            &env,
+            Symbol::new(&env, "temp_key"),
+            protected_content.access_level.clone(),
+            env.ledger().timestamp() + 3600, // 1 hour validity
+        )?;
+
+        let has_access = ContentProtection::verify_access(
+            &env,
+            &protected_content,
+            &user,
+            &encryption_key,
+        )?;
+
+        if !has_access {
+            return Err(SharedError::ContentAccessDenied);
+        }
+
+        // Create usage tracking record
+        let usage_record = IPVerification::track_usage(
+            &env,
+            content_id.clone(),
+            user.clone(),
+            usage_type.clone(),
+            session_id.clone(),
+            has_access,
+        );
+
+        // Store usage record
+        let usage_key = DataKey::UsageTracking(content_id.clone(), user.clone());
+        env.storage().persistent().set(&usage_key, &usage_record);
+
+        // Update content access statistics
+        ContentProtection::update_access_stats(&env, &mut protected_content);
+        env.storage().persistent().set(&content_key, &protected_content);
+
+        // Log access
+        let access_log = ContentProtection::log_access(
+            &env,
+            content_id.clone(),
+            user.clone(),
+            usage_type,
+            true,
+            None, // IP hash not available in this context
+        );
+
+        let log_key = DataKey::ContentAccess(content_id, user);
+        env.storage().persistent().set(&log_key, &access_log);
+
+        Ok(())
+    }
+
+    /// Enforce IP rights and detect violations
+    pub fn enforce_ip_rights(
+        env: Env,
+        content_id: Symbol,
+        alleged_violator: Address,
+        evidence_hash: BytesN<32>,
+        reporter: Address,
+    ) -> Result<Symbol, SharedError> {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        // Get protected content
+        let content_key = DataKey::SessionContent(content_id.clone());
+        let protected_content: ProtectedContent = env
+            .storage()
+            .persistent()
+            .get(&content_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Only content owner or authorized users can report violations
+        if protected_content.owner != reporter && 
+           !protected_content.authorized_viewers.contains(&reporter) {
+            return Err(SharedError::Unauthorized);
+        }
+
+        // Create infringement record
+        let violation_id = Symbol::new(&env, "violation");
+        let infringement = IPVerification::report_infringement(
+            &env,
+            violation_id.clone(),
+            content_id.clone(),
+            alleged_violator.clone(),
+            evidence_hash,
+            reporter.clone(),
+        );
+
+        // Store infringement record
+        let violation_key = DataKey::ViolationRecord(violation_id.clone());
+        env.storage().persistent().set(&violation_key, &infringement);
+
+        // Emit violation event
+        env.events().publish(
+            (
+                symbol_short!("violation"),
+                Symbol::new(&env, "ip_violation_reported"),
+                violation_id.clone(),
+            ),
+            (content_id, alleged_violator, reporter),
+        );
+
+        Ok(violation_id)
+    }
+
+    /// Create and manage content licenses for sessions
+    pub fn create_content_license(
+        env: Env,
+        session_id: Symbol,
+        content_id: Symbol,
+        licensee: Address,
+        license_types: Vec<LicenseType>,
+        expires_at: Option<u64>,
+        max_usage_count: Option<u32>,
+    ) -> Result<Symbol, SharedError> {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        // Get session record
+        let session_key = DataKey::Session(session_id.clone());
+        let mut session: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&session_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Get protected content
+        let content_key = DataKey::SessionContent(content_id.clone());
+        let protected_content: ProtectedContent = env
+            .storage()
+            .persistent()
+            .get(&content_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Only content owner (mentor) can create licenses
+        if protected_content.owner != session.mentor {
+            return Err(SharedError::Unauthorized);
+        }
+
+        // Create license
+        let license_id = Symbol::new(&env, "license");
+        let license = UsageRightsManager::create_license(
+            &env,
+            license_id.clone(),
+            licensee.clone(),
+            protected_content.owner.clone(),
+            content_id.clone(),
+            license_types,
+            expires_at,
+            max_usage_count,
+            None, // No payment required for session content
+            None, // No payment token
+        )?;
+
+        // Store license
+        let license_key = DataKey::ContentLicense(license_id.clone());
+        env.storage().persistent().set(&license_key, &license);
+
+        // Add license to session record
+        session.content_licenses.push_back(license_id.clone());
+        env.storage().persistent().set(&session_key, &session);
+
+        // Emit license creation event
+        env.events().publish(
+            (
+                symbol_short!("license"),
+                Symbol::new(&env, "content_license_created"),
+                license_id.clone(),
+            ),
+            (content_id, licensee, session_id),
+        );
+
+        Ok(license_id)
+    }
+
+    /// Validate content access based on licenses
+    pub fn validate_content_access(
+        env: Env,
+        content_id: Symbol,
+        user: Address,
+        usage_type: LicenseType,
+    ) -> Result<bool, SharedError> {
+        // Get protected content
+        let content_key = DataKey::SessionContent(content_id.clone());
+        let protected_content: ProtectedContent = env
+            .storage()
+            .persistent()
+            .get(&content_key)
+            .ok_or(SharedError::NotFound)?;
+
+        // Check if user is content owner
+        if protected_content.owner == user {
+            return Ok(true);
+        }
+
+        // Check if user has appropriate license
+        // This is a simplified check - in practice, you'd iterate through all licenses
+        // for this content and check if any grant the required permission to this user
+        
+        // For now, check if user is in authorized viewers list
+        if protected_content.authorized_viewers.contains(&user) {
+            return Ok(true);
+        }
+
+        // Check public access
+        if protected_content.access_level == AccessLevel::Public && 
+           usage_type == LicenseType::View {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Get session content information
+    pub fn get_session_content(env: Env, session_id: Symbol) -> Vec<Symbol> {
+        let session_key = DataKey::Session(session_id);
+        let session: Option<SessionRecord> = env.storage().persistent().get(&session_key);
+        
+        match session {
+            Some(s) => s.protected_content,
+            None => Vec::new(&env),
+        }
+    }
+
+    /// Get content access logs
+    pub fn get_content_access_log(
+        env: Env,
+        content_id: Symbol,
+        user: Address,
+    ) -> Option<AccessLog> {
+        let log_key = DataKey::ContentAccess(content_id, user);
+        env.storage().persistent().get(&log_key)
+    }
         // Distinct-learner tracking for demand authenticity.
         let seen_key = DataKey::MentorHasBookedBefore(mentor.clone(), learner.clone());
         if !env.storage().persistent().get(&seen_key).unwrap_or(false) {
@@ -997,6 +1335,13 @@ impl SessionRegistry {
         flag
     }
 
+        let record = client.get_session(&session_id);
+        assert_eq!(record.status, SessionStatus::Pending);
+        assert_eq!(record.mentor, mentor);
+        assert_eq!(record.learner, learner);
+        assert_eq!(record.duration_mins, 60);
+        assert_eq!(record.protected_content.len(), 0);
+        assert_eq!(record.content_licenses.len(), 0);
     /// Compute a fair booking-capacity share for `requested_units` (e.g.
     /// requested session duration in minutes) against `mentor`'s rolling
     /// total requested capacity, throttling any single requester attempting

@@ -28,17 +28,9 @@ members = [
     "contracts/kyc_registry",
     "contracts/lending_pool",
     "contracts/mnt-token",
-    "contracts/multisig_admin",
-    "contracts/onboarding_escrow",
-    "contracts/oracle",
-    "contracts/pause_guardian",
-    "contracts/payment_router",
-    "contracts/performance_bond",
-    "contracts/prediction_market",
-    "contracts/proposal_templates",
-    "contracts/rate_limiter",
-    "contracts/rbac",
-    "contracts/reconciliation",
+    "contracts/shared",
+    "contracts/verification",
+    "contracts/session_registry",
     "contracts/referral",
     "contracts/referral_leaderboard",
     "contracts/regulatory_reporting",
@@ -77,7 +69,7 @@ soroban-sdk = "25.3.0"
 soroban-token-sdk = "25.3.0"
 
 # Explicit dependency versions to avoid conflicts and edition2024 issues
-ed25519-dalek = "2.1.1"
+ed25519-dalek = "2.2.0"  # Updated to match what soroban expects
 rand_core = "0.6.4"
 crypto-common = "0.1.6"  # Pin to version that doesn't require edition2024
 base64ct = "1.8.2"       # Pin to version compatible with Rust 1.89

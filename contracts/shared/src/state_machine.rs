@@ -38,33 +38,6 @@ pub trait StateMachine {
     }
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransitionRollback {
-    pub transition_id: BytesN<32>,
-    pub restored: bool,
-    pub restored_at: u64,
-}
-
-pub fn validate_atomic_transition<T: StateMachine>(
-    env: &Env,
-    from: &T::State,
-    to: &T::State,
-) -> bool {
-    T::is_valid_transition(env, from, to)
-}
-
-pub fn rollback_transition(env: &Env, transition_id: BytesN<32>) -> TransitionRollback {
-    let rollback = TransitionRollback {
-        transition_id,
-        restored: true,
-        restored_at: env.ledger().timestamp(),
-    };
-    env.events()
-        .publish((Symbol::new(env, "state"), Symbol::new(env, "rollback")), rollback.clone());
-    rollback
-}
-
 /// Atomic state transition control structure
 #[contracttype]
 #[derive(Clone, Debug)]

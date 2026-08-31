@@ -34,12 +34,12 @@ use shared::{
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
-    IntoVal, Symbol, Vec, Map,
+    IntoVal, Symbol, Vec,
 };
 
 use shared::{
-    SessionRecording, RecordingStatus, ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
-    create_recording, compute_merkle_root, verify_recording_integrity, grant_consent, revoke_consent,
+    SessionRecording, RecordingStatus, RecordingConsentRecord as ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
+    create_recording, verify_recording_integrity, grant_consent, revoke_consent,
     check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
 };
 
@@ -1299,7 +1299,7 @@ impl DisputeEvidenceContract {
         role: AccessRole,
         purpose: Symbol,
     ) -> Result<(), Error> {
-        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+        let _recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
             .ok_or(Error::NotFound)?;
 
         let recording_id: Symbol = env.storage().persistent().get(&DataKey::SessionRecording(escrow_id))

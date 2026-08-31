@@ -27,6 +27,12 @@ pub enum DataKey {
     Admin,
     Verification(Address),
     Tier(Address),
+    IPRecord(Symbol),           // IP records by IP ID
+    ContentOwnership(Symbol),   // Content ownership by content ID
+    IPUsage(Symbol, Address),   // IP usage by IP ID and user
+    InfringementCase(Symbol),   // Infringement cases by case ID
+    TakedownRequest(Symbol),    // Takedown requests by request ID
+    RecoveryAction(Symbol),     // Recovery actions by action ID
     GracePeriod,
     CertificationAuthority(Address),
     RevokedCredential(BytesN<32>),
@@ -66,6 +72,36 @@ pub struct VerificationStatus {
     pub is_grace: bool,
     pub expires_at: u64,
     pub grace_expires_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TakedownRequest {
+    pub request_id: Symbol,
+    pub content_id: Symbol,
+    pub ip_id: Symbol,
+    pub requester: Address,
+    pub target_platform: Symbol,
+    pub reason: Symbol,
+    pub evidence_hash: BytesN<32>,
+    pub requested_at: u64,
+    pub status: Symbol, // "pending", "processing", "completed", "rejected"
+    pub processed_by: Option<Address>,
+    pub processed_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryAction {
+    pub action_id: Symbol,
+    pub ip_id: Symbol,
+    pub recovery_type: Symbol, // "takedown", "dmca", "legal", "platform_report"
+    pub target: Address,
+    pub initiated_by: Address,
+    pub initiated_at: u64,
+    pub completed_at: Option<u64>,
+    pub status: Symbol, // "initiated", "in_progress", "completed", "failed"
+    pub outcome: Option<Symbol>,
 }
 
 #[contracttype]

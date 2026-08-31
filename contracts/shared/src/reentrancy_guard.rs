@@ -9,7 +9,6 @@ const LOCK_PREFIX: Symbol = symbol_short!("RGUARD");
 const CALLER_STACK_PREFIX: Symbol = symbol_short!("RG_CALL");
 const PAUSE_TRIGGERED_KEY: Symbol = symbol_short!("RG_PAUSE");
 const LAST_ATTACKER_KEY: Symbol = symbol_short!("RG_ATK");
-const FUNCTION_MUTEX_PREFIX: Symbol = symbol_short!("RG_MUTEX");
 const MAX_CALLER_DEPTH: u32 = 8;
 
 #[derive(Clone)]
@@ -28,13 +27,6 @@ pub struct ReentrancyGuard<'a> {
     released: bool,
 }
 
-#[derive(Clone)]
-pub struct ExecutionContext {
-    pub function: Symbol,
-    pub depth: u32,
-    pub timestamp: u64,
-}
-
 impl<'a> ReentrancyGuard<'a> {
     pub fn enter(env: &'a Env, lock_name: Symbol) -> Self {
         Self::enter_internal(env, lock_name, None)
@@ -42,42 +34,6 @@ impl<'a> ReentrancyGuard<'a> {
 
     pub fn enter_with_caller(env: &'a Env, lock_name: Symbol, caller: Address) -> Self {
         Self::enter_internal(env, lock_name, Some(caller))
-    }
-
-    pub fn acquire_function_mutex(env: &Env, function: Symbol) {
-        let key = (FUNCTION_MUTEX_PREFIX, function.clone());
-        if env.storage().instance().get(&key).unwrap_or(false) {
-            panic!("function-level mutex already held");
-        }
-        env.storage().instance().set(&key, &true);
-    }
-
-    pub fn release_function_mutex(env: &Env, function: Symbol) {
-        let key = (FUNCTION_MUTEX_PREFIX, function);
-        env.storage().instance().remove(&key);
-    }
-
-    pub fn record_execution_context(env: &Env, function: Symbol) -> ExecutionContext {
-        let depth_key = (CALLER_STACK_PREFIX, symbol_short!("depth"));
-        let depth: u32 = env.storage().instance().get(&depth_key).unwrap_or(0);
-        ExecutionContext {
-            function,
-            depth,
-            timestamp: env.ledger().timestamp(),
-        }
-    }
-
-    pub fn detect_cross_function_reentrancy(env: &Env, function: Symbol) -> bool {
-        let ctx = Self::record_execution_context(env, function.clone());
-        let seen_key = (FUNCTION_MUTEX_PREFIX, symbol_short!("ctx"));
-        let prev: Option<Symbol> = env.storage().instance().get(&seen_key);
-        if let Some(prev_fn) = prev {
-            if prev_fn != ctx.function && ctx.depth > 0 {
-                return true;
-            }
-        }
-        env.storage().instance().set(&seen_key, &function);
-        false
     }
 
     fn enter_internal(

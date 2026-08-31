@@ -408,19 +408,3 @@ mod tests {
         assert_eq!(report.mismatches.len(), 2);
     }
 }
-
-/// Tamper-detection tie-in for #871: confirms a `StorageVersion` record's
-/// stored `layout_hash` still matches a freshly recomputed hash of the
-/// live schema fields. A mismatch means the on-chain layout was altered
-/// without going through `CompatibilityValidator`, e.g. a slot reordered
-/// or reinterpreted outside the normal upgrade path. This is one honest
-/// increment (a fingerprint recheck) toward the issue's broader ask for
-/// automated malicious-upgrade detection, not the full detection system.
-pub fn detect_layout_tampering(
-    env: &Env,
-    version: &StorageVersion,
-    live_fields: &Vec<StorageField>,
-) -> bool {
-    let recomputed = CompatibilityValidator::compute_schema_hash(env, live_fields);
-    recomputed != version.layout_hash
-}

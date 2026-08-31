@@ -202,3 +202,31 @@ mod tests {
         assert!(report.reviewer_protection_required);
     }
 }
+
+// Additional types for staking contract compatibility
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollusionDetection {
+    pub detected: bool,
+    pub risk_score: u32,
+    pub actors_count: u32,
+    pub coordination_patterns: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameTheoryState {
+    pub equilibrium_stable: bool,
+    pub defection_risk: u32,
+    pub cooperation_incentive: u32,
+    pub nash_deviation_risk: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncentiveCompatibilityResult {
+    pub compatible: bool,
+    pub misalignment_risk: u32,
+    pub mechanism_integrity: u32,
+    pub welfare_efficiency: u32,
+}

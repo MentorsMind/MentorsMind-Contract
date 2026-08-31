@@ -7,7 +7,7 @@ use shared::events::{
 };
 use shared::{
     compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord,
-    RollbackProposal, SnapshotMeta, StateVerificationReport,
+    RollbackProposal, SnapshotMeta, StateVerificationReport, ReentrancyGuard,
     MAX_SNAPSHOTS, EscrowTransitionLog, GasEstimate, Validator, StateMachine,
     ReleaseFailure, FailureClassification, RecoveryState,
     calculate_next_retry,
@@ -1378,7 +1378,7 @@ impl EscrowContract {
     ) -> u64 {
         let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("create"), learner.clone());
         Self::_create_escrow_internal(
-            env,
+            env.clone(),
             mentor,
             learner,
             amount,
@@ -2708,7 +2708,7 @@ impl EscrowContract {
         if action.reason_hash != reason_hash {
             panic!("Emergency action reason_hash mismatch");
         }
-        Self::execute_emergency_action(env, caller, emergency_action_id)
+        Self::execute_emergency_action(env.clone(), caller, emergency_action_id)
     }
 
     /// View: fetch an emergency action proposal.

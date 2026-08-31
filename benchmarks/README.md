@@ -11,12 +11,14 @@ the recorded baseline.
 
 # 1. Build WASM binaries (populates wasm_bytes in the report)
 cargo build \
-  --target wasm32-unknown-unknown \
+  --target wasm32v1-none \
   --release \
   -p mentorminds-escrow \
   -p mentorminds-staking \
   -p mentorminds-governance \
-  -p mentorminds-timelock
+  -p mentorminds-timelock \
+  -p mentorminds-upgrade-registry \
+  -p mentorminds-dispute-evidence
 
 # 2. Run benchmarks (compare against baselines.json, exit 1 on regression)
 cargo run -p mentorminds-benchmarks
