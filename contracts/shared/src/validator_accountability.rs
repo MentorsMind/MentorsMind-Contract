@@ -8,7 +8,7 @@
 //! - Real-time validator behavior monitoring with anomaly detection
 //! - Emergency consensus recovery with alternative validator selection
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -168,6 +168,70 @@ pub struct IncentiveAlignmentScore {
     pub aligned: bool,
     /// Risk factors detected (count).
     pub risk_factors: u32,
+}
+
+/// Active validator set for an epoch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatorSet {
+    /// Epoch this validator set is active for
+    pub epoch: u64,
+    /// Ordered list of active validators
+    pub validators: Vec<Address>,
+    /// Stake amounts for each validator (parallel to validators)
+    pub stakes: Vec<i128>,
+    /// Quorum threshold (2f+1 where f = floor(n/3))
+    pub quorum_threshold: u32,
+    /// Total stake of all validators in this set
+    pub total_stake: i128,
+    /// Timestamp when this set was selected
+    pub selected_at: u64,
+    /// Duration this set is valid (in seconds)
+    pub duration_secs: u64,
+    /// VRF output hash used for selection
+    pub vrf_seed: BytesN<32>,
+}
+
+/// Slashing penalty record with full context.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashingPenalty {
+    /// Validator that was penalized
+    pub validator: Address,
+    /// The violation type
+    pub violation: ViolationType,
+    /// Slash amount in basis points
+    pub slash_bps: u32,
+    /// Estimated slashed amount in token units
+    pub slashed_amount: i128,
+    /// When the penalty was applied
+    pub applied_at: u64,
+    /// Evidence hash for the violation
+    pub evidence_hash: BytesN<32>,
+    /// Whether the validator was ejected
+    pub ejected: bool,
+    /// Readmission eligible timestamp (if ejected)
+    pub readmission_at: Option<u64>,
+}
+
+/// Long-range attack protection checkpoint.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LongRangeCheckpoint {
+    /// Checkpoint sequence number
+    pub sequence: u64,
+    /// Ledger sequence at checkpoint
+    pub ledger_sequence: u32,
+    /// State root hash
+    pub state_root: BytesN<32>,
+    /// Validator set hash at checkpoint
+    pub validator_set_hash: BytesN<32>,
+    /// Timestamp
+    pub timestamp: u64,
+    /// Number of validator attestations
+    pub attestation_count: u32,
+    /// Whether this checkpoint is finalized (irreversible)
+    pub finalized: bool,
 }
 
 // ---------------------------------------------------------------------------
