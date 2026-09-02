@@ -4,6 +4,7 @@ use shared::events::{
     emit_bounty_event, evt_bounty_claimed, evt_bounty_disputed, evt_bounty_posted,
     evt_bounty_refunded, evt_bounty_verified,
 };
+use shared::health_reporter::{report_metric, MetricCategory};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Val, Vec,
@@ -46,6 +47,8 @@ pub enum DataKey {
     Claim(u32, Address), // (bounty_id, learner)
     ClaimEvidence(u32, Address), // (bounty_id, learner)
     BountyLock(u32),
+    /// Address of the health dashboard for metric reporting.
+    HealthDashboard,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +187,19 @@ impl BountyContract {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
+    /// Set the health dashboard address for metric reporting. Admin only.
+    pub fn set_health_dashboard(env: Env, health_dashboard: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::HealthDashboard, &health_dashboard);
+    }
+
     /// Post a new bounty with milestones. Transfers `reward` tokens from poster to this contract.
     /// `milestones` must have reward_bps summing to 10000.
     /// Returns the new bounty ID.
@@ -275,6 +291,21 @@ impl BountyContract {
                 deadline,
             },
         );
+
+        // Report health metric for bounty creation
+        if let Some(dashboard) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "bounty_created"),
+                MetricCategory::Throughput,
+                count as i128,
+            );
+        }
 
         count
     }
