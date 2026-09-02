@@ -287,7 +287,7 @@ pub fn require_account_not_blocked(env: &Env, account: &Address) {
 pub fn create_multisig_requirement(
     env: &Env,
     caller: &Address,
-    _operation: Symbol,
+    operation: Symbol,
     required_approvals: u32,
 ) -> BytesN<32> {
     let now = env.ledger().timestamp();

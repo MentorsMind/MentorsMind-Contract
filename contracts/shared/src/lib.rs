@@ -65,6 +65,7 @@ pub mod service_continuity;
 pub mod session_privacy;
 pub mod session_protection;
 pub mod attack_detection;
+pub mod health_reporter;
 
 // Additional protection modules
 pub mod cartel_detection;
@@ -170,7 +171,6 @@ pub use privacy_protection::{
     FIELD_LEARNING_HISTORY, FIELD_PAYMENT, MAX_ACCESSES_PER_WINDOW, MINIMAL_SESSION_FIELDS,
     PRIVACY_RISK_THRESHOLD,
 };
-pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::{
     validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
     BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
@@ -265,6 +265,10 @@ pub use dynamic_fees::{
 };
 pub use curriculum_validation::{
     validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute
+};
+pub use health_reporter::{
+    AlertSeverity, HealthMetric, HealthReporterError, HealthReporter, HealthStorageKey,
+    HealthThresholds, MetricCategory, SystemHealth, report_metric,
 };
 pub use qualification_verification::{
     verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment
@@ -375,6 +379,7 @@ pub use threat_intelligence::{
     assess_delegation_concentration, assess_token_velocity, correlate_attack_vectors, assess_review_quality,
     DelegationConcentrationReport, EconomicVelocityReport, MultiVectorThreatReport, ReviewQualityReport,
     CollusionDetection, GameTheoryState, IncentiveCompatibilityResult,
+    DEFAULT_DELEGATION_CAP_BPS,
 };
 
 // Tokenomics protection exports

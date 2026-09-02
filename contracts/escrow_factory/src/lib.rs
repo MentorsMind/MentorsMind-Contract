@@ -9,6 +9,7 @@ use soroban_sdk::xdr::ToXdr;
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
 use shared::GasEstimate;
 use shared::dynamic_fees::{calculate_dynamic_fee, DynamicFeeResult};
+use shared::health_reporter::{report_metric, MetricCategory};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 /// therefore a different address) instead of colliding.
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
 const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
+const HEALTH_DASHBOARD: Symbol = symbol_short!("HLTH_DB");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -229,6 +231,16 @@ impl EscrowFactory {
         env.storage()
             .persistent()
             .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    /// Set the health dashboard address for metric reporting. Admin only.
+    pub fn set_health_dashboard(env: Env, health_dashboard: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&HEALTH_DASHBOARD, &health_dashboard);
+        env.storage()
+            .persistent()
+            .extend_ttl(&HEALTH_DASHBOARD, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     pub fn set_anomaly_detector(env: Env, detector: Address) {
@@ -452,6 +464,18 @@ impl EscrowFactory {
                 &registry_addr,
                 &Symbol::new(&env, "register_interface"),
                 (escrow_address.clone(), interface_id, 1u32).into_val(&env),
+            );
+        }
+
+        // Report health metric for escrow creation
+        if let Some(dashboard) = env.storage().persistent().get::<_, Address>(&HEALTH_DASHBOARD) {
+            let count: u64 = env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0);
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "escrow_created"),
+                MetricCategory::Throughput,
+                count as i128,
             );
         }
 

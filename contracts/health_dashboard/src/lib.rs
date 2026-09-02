@@ -1,5 +1,8 @@
 #![no_std]
 
+use shared::health_reporter::{
+    AlertSeverity, HealthMetric, HealthThresholds, MetricCategory, SystemHealth,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Env, IntoVal, Map, Symbol, Vec,
 };
@@ -94,6 +97,13 @@ pub enum DataKey {
     /// Number of disputes ever opened against a given mentor, used by
     /// [`HealthDashboardContract::get_mentor_dispute_rate`].
     MentorDisputeCount(Address),
+    /// Health metric storage keys
+    MetricPage(u32),
+    PageCount,
+    CurrentPage,
+    PageSize,
+    Thresholds,
+    LastHealth,
 }
 
 #[contracttype]
@@ -110,6 +120,8 @@ pub struct Config {
     pub insurance: Address,
     pub lending_pool: Address,
     pub usdc_token: Address,
+    /// Address of this health dashboard contract (for self-referencing)
+    pub health_dashboard: Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +182,7 @@ impl HealthDashboardContract {
         if env.storage().persistent().has(&DataKey::Config) {
             panic!("Already initialized");
         }
+        let health_dashboard = env.current_contract_address();
         env.storage().persistent().set(
             &DataKey::Config,
             &Config {
@@ -184,6 +197,7 @@ impl HealthDashboardContract {
                 insurance,
                 lending_pool,
                 usdc_token,
+                health_dashboard,
             },
         );
     }
@@ -489,6 +503,195 @@ impl HealthDashboardContract {
         }
 
         report
+    }
+
+    // ─── Health Metrics (Issue #625) ──────────────────────────────────
+
+    /// Record a health metric from any contract. Metrics are stored in
+    /// paginated pages (default 100 per page) for efficient on-chain access.
+    pub fn record_metric(env: Env, metric: HealthMetric) {
+        if metric.name == Symbol::new(&env, "") {
+            panic!("metric name cannot be empty");
+        }
+
+        let page_size: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PageSize)
+            .unwrap_or(100);
+        let current_page: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentPage)
+            .unwrap_or(0);
+        let mut page: Vec<HealthMetric> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MetricPage(current_page))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if page.len() >= page_size {
+            let new_page = current_page + 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::CurrentPage, &new_page);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PageCount, &(new_page + 1));
+            page = Vec::new(&env);
+        }
+
+        page.push_back(metric);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetricPage(current_page), &page);
+
+        if current_page == 0 && page.len() == 1 {
+            env.storage().persistent().set(&DataKey::PageCount, &1u32);
+        }
+
+        // Emit event for off-chain monitoring
+        env.events().publish(
+            (Symbol::new(&env, "metric_recorded"),),
+            (Symbol::new(&env, ""), current_page),
+        );
+    }
+
+    /// Get health metrics for a specific page (0-indexed).
+    /// Returns an empty Vec if the page doesn't exist.
+    pub fn get_system_health(env: Env, page: u32) -> Vec<HealthMetric> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetricPage(page))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get the total number of metric pages.
+    pub fn get_metric_page_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PageCount)
+            .unwrap_or(0)
+    }
+
+    /// Determine if the system is healthy based on configurable thresholds.
+    /// Checks: error rate, TVL, critical alert count, and warning alert count.
+    pub fn is_system_healthy(env: Env) -> SystemHealth {
+        let thresholds: HealthThresholds = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Thresholds)
+            .unwrap_or(HealthThresholds {
+                max_error_rate_bps: 500,
+                min_tvl: 0,
+                max_critical_alerts: 3,
+                max_warning_alerts: 10,
+            });
+
+        let page_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PageCount)
+            .unwrap_or(0);
+
+        let mut total_metrics: u32 = 0;
+        let mut warning_count: u32 = 0;
+        let mut critical_count: u32 = 0;
+        let mut last_updated: u64 = 0;
+        let mut total_tvl: i128 = 0;
+        let mut error_count: u32 = 0;
+        let mut active_sources: Map<Address, bool> = Map::new(&env);
+
+        for page_idx in 0..page_count {
+            let metrics: Vec<HealthMetric> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MetricPage(page_idx))
+                .unwrap_or_else(|| Vec::new(&env));
+
+            for metric in metrics.iter() {
+                total_metrics += 1;
+
+                if metric.recorded_at > last_updated {
+                    last_updated = metric.recorded_at;
+                }
+
+                active_sources.set(metric.source.clone(), true);
+
+                match metric.category {
+                    MetricCategory::Liquidity => {
+                        total_tvl = total_tvl.saturating_add(metric.value);
+                    }
+                    MetricCategory::ErrorRate => {
+                        error_count += 1;
+                    }
+                    _ => {}
+                }
+
+                match metric.alert {
+                    AlertSeverity::Warning => warning_count += 1,
+                    AlertSeverity::Critical => critical_count += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        let error_rate_bps: u32 = if total_metrics == 0 {
+            0
+        } else {
+            ((error_count as u64 * 10_000) / (total_metrics as u64)) as u32
+        };
+
+        let is_healthy = error_rate_bps <= thresholds.max_error_rate_bps
+            && total_tvl >= thresholds.min_tvl
+            && critical_count <= thresholds.max_critical_alerts
+            && warning_count <= thresholds.max_warning_alerts;
+
+        let health = SystemHealth {
+            is_healthy,
+            total_metrics,
+            warning_count,
+            critical_count,
+            last_updated,
+            total_tvl,
+            error_rate_bps,
+            active_sources: active_sources.len(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastHealth, &health);
+
+        health
+    }
+
+    /// Update the health thresholds. Admin-only.
+    pub fn set_health_thresholds(env: Env, admin: Address, thresholds: HealthThresholds) {
+        let cfg: Config = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != cfg.admin {
+            panic!("unauthorized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Thresholds, &thresholds);
+    }
+
+    /// Get the current health thresholds.
+    pub fn get_health_thresholds(env: Env) -> HealthThresholds {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Thresholds)
+            .unwrap_or(HealthThresholds {
+                max_error_rate_bps: 500,
+                min_tvl: 0,
+                max_critical_alerts: 3,
+                max_warning_alerts: 10,
+            })
     }
 }
 

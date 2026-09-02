@@ -420,6 +420,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "health_dashboard"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYRE5"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "insurance"
                     },
                     "val": {

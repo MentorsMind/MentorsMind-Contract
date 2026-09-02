@@ -1,5 +1,8 @@
 #![no_std]
 
+use shared::events::{
+    emit_delegation_event, evt_del_delegated, evt_del_suspended, evt_del_undelegated,
+};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
 };
@@ -144,13 +147,7 @@ impl DelegationContract {
         env.storage()
             .instance()
             .set(&DataKey::DelegationSuspended, &suspended);
-        env.events().publish(
-            (
-                Symbol::new(&env, "delegation"),
-                Symbol::new(&env, "suspended"),
-            ),
-            suspended,
-        );
+        emit_delegation_event(&env, evt_del_suspended(&env), suspended);
     }
 
     pub fn is_delegation_suspended(env: Env) -> bool {
@@ -302,12 +299,9 @@ impl DelegationContract {
 
         Self::propagate_weight_change(&env, &delegate, weight, max_depth);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "delegation"),
-                Symbol::new(&env, "delegated"),
-                delegator.clone(),
-            ),
+        emit_delegation_event(
+            &env,
+            evt_del_delegated(&env),
             DelegatedEventData {
                 delegator,
                 delegate,
@@ -348,12 +342,9 @@ impl DelegationContract {
 
         Self::propagate_weight_change(&env, &delegate, -weight, max_depth);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "delegation"),
-                Symbol::new(&env, "undelegated"),
-                delegator.clone(),
-            ),
+        emit_delegation_event(
+            &env,
+            evt_del_undelegated(&env),
             UndelegatedEventData { delegator },
         );
     }
