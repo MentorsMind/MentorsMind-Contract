@@ -72,6 +72,8 @@ pub mod cartel_detection;
 pub mod transaction_guard;
 pub mod validator_accountability;
 pub mod cross_chain_sync;
+pub mod vrf;
+pub mod bft_consensus;
 pub mod payment_integrity;
 pub mod threat_intelligence;
 pub mod tokenomics_protection;
@@ -80,6 +82,12 @@ pub mod tokenomics_protection;
 pub mod content_protection;
 pub mod ip_verification; 
 pub mod usage_rights_management;
+
+// Additional module declarations
+pub mod curriculum_validation;
+pub mod qualification_verification;
+pub mod proof_of_mentoring;
+pub mod cross_contract_recovery;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -148,7 +156,6 @@ pub use outcome_authenticity::{
 pub use pagination::{
     BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
 };
-pub use pause_guard::{is_paused, require_not_paused, ContractPaused};
 pub use pricing_protection::{
     compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,
     validate_market_rate, verify_demand_authenticity, DemandAuthenticity, FairPricingResult,
@@ -256,10 +263,6 @@ pub use dynamic_fees::{
     DynamicFeeResult, FeeEvasionResult,
     BASE_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
 };
-pub mod curriculum_validation;
-pub mod qualification_verification;
-pub mod proof_of_mentoring;
-pub mod cross_contract_recovery;
 pub use curriculum_validation::{
     validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute
 };
@@ -345,6 +348,25 @@ pub use scalability_protection::{
 pub use validator_accountability::{
     assess_incentive_alignment, get_validator_record, is_validator_ejected,
     register_validator, IncentiveAlignmentScore, ValidatorRecord,
+    ValidatorSet, SlashingPenalty, LongRangeCheckpoint,
+};
+
+pub use vrf::{
+    evaluate_vrf, verify_vrf_proof, select_validators_for_epoch, create_epoch,
+    is_epoch_expired, next_epoch_seed, compute_quorum_threshold, has_quorum,
+    create_checkpoint, is_checkpoint_finalized, should_create_checkpoint,
+    VrfOutput, ValidatorSelection, EpochInfo, ChainCheckpoint,
+    MIN_VALIDATORS, DEFAULT_EPOCH_DURATION_SECS,
+};
+
+pub use bft_consensus::{
+    start_round, cast_prepare, cast_commit, finalize_round, fail_round,
+    is_round_expired, verify_quorum_certificate, create_view_change,
+    has_view_change_quorum, select_proposer, is_valid_proposer,
+    init_consensus_state, start_new_round, handle_round_timeout, reset_timeouts,
+    ConsensusRound, ConsensusPhase, QuorumCertificate, ViewChange,
+    ViewChangeReason, ConsensusState, ConsensusError,
+    ROUND_TIMEOUT_SECS, MAX_TIMEOUTS_BEFORE_EJECT,
 };
 
 // Content protection exports
