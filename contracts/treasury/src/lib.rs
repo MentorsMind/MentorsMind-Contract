@@ -1,19 +1,24 @@
 #![no_std]
 
+use shared::pause_guard::require_not_paused;
+use shared::admin::{AdminTransfer, AdminChangeProposal, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS};
 use shared::{
-    require_not_paused, AtomicBatch, BatchOp, ReentrancyGuard, StateSnapshot, Validator,
+    AtomicBatch, BatchOp, ReentrancyGuard, StateSnapshot, Validator,
     validate_amount_limits, validate_caller_is_authorized, MAX_BATCH_SIZE,
     detect_price_coordination, validate_market_rate,
     enforce_fair_pricing as shared_enforce_fair_pricing, FairPricingResult, MarketRateValidation,
     PriceCoordinationFlag, DEFAULT_MAX_MARKET_DEVIATION_BPS,
-    detect_atomic_arbitrage, enforce_protocol_isolation, compute_mev_redistribution, record_mev_monitoring,
-    MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
+    detect_atomic_arbitrage, enforce_protocol_isolation,
     // resource management
     manage_session_load, check_emergency_trigger,
     // platform authenticity
     detect_fee_evasion, PenaltyTier,
     // dynamic fees
     calculate_dynamic_fee, detect_fee_gaming,
+};
+use shared::economic_verification::{
+    validate_fund_conservation, validate_reward_distribution, record_invariant_check,
+    EconomicInvariant, EconomicInvariantRecord, RewardAllocation,
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -50,11 +55,11 @@ pub trait OracleContractTrait {
 pub trait StakingCoordinationTrait {
     /// Push the scheduled-next-distribution timestamp into the staking
     /// contract so its pattern detector can flag large late stakes.
-    fn set_next_scheduled_distribution_at(
+    fn set_next_distribution_at(
         env: Env,
         admin: Address,
         timestamp: u64,
-    ) -> Result<(), shared::SharedError>;
+    ) -> Result<(), soroban_sdk::Error>;
 
     /// Eligible-total denominator for an already-closed epoch. Used by the
     /// treasury for off-chain audit verification: the treasury confirms
@@ -131,6 +136,9 @@ pub enum Error {
     DuplicateEntry = 21,
     Overflow = 22,
     OracleCircuitBreaker = 23,
+    CoolingOffPeriod = 24,
+    TimelockNotExpired = 25,
+    SuspendedDuringAdminTransfer = 26,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,9 +382,6 @@ impl TreasuryContract {
         env.storage()
             .persistent()
             .set(&DataKey::OperationLogCount, &0u64);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RegulatoryReporting, &Address::generate(&env));
         env.storage()
             .persistent()
             .set(&DataKey::TreasuryContractSelf, &env.current_contract_address());
@@ -770,7 +775,7 @@ impl TreasuryContract {
             .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
         {
             use soroban_sdk::IntoVal;
-            let _ = env.try_invoke_contract::<(), _>(
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &reporting_addr,
                 &Symbol::new(env, "record_large_tx"),
                 (
@@ -1126,14 +1131,12 @@ impl TreasuryContract {
         let amount_ref = amount;
 
         batch.execute_all(|e, op| match op {
-            BatchOp::Transfer {
-                token, from, to, amount, ..
-            } => {
+            BatchOp::Transfer(token, from, to, amount, _) => {
                 token::Client::new(e, token).transfer(from, to, amount);
                 Ok(())
             }
             _ => Ok(()),
-        }).map_err(|_e| Error::InvalidAmount)?;
+        }).map_err(|_e: shared::reentrancy_guard::BatchValidationError| Error::InvalidAmount)?;
 
         let balance_after: i128 =
             token::Client::new(&env, &token_ref).balance(&env.current_contract_address());
@@ -1303,7 +1306,7 @@ impl TreasuryContract {
         batch
             .execute_all(|e, op| -> Result<(), Error> {
                 match op {
-                    BatchOp::Transfer { token, from, to, amount, .. } => {
+                    BatchOp::Transfer(token, from, to, amount, _) => {
                         token::Client::new(e, token).transfer(from, to, amount);
                         Ok(())
                     }
@@ -1519,9 +1522,9 @@ impl TreasuryContract {
         // to understand this new entry point we ignore the failure — the
         // treasury itself still enforces the minimum-interval gate so
         // the deployment is safe either way.
-        let _ = env.try_invoke_contract::<(), _>(
+        let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
             &staking,
-            &Symbol::new(&env, "set_next_scheduled_distribution_at"),
+            &Symbol::new(&env, "set_next_distribution_at"),
             (admin.clone(), distribution_at).into_val(&env),
         );
 
@@ -1536,7 +1539,7 @@ impl TreasuryContract {
     /// matching `schedule_staker_distribution`. Default is `false`
     /// (backwards compatible). Governance can flip to `true` once the
     /// protocol is ready to commit to fully-announced schedules.
-    pub fn set_require_scheduled_distribution(
+    pub fn set_require_sched_distrib(
         env: Env,
         admin: Address,
         require: bool,
@@ -1554,7 +1557,7 @@ impl TreasuryContract {
             .get(&DataKey::ScheduledNextDistributionAt)
     }
 
-    pub fn get_require_scheduled_distribution(env: Env) -> bool {
+    pub fn get_require_sched_distrib(env: Env) -> bool {
         env.storage()
             .persistent()
             .get(&DataKey::RequireScheduledDistribution)
@@ -1712,7 +1715,7 @@ impl TreasuryContract {
             .storage()
             .persistent()
             .get(&DataKey::LastDistributionId)
-            .unwrap_or(0)
+            .unwrap_or(0u64)
             .checked_add(1)
             .ok_or(Error::Overflow)?;
 
@@ -1765,15 +1768,11 @@ impl TreasuryContract {
         let treasury_self = env.current_contract_address();
 
         batch.execute_all(|e, op| match op {
-            BatchOp::Transfer {
-                token, from, to, amount, ..
-            } => {
+            BatchOp::Transfer(token, from, to, amount, _) => {
                 token::Client::new(e, token).transfer(from, to, amount);
                 Ok(())
             }
-            BatchOp::Invoke {
-                contract, function, ..
-            } => {
+            BatchOp::Invoke(contract, _function, _) => {
                 let lp_amount = amount_ref / 10;
                 let staker_amount = amount_ref - lp_amount;
 
@@ -1799,7 +1798,7 @@ impl TreasuryContract {
                 );
                 Ok(())
             }
-        }).map_err(|_e| Error::InvalidAmount)?;
+        }).map_err(|_e: shared::reentrancy_guard::BatchValidationError| Error::InvalidAmount)?;
 
         let balance_after: i128 =
             token::Client::new(&env, &token).balance(&env.current_contract_address());
@@ -2005,7 +2004,7 @@ impl TreasuryContract {
         let mnt_tok = mnt_token.clone();
         let treasury_clone = treasury_addr.clone();
 
-        let mnt_received_result: Result<i128, _> = env.try_invoke_contract(
+        let mnt_received: i128 = env.invoke_contract(
             &dex_contract,
             &swap_fn,
             (
@@ -2017,26 +2016,6 @@ impl TreasuryContract {
             )
                 .into_val(&env),
         );
-
-        let mnt_received = match mnt_received_result {
-            Ok(val) => val,
-            Err(_) => {
-                xlm_client.approve(
-                    &treasury_addr,
-                    &dex_contract,
-                    &0,
-                    &expiration_ledger,
-                );
-                env.events().publish(
-                    (symbol_short!("buyback"), symbol_short!("failed")),
-                    BuybackFailed {
-                        xlm_amount,
-                        reason: Symbol::new(&env, "dex_call_failed"),
-                    },
-                );
-                return Err(Error::ZeroOutput);
-            }
-        };
 
         if mnt_received == 0 {
             xlm_client.approve(
@@ -2225,6 +2204,8 @@ impl TreasuryContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &destination, &amount);
         Ok(())
+    }
+
     // ── Economic monitoring & fairness audit (#903) ────────────────────────
 
     /// Validates a distribution's allocation vector and emits a monitorable

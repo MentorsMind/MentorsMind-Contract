@@ -3,10 +3,11 @@
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::pause_guard::require_not_paused;
 use shared::{
     action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
     compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
-    correlate_attack_vectors, detect_suspicious_pattern, push_snapshot_index, require_not_paused,
+    correlate_attack_vectors, detect_suspicious_pattern, push_snapshot_index,
     validate_amount_limits, exceeds_extraction_rate, detect_coordinated_timing,
     EconomicVelocityReport, MultiVectorThreatReport, PenaltyCalculation,
     ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath, SnapshotMeta, StakeRecord,
