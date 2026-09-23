@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractevent, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec};
 
 #[contractclient(name = "CertificatesClient")]
 pub trait CertificatesTrait {
@@ -57,6 +57,25 @@ const FEATURED_LEARNERS_LIMIT: u32 = 10;
 // Contract
 // ---------------------------------------------------------------------------
 
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct ShowcaseCertEvent {
+    #[topic]
+    action: Symbol,
+    learner: Address,
+    cert_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct FeaturedUpdatedEvent {
+    #[topic]
+    action: Symbol,
+    count: u32,
+}
+
 #[contract]
 pub struct CertShowcase;
 
@@ -93,8 +112,11 @@ impl CertShowcase {
             .persistent()
             .set(&DataKey::Showcase(learner.clone()), &showcase);
 
-        env.events()
-            .publish((symbol_short!("showcased"),), (learner, cert_id));
+        ShowcaseCertEvent {
+            action: symbol_short!("showcased"),
+            learner,
+            cert_id,
+        }.publish(env);
     }
 
     /// Remove a certificate from learner's showcase
@@ -131,8 +153,11 @@ impl CertShowcase {
                 .set(&DataKey::Showcase(learner.clone()), &new_showcase);
         }
 
-        env.events()
-            .publish((symbol_short!("hidden"),), (learner, cert_id));
+        ShowcaseCertEvent {
+            action: symbol_short!("hidden"),
+            learner,
+            cert_id,
+        }.publish(env);
     }
 
     /// Get all showcased certificates for a learner
@@ -207,8 +232,10 @@ impl CertShowcase {
             .persistent()
             .set(&DataKey::FeaturedLearners, &learners);
 
-        env.events()
-            .publish((symbol_short!("feat_upd"),), learners.len() as u32);
+        FeaturedUpdatedEvent {
+            action: symbol_short!("feat_upd"),
+            count: learners.len() as u32,
+        }.publish(env);
     }
 }
 

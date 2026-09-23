@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec,
+    contract, contractevent, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,6 +87,20 @@ const DAY_SECONDS_TTL: u32 = 86_400;
 // Contract
 // ---------------------------------------------------------------------------
 
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct ScoreUpdatedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    #[topic]
+    user: Address,
+    score: u32,
+}
+
 #[contract]
 pub struct CreditScoreContract;
 
@@ -154,10 +168,12 @@ impl CreditScoreContract {
             DAY_SECONDS_TTL,
         );
 
-        env.events().publish(
-            (symbol_short!("score"), symbol_short!("updated"), user),
-            (score,),
-        );
+        ScoreUpdatedEvent {
+            category: symbol_short!("score"),
+            action: symbol_short!("updated"),
+            user,
+            score,
+        }.publish(env);
     }
 
     pub fn compute_score(env: Env, user: Address) -> u32 {

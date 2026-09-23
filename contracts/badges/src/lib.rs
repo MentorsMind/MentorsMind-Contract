@@ -2,7 +2,7 @@
 mod badge_types;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Vec,
+    contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Vec,
 };
 use shared::{audit_privacy, compute_nullifier as shared_compute_nullifier, PrivacyAudit, ZKProof};
 
@@ -30,6 +30,26 @@ pub enum DataKey {
     BadgeNullifier(BytesN<32>),
     BadgeProof(BytesN<32>),
     BadgePrivacyAudit(BytesN<32>),
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct BadgeAwardedEvent {
+    #[topic]
+    action: Symbol,
+    #[topic]
+    mentor: Address,
+    badge_type: BadgeType,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct BadgeAnonMintEvent {
+    #[topic]
+    action: Symbol,
+    #[topic]
+    nullifier: BytesN<32>,
+    badge_type_hash: BytesN<32>,
 }
 
 #[contract]
@@ -73,8 +93,11 @@ impl Badges {
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         env.storage().persistent().set(&count_key, &(count + 1));
 
-        env.events()
-            .publish((symbol_short!("badge_aw"), mentor), badge_type);
+        BadgeAwardedEvent {
+            action: symbol_short!("badge_aw"),
+            mentor,
+            badge_type,
+        }.publish(env);
     }
 
     pub fn revoke_badge(env: Env, mentor: Address, badge_type: BadgeType) {
@@ -112,8 +135,11 @@ impl Badges {
             .persistent()
             .set(&count_key, &count.saturating_sub(1));
 
-        env.events()
-            .publish((symbol_short!("badge_rv"), mentor), badge_type);
+        BadgeAwardedEvent {
+            action: symbol_short!("badge_rv"),
+            mentor,
+            badge_type,
+        }.publish(env);
     }
 
     pub fn has_badge(env: Env, mentor: Address, badge_type: BadgeType) -> bool {
@@ -167,10 +193,11 @@ impl Badges {
             .persistent()
             .set(&DataKey::BadgePrivacyAudit(nullifier.clone()), &audit);
 
-        env.events().publish(
-            (symbol_short!("anon_mint"), nullifier),
+        BadgeAnonMintEvent {
+            action: symbol_short!("anon_mint"),
+            nullifier,
             badge_type_hash,
-        );
+        }.publish(env);
     }
 
     pub fn prove_badge(

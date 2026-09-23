@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
 
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -38,6 +40,55 @@ pub struct YieldHealth {
     pub last_checked_at: u64,
 }
 
+#[contractevent]
+#[derive(Clone)]
+struct GuardianAddressEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    addr: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianPausedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    paused: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianCbTrippedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    count: u32,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianUnitEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianTimestampEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    timestamp: u64,
+}
+
 #[contract]
 pub struct PauseGuardian;
 
@@ -52,10 +103,12 @@ impl PauseGuardian {
         env.storage().instance().set(&PAUSED, &false);
         env.storage().instance().set(&FAILURES, &0u32);
         env.storage().instance().set(&IFACE_VALID, &false);
-        env.events().publish(
-            (symbol_short!("guardian"), symbol_short!("init")),
-            admin,
-        );
+        GuardianAddressEvent {
+            category: symbol_short!("guardian"),
+            action: symbol_short!("init"),
+            addr: admin,
+        }
+        .publish(&env);
     }
 
     // ─── Core pause / unpause ─────────────────────────────────────────────
@@ -69,10 +122,12 @@ impl PauseGuardian {
         if !value {
             env.storage().instance().set(&FAILURES, &0u32);
         }
-        env.events().publish(
-            (symbol_short!("guardian"), symbol_short!("paused")),
-            value,
-        );
+        GuardianPausedEvent {
+            category: symbol_short!("guardian"),
+            action: symbol_short!("paused"),
+            paused: value,
+        }
+        .publish(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -95,10 +150,12 @@ impl PauseGuardian {
             env.storage().instance().set(&PAUSED, &true);
             if !was_paused {
                 // Emit once when the breaker first trips to aid monitoring.
-                env.events().publish(
-                    (symbol_short!("guardian"), symbol_short!("cb_trip")),
-                    next,
-                );
+                GuardianCbTrippedEvent {
+                    category: symbol_short!("guardian"),
+                    action: symbol_short!("cb_trip"),
+                    count: next,
+                }
+                .publish(&env);
             }
         }
     }

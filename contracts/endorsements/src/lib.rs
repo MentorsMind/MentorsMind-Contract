@@ -2,7 +2,7 @@
 
 use shared::health_reporter::{report_metric, MetricCategory};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contractevent, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
 const DECAY_HALF_LIFE_SECS: u64 = 6 * 30 * 24 * 3600; // 6 months in seconds
@@ -57,6 +57,18 @@ pub trait SessionRegistryTrait {
     fn get_sessions_by_mentor(env: Env, mentor: Address) -> Vec<Symbol>;
     fn get_sessions_by_learner(env: Env, learner: Address) -> Vec<Symbol>;
     fn get_session(env: Env, session_id: Symbol) -> SessionRecord;
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct EndorsementChangedEvent {
+    #[topic]
+    action: Symbol,
+    #[topic]
+    endorsee: Address,
+    #[topic]
+    skill: Symbol,
+    endorser: Address,
 }
 
 #[contract]
@@ -148,8 +160,12 @@ impl EndorsementsContract {
             env.storage().persistent().set(&skills_key, &skills);
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "endorsed"), endorsee, skill), endorser);
+        EndorsementChangedEvent {
+            action: Symbol::new(&env, "endorsed"),
+            endorsee,
+            skill,
+            endorser,
+        }.publish(env);
 
         // Report health metric for endorsement creation
         if let Some(dashboard) = env

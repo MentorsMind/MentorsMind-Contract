@@ -21,8 +21,8 @@ use shared::{
     ViolationType,
 };
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contractclient, contractevent, contractimpl, contracttype, symbol_short, Address,
+    BytesN, Env, Symbol, Vec,
 };
 use shared::mev_protection::{
     detect_atomic_arbitrage, enforce_protocol_isolation, record_mev_monitoring,
@@ -111,6 +111,30 @@ pub struct OracleHealth {
 pub struct TwapState {
     pub twap: i128,
     pub last_updated: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct OraclePriceUpdateEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    #[topic]
+    asset: Symbol,
+    price: i128,
+    timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct OracleFeederFlaggedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    feeder: Address,
+    trips: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +354,14 @@ impl OracleContract {
         // #869 — Record successful participation for accountability.
         record_epoch_participation_safe(&env, &feeder);
 
-        env.events().publish(
-            (symbol_short!("oracle"), symbol_short!("price_upd"), asset),
-            (price, timestamp),
-        );
+        OraclePriceUpdateEvent {
+            category: symbol_short!("oracle"),
+            action: symbol_short!("price_upd"),
+            asset,
+            price,
+            timestamp,
+        }
+        .publish(&env);
 
         let _ = cb_trips_this_submission;
     }
@@ -804,10 +832,13 @@ impl OracleContract {
         if new_trips >= FEEDER_SLASH_THRESHOLD {
             let flagged = record_missed_epoch_safe(env, feeder);
             if flagged {
-                env.events().publish(
-                    (symbol_short!("oracle"), symbol_short!("fdr_flag")),
-                    (feeder.clone(), new_trips),
-                );
+                OracleFeederFlaggedEvent {
+                    category: symbol_short!("oracle"),
+                    action: symbol_short!("fdr_flag"),
+                    feeder: feeder.clone(),
+                    trips: new_trips,
+                }
+                .publish(env);
             }
         }
     }
