@@ -162,11 +162,11 @@ impl CollateralLoanContract {
     }
 
     pub fn is_paused(env: Env) -> bool {
-        pause_guard::is_paused(&env)
+        pause_guard::is_paused_local(&env)
     }
 
     pub fn open_loan(env: Env, borrower: Address, collateral_amount: i128, borrow_amount: i128) {
-        pause_guard::require_not_paused(&env);
+        pause_guard::require_not_paused_local(&env);
         Self::require_initialized(&env);
         borrower.require_auth();
 
@@ -223,7 +223,7 @@ impl CollateralLoanContract {
     }
 
     pub fn repay_loan(env: Env, borrower: Address, amount: i128) {
-        pause_guard::require_not_paused(&env);
+        pause_guard::require_not_paused_local(&env);
         Self::require_initialized(&env);
         borrower.require_auth();
 
@@ -327,7 +327,7 @@ impl CollateralLoanContract {
     }
 
     pub fn liquidate(env: Env, borrower: Address, liquidator: Address) {
-        pause_guard::require_not_paused(&env);
+        pause_guard::require_not_paused_local(&env);
         Self::require_initialized(&env);
         liquidator.require_auth();
 

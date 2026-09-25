@@ -14,64 +14,117 @@ use soroban_sdk::{
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    /// Escrow funds are locked pending session completion.
     Active,
+    /// Funds have been released to the mentor upon successful completion.
     Released,
+    /// A dispute has been opened by a party, freezing escrow movement.
     Disputed,
+    /// Escrow funds have been refunded back to the learner.
     Refunded,
+    /// The dispute has been arbitrated and settled.
     Resolved,
 }
 
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Escrow {
+    /// Unique numeric identifier for the escrow instance.
     pub id: u64,
+    /// Address of the mentor delivering the session.
     pub mentor: Address,
+    /// Address of the learner paying for the session.
     pub learner: Address,
+    /// Total escrow principal amount, in token smallest units.
     pub amount: i128,
+    /// Associated mentoring session identifier symbol.
     pub session_id: Symbol,
+    /// Current lifecycle state of the escrow.
     pub status: EscrowStatus,
+    /// Timestamp (seconds) when the escrow was initialized.
     pub created_at: u64,
+    /// Contract address of the payment token (e.g. USDC or MNT).
     pub token_address: Address,
+    /// Fee collected by the platform protocol, in token smallest units.
     pub platform_fee: i128,
+    /// Net token amount payable to the mentor, in token smallest units.
     pub net_amount: i128,
+    /// Expected completion timestamp (seconds) of the mentoring session.
     pub session_end_time: u64,
+    /// Grace period in seconds after session_end_time before auto-release triggers.
     pub auto_release_delay: u64,
+    /// Reason code symbol provided if a dispute is filed.
     pub dispute_reason: Symbol,
+    /// Timestamp (seconds) when the dispute was resolved, or 0 if unresolved.
     pub resolved_at: u64,
+    /// USD equivalent valuation of the escrow, in token smallest units.
     pub usd_amount: i128,
+    /// Quoted token amount converted from reference currency.
     pub quoted_token_amount: i128,
+    /// Source asset address for cross-currency routed escrows.
     pub send_asset: Address,
+    /// Destination asset address received by the mentor.
     pub dest_asset: Address,
+    /// Total scheduled sessions included in this escrow agreement.
     pub total_sessions: u32,
+    /// Number of scheduled sessions verified as completed so far.
     pub sessions_completed: u32,
 }
 
-/// Threshold (bps of a mentor's disputes / total sessions) above which
-/// [`HealthDashboardContract::record_dispute_opened`] emits a
-/// `MentorDisputeRateAlert` event. 2000 bps = 20%.
+/// Dispute rate alert threshold in basis points (2000 bps = 20.00%).
+///
+/// ### Definition
+/// Encodes the ratio of total disputes opened against a mentor relative to their
+/// total recorded mentoring sessions (`disputes * 10_000 / sessions`).
+///
+/// ### Business Significance
+/// A mentor whose dispute rate exceeds 20% indicates significant friction, service
+/// delivery issues, or potential malicious behavior. When breached, the platform
+/// automatically emits a `MentorDisputeRateAlert` event to alert community moderators,
+/// triage arbitration queues, and prompt administrative review or staking slash evaluation.
+///
+/// ### Governance Process
+/// Modifying this threshold requires a standard DAO governance parameter change
+/// proposal submitted through the governance timelock. Adjustments should be justified
+/// by network-wide dispute trends, statistical analysis of false positives, and mentor
+/// onboarding volumes to ensure appropriate alert sensitivity.
 pub const DISPUTE_RATE_ALERT_BPS: u32 = 2000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeStats {
+    /// Total count of disputes opened across all historical sessions.
     pub total_opened: u32,
+    /// Number of disputes resolved in favor of the mentor.
     pub total_resolved_mentor_favor: u32,
+    /// Number of disputes resolved in favor of the learner.
     pub total_resolved_learner_favor: u32,
+    /// Number of arbitrated disputes appealed to community governance.
     pub total_appealed: u32,
+    /// Average duration from dispute opening to resolution, in seconds.
     pub avg_resolution_time_secs: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlatformStats {
+    /// Total value locked across all active escrows, in token smallest units.
     pub total_value_locked: i128,
+    /// Number of currently active, non-finalized escrows.
     pub active_escrows: u32,
+    /// Aggregate count of all mentoring sessions created on the platform.
     pub total_sessions: u32,
+    /// Network-wide aggregate dispute rate, in basis points (1 bps = 0.01%).
     pub dispute_rate_bps: u32,
+    /// Total registered mentors active on the platform.
     pub total_mentors: u32,
+    /// Total registered learners active on the platform.
     pub total_learners: u32,
+    /// Total MNT tokens currently staked in the staking contract, in smallest units.
     pub mnt_staked: i128,
+    /// Mapping of platform contract identifiers to their active version numbers.
     pub contract_versions: Map<Symbol, u32>,
+    /// List of learner addresses flagged for security review or excessive disputes.
     pub flagged_learners: Vec<Address>,
 }
 
@@ -79,8 +132,11 @@ pub struct PlatformStats {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceEntry {
+    /// Identifier symbol of the protocol interface.
     pub interface_id: Symbol,
+    /// Deployed contract address implementing the interface.
     pub contract: Address,
+    /// Semantic version number of the contract implementation.
     pub version: u32,
 }
 
@@ -89,6 +145,7 @@ pub struct InterfaceEntry {
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
+    /// Global configuration containing addresses of dependent protocol contracts.
     Config,
     /// `(ledger_sequence, cached stats)` — invalidated when ledger advances.
     Cache,
@@ -97,30 +154,46 @@ pub enum DataKey {
     /// Number of disputes ever opened against a given mentor, used by
     /// [`HealthDashboardContract::get_mentor_dispute_rate`].
     MentorDisputeCount(Address),
-    /// Health metric storage keys
+    /// Health metric storage keys partitioned by page number.
     MetricPage(u32),
+    /// Total number of stored metric pages.
     PageCount,
+    /// Pointer to the latest active metric page index.
     CurrentPage,
+    /// Maximum number of metrics stored per page.
     PageSize,
+    /// Configured health thresholds for automated evaluation.
     Thresholds,
+    /// Most recent evaluated system health status snapshot.
     LastHealth,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
+    /// Admin address authorized to execute privileged dashboard maintenance.
     pub admin: Address,
+    /// Contract address of the escrow factory / manager.
     pub escrow: Address,
+    /// Contract address managing session scheduling and lifecycle events.
     pub session_registry: Address,
+    /// Contract address handling MNT staking and reward distribution.
     pub staking: Address,
+    /// Contract address of the native MNT utility and governance token.
     pub mnt_token: Address,
+    /// Contract address computing and storing participant reputation metrics.
     pub reputation: Address,
+    /// Contract address tracking interface implementations and versions.
     pub interface_registry: Address,
+    /// Contract address managing protocol treasury reserves and allocations.
     pub treasury: Address,
+    /// Contract address maintaining the insurance fund pool.
     pub insurance: Address,
+    /// Contract address providing liquidity lending and borrowing facilities.
     pub lending_pool: Address,
+    /// Contract address of the USDC stablecoin settlement token.
     pub usdc_token: Address,
-    /// Address of this health dashboard contract (for self-referencing)
+    /// Address of this health dashboard contract (for self-referencing).
     pub health_dashboard: Address,
 }
 
@@ -132,26 +205,42 @@ pub struct Config {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAllocationView {
+    /// Identifier number for the pending allocation request.
     pub id: u32,
+    /// Token address of the asset scheduled for allocation.
     pub token: Address,
+    /// Beneficiary address designated to receive the allocated funds.
     pub recipient: Address,
+    /// Allocation amount, in token smallest units.
     pub amount: i128,
+    /// Total number of governance/guardian approvals gathered for the allocation.
     pub approvals_count: u32,
+    /// Flag indicating whether the allocation transaction has been executed.
     pub executed: bool,
+    /// Timestamp (seconds) when the allocation request was created.
     pub created_at: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SolvencyReport {
+    /// Available liquid reserves in the protocol treasury, in token smallest units.
     pub treasury_balance: i128,
+    /// Total committed but unexecuted treasury allocations, in token smallest units.
     pub pending_allocations: i128,
+    /// Liquid capital balance held in the insurance pool, in token smallest units.
     pub insurance_pool_balance: i128,
+    /// Total outstanding unpaid insurance claims, in token smallest units.
     pub outstanding_claims: i128,
+    /// Total principal staked by users across all staking tiers, in token smallest units.
     pub staking_total: i128,
+    /// Total accrued but unclaimed staking rewards owed to stakers, in token smallest units.
     pub pending_rewards: i128,
+    /// Total liquidity provided across all active lending pools, in token smallest units.
     pub lending_total_liquidity: i128,
+    /// Total borrowed principal currently outstanding across all active loans, in token smallest units.
     pub outstanding_loans: i128,
+    /// Overall protocol solvency verdict: `true` if aggregate reserves exceed obligations.
     pub is_solvent: bool,
 }
 
@@ -467,7 +556,8 @@ impl HealthDashboardContract {
         // Outstanding loans = bad_debt + (initial liquidity - current liquidity)
         let initial_liquidity_proxy: i128 = treasury_balance.saturating_add(insurance_pool_balance);
         let outstanding_loans: i128 = bad_debt
-            .saturating_add(initial_liquidity_proxy.saturating_sub(lending_total_liquidity));
+            .saturating_add(initial_liquidity_proxy.saturating_sub(lending_total_liquidity))
+            .max(0);
 
         // ── Solvency check ───────────────────────────────────────────────
         // treasury must cover pending allocations
@@ -1131,7 +1221,7 @@ mod test {
 
         let escrow_id = env.register_contract(None, MockEscrow);
         let session_reg = env.register_contract(None, MockSessionRegistry);
-        let staking = Address::generate(&env);
+        let staking = env.register_contract(None, MockStakingForSolvency);
         let mnt = env.register_contract(None, MockMntToken);
         MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
 
@@ -1243,7 +1333,7 @@ mod test {
 
         let escrow_id = env.register_contract(None, MockEscrow);
         let session_reg = env.register_contract(None, MockSessionRegistry);
-        let staking = Address::generate(&env);
+        let staking = env.register_contract(None, MockStakingForSolvency);
         let mnt = env.register_contract(None, MockMntToken);
         MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
 
@@ -1286,7 +1376,7 @@ mod test {
 
         let escrow_id = env.register_contract(None, MockEscrow);
         let session_reg = env.register_contract(None, MockSessionRegistry);
-        let staking = Address::generate(&env);
+        let staking = env.register_contract(None, MockStakingForSolvency);
         let mnt = env.register_contract(None, MockMntToken);
         MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
 
