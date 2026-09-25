@@ -219,6 +219,9 @@ pub enum DataKey {
     EmergencyOverride(Symbol),
     SessionAccessAudit(Symbol),
     AccessorContained(Address),
+    /// Whether a learner's session data is currently contained after a
+    /// confirmed cross-session breach.
+    BreachContained(Address),
     OutOfScopeAccessLog(Address),
     OutOfScopeSessionSet(Address),
     SessionProtection(Symbol),
@@ -2921,15 +2924,26 @@ impl SessionRegistry {
             panic!("Accessor contained after detected cross-session leak");
         }
 
+        let record: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Session(session_id.clone()))
+            .expect("Session not found");
+        let learner_contained: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BreachContained(record.learner.clone()))
+            .unwrap_or(false);
+        if learner_contained {
+            panic!("Learner data contained after detected cross-session leak");
+        }
+
         let boundary = Self::enforce_privacy_boundaries(env.clone(), accessor, session_id.clone());
         if !boundary.allowed {
             panic!("Unauthorized: not a participant in this session");
         }
 
-        env.storage()
-            .persistent()
-            .get(&DataKey::Session(session_id))
-            .expect("Session not found")
+        record
     }
 
     /// Re-score an accessor's cross-session leak risk from its rolling
@@ -2951,12 +2965,41 @@ impl SessionRegistry {
         let containment = contain_data_breach(&env, leak, Symbol::new(&env, "cross_session_leak"));
         if containment.contain {
             env.storage().persistent().set(&DataKey::AccessorContained(accessor.clone()), &true);
-            env.events().publish(
-                (symbol_short!("privacy"), Symbol::new(&env, "breach_contained")),
-                (accessor, containment.reason),
-            );
+            for session_id in distinct_sessions.iter() {
+                if let Some(record) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, SessionRecord>(&DataKey::Session(session_id.clone()))
+                {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::BreachContained(record.learner.clone()), &true);
+                    env.events().publish(
+                        (symbol_short!("privacy"), Symbol::new(&env, "breach_contained")),
+                        (record.learner, containment.reason.clone()),
+                    );
+                }
+            }
         }
         leak
+    }
+
+    /// Whether a learner's session data is currently contained after a
+    /// confirmed cross-session breach.
+    pub fn is_breach_contained(env: Env, learner: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BreachContained(learner))
+            .unwrap_or(false)
+    }
+
+    /// Clear learner-data containment after backend/admin review.
+    pub fn restore_learner_access(env: Env, learner: Address) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::BreachContained(learner), &false);
     }
 
     /// Whether `accessor` is currently contained following a detected
@@ -3974,6 +4017,34 @@ mod tests {
         env.mock_all_auths();
         client.restore_accessor_access(&outsider);
         assert!(!client.is_accessor_contained(&outsider));
+    }
+
+    #[test]
+    fn test_breach_contains_learner_reads_until_admin_clears_it() {
+        let (env, client, _backend) = setup();
+        let learner = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let token = dummy_token(&env);
+        let session_id = Symbol::new(&env, "brecha");
+
+        for i in 0..3u32 {
+            let session_mentor = Address::generate(&env);
+            let session_id = Symbol::new(&env, if i == 0 { "brecha" } else if i == 1 { "brechb" } else { "brechc" });
+            client.register_session(&session_id, &session_mentor, &learner, &2_000_000u64, &30u32, &100i128, &token);
+            client.enforce_privacy_boundaries(&outsider, &session_id);
+            client.monitor_cross_session_leakage(&outsider);
+        }
+
+        assert!(client.is_breach_contained(&learner));
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.manage_session_data(&learner, &session_id);
+        }));
+        assert!(blocked.is_err());
+
+        env.mock_all_auths();
+        client.restore_learner_access(&learner);
+        assert!(!client.is_breach_contained(&learner));
+        assert_eq!(client.manage_session_data(&learner, &session_id).learner, learner);
     }
 
     // ── Session protection & attack detection (#901) ────────────────────────
