@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 soroban-sdk = "21.0.0"
 
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
 [lib]
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
