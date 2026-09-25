@@ -29,6 +29,7 @@ members = [
     "contracts/cert_showcase",
     "contracts/lending_pool",
     "contracts/collateral_loan",
+    "contracts/delegation",
     "contracts/velocity_limits",
     "contracts/endorsements",
     "contracts/prediction_market",
