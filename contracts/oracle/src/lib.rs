@@ -930,6 +930,10 @@ impl OracleContract {
         // After threshold, record missed epoch and potentially slash.
         if new_trips >= FEEDER_SLASH_THRESHOLD {
             let flagged = record_missed_epoch_safe(env, feeder);
+            if new_trips == FEEDER_SLASH_THRESHOLD {
+                let evidence_hash = BytesN::from_array(env, &[0u8; 32]);
+                apply_slash(env, feeder, ViolationType::MissedEpoch, evidence_hash);
+            }
             if flagged {
                 OracleFeederFlaggedEvent {
                     category: symbol_short!("oracle"),
@@ -974,7 +978,10 @@ fn record_missed_epoch_safe(env: &Env, validator: &Address) -> bool {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::Env;
 
@@ -1188,6 +1195,80 @@ mod tests {
         // Feeder accountability record should reflect ejection.
         let rec = client.get_feeder_accountability(&feeder).unwrap();
         assert!(rec.ejected);
+    }
+
+    #[test]
+    fn test_record_missed_epoch_increments_feeder_counter() {
+        let env = Env::default();
+        let feeder = Address::generate(&env);
+        register_validator(&env, &feeder);
+
+        assert!(!record_missed_epoch(&env, &feeder));
+
+        let record = get_validator_record(&env, &feeder).unwrap();
+        assert_eq!(record.epochs_missed, 1);
+        assert_eq!(record.consecutive_missed, 1);
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_applies_feeder_slash() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 3);
+        let asset = symbol_short!("XLM");
+
+        submit(&env, &client, &feeders.get(0).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(1).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(2).unwrap(), asset.clone(), 100, 999);
+        client.get_price(&asset);
+
+        let feeder = feeders.get(0).unwrap();
+        for _ in 0..FEEDER_SLASH_THRESHOLD {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                client.submit_price(&feeder, &asset, &200, &999);
+            }));
+            assert!(result.is_err());
+        }
+
+        let record = client.get_feeder_accountability(&feeder).unwrap();
+        assert_eq!(record.epochs_missed, 1);
+        assert_eq!(
+            record.total_slashed_bps,
+            shared::validator_accountability::SLASH_MINOR_BPS
+        );
+        assert_eq!(record.total_violations, 1);
+    }
+
+    #[test]
+    fn test_consensus_attack_flags_deviating_feeder() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 3);
+        let asset = symbol_short!("XLM");
+
+        submit(&env, &client, &feeders.get(0).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(1).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(2).unwrap(), asset.clone(), 100, 999);
+        client.get_price(&asset);
+
+        let feeder = feeders.get(0).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            client.submit_price(&feeder, &asset, &200, &999);
+        }));
+        assert!(result.is_err());
+
+        let evidence = BytesN::from_array(&env, &[0xCDu8; 32]);
+        let anomaly_score = client.detect_oracle_consensus_attack(
+            &admin,
+            &feeder,
+            &symbol_short!("price_deviation"),
+            &evidence,
+        );
+
+        assert_eq!(anomaly_score, 10_000 / feeders.len() as u32);
+        assert!(client.get_feeder_accountability(&feeder).unwrap().ejected);
     }
 
     // -----------------------------------------------------------------------
