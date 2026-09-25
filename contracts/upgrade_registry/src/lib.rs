@@ -260,6 +260,8 @@ impl UpgradeRegistryContract {
     ) -> Result<(), Error> {
         let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
+        Self::validate_storage_upgrade(&env, &contract_name, new_version)?;
+
         validate_wasm_exports(&env, &new_wasm_hash)?;
 
         if let Some(status) = Self::get_migration_status(env.clone(), contract_name.clone()) {
@@ -330,6 +332,12 @@ impl UpgradeRegistryContract {
             .instance()
             .get(&DataKey::PendingUpgrade)
             .ok_or(Error::NoPendingUpgrade)?;
+
+        Self::validate_storage_upgrade(
+            &env,
+            &pending.contract_name,
+            pending.new_version,
+        )?;
 
         let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
@@ -474,6 +482,8 @@ impl UpgradeRegistryContract {
             "DEPRECATION WARNING: upgrade_contract is deprecated and will be removed in v1.0.0. Please migrate to schedule_upgrade + execute_pending_upgrade."
         );
         let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
+
+        Self::validate_storage_upgrade(&env, &contract_name, new_version)?;
 
         let current = Self::get_latest_version(env.clone(), contract_name.clone());
         if new_version <= current {
@@ -800,34 +810,39 @@ impl UpgradeRegistryContract {
             return Err(Error::IncompatibleStorageLayout);
         }
 
-        // If a previous version exists, validate compatibility
         let current_version = Self::get_latest_version(env.clone(), contract_name.clone());
-        if current_version > 0 {
-            if let Some(old_schema) = Self::get_storage_schema(env.clone(), contract_name.clone(), current_version) {
-                let report = CompatibilityValidator::validate_compatibility(&env, &old_schema, &schema);
-                if !report.is_compatible && !report.requires_migration {
-                    return Err(Error::IncompatibleStorageLayout);
-                }
+        let current_storage = Self::get_active_storage_version(env.clone(), contract_name.clone());
+        if let Some(ref current_storage) = current_storage {
+            let current_schema = Self::get_storage_schema(
+                env.clone(),
+                contract_name.clone(),
+                current_storage.current_version,
+            )
+            .ok_or(Error::StorageLayoutNotFound)?;
+            let report =
+                CompatibilityValidator::validate_compatibility(&env, &current_schema, &schema);
+            if !report.is_compatible && !report.requires_migration {
+                return Err(Error::IncompatibleStorageLayout);
             }
         }
 
-        // Store schema
         env.storage().persistent().set(
             &DataKey::StorageLayout(contract_name.clone(), schema.version),
             &schema,
         );
 
-        let storage_ver = StorageVersion {
-            current_version: schema.version,
-            min_compatible_version: if current_version == 0 { schema.version } else { current_version },
-            layout_hash: schema.schema_hash.clone(),
-            migration_in_progress: false,
-        };
-
-        env.storage().persistent().set(
-            &DataKey::ActiveStorageVersion(contract_name.clone()),
-            &storage_ver,
-        );
+        if current_version == 0 || current_storage.is_none() {
+            let storage_ver = StorageVersion {
+                current_version: schema.version,
+                min_compatible_version: schema.version,
+                layout_hash: schema.schema_hash.clone(),
+                migration_in_progress: false,
+            };
+            env.storage().persistent().set(
+                &DataKey::ActiveStorageVersion(contract_name.clone()),
+                &storage_ver,
+            );
+        }
 
         env.events().publish(
             (
@@ -868,28 +883,60 @@ impl UpgradeRegistryContract {
         contract_name: Symbol,
         new_schema: StorageLayoutSchema,
     ) -> Result<CompatibilityReport, Error> {
-        let current_version = Self::get_latest_version(env.clone(), contract_name.clone());
-        if current_version == 0 {
-            // No previous schema, fully compatible as initial layout
-            let fields_count = new_schema.fields.len();
-            return Ok(CompatibilityReport {
-                is_compatible: true,
-                requires_migration: false,
-                added_fields: fields_count,
-                deprecated_fields: 0,
-                fields_checked: fields_count,
-                mismatches: Vec::new(&env),
-            });
-        }
-
-        let old_schema = Self::get_storage_schema(env.clone(), contract_name, current_version)
+        let current_storage = Self::get_active_storage_version(env.clone(), contract_name.clone())
             .ok_or(Error::StorageLayoutNotFound)?;
+        let old_schema = Self::get_storage_schema(
+            env.clone(),
+            contract_name,
+            current_storage.current_version,
+        )
+        .ok_or(Error::StorageLayoutNotFound)?;
 
         Ok(CompatibilityValidator::validate_compatibility(
             &env,
             &old_schema,
             &new_schema,
         ))
+    }
+
+    fn validate_storage_upgrade(
+        env: &Env,
+        contract_name: &Symbol,
+        target_version: u32,
+    ) -> Result<(), Error> {
+        let current_version = Self::get_latest_version(env.clone(), contract_name.clone());
+        if current_version == 0 || target_version <= current_version {
+            return Ok(());
+        }
+
+        let Some(current_storage) =
+            Self::get_active_storage_version(env.clone(), contract_name.clone())
+        else {
+            return Ok(());
+        };
+        if current_storage.current_version >= target_version {
+            return Ok(());
+        }
+        let target_schema =
+            Self::get_storage_schema(env.clone(), contract_name.clone(), target_version)
+                .ok_or(Error::StorageLayoutNotFound)?;
+        let current_schema = Self::get_storage_schema(
+            env.clone(),
+            contract_name.clone(),
+            current_storage.current_version,
+        )
+        .ok_or(Error::StorageLayoutNotFound)?;
+        let report =
+            CompatibilityValidator::validate_compatibility(env, &current_schema, &target_schema);
+
+        if report.requires_migration {
+            return Err(Error::StorageMigrationRequired);
+        }
+        if !report.is_compatible {
+            return Err(Error::IncompatibleStorageLayout);
+        }
+
+        Ok(())
     }
 
     /// Start a gradual storage migration for a large dataset across schema versions.
@@ -2101,6 +2148,56 @@ mod test {
         let active_ver = client.get_active_storage_version(&contract_name).unwrap();
         assert_eq!(active_ver.current_version, 2);
         assert!(!active_ver.migration_in_progress);
+    }
+
+    #[test]
+    fn test_storage_migration_required_blocks_until_complete() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let wasm_hash = BytesN::from_array(&env, &[0xab; 32]);
+        let field_v1 = StorageField {
+            name: symbol_short!("fee"),
+            field_type: StorageFieldType::U32,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let field_v2 = StorageField {
+            name: symbol_short!("fee"),
+            field_type: StorageFieldType::U64,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let schema_v1 = make_test_storage_schema(&env, 1, soroban_sdk::vec![&env, field_v1]);
+        let schema_v2 = make_test_storage_schema(&env, 2, soroban_sdk::vec![&env, field_v2]);
+
+        client.register_storage_schema(&contract_name, &schema_v1, &signers);
+        client.register_upgrade(&contract_name, &0, &1, &wasm_hash);
+        client.register_storage_schema(&contract_name, &schema_v2, &signers);
+
+        let report = client.validate_upgrade_compatibility(&contract_name, &schema_v2);
+        assert!(!report.is_compatible);
+        assert!(report.requires_migration);
+        assert_eq!(
+            client.try_schedule_upgrade(
+                &wasm_hash,
+                &contract_name,
+                &2,
+                &wasm_hash,
+                &signers,
+            ),
+            Err(Ok(Error::StorageMigrationRequired))
+        );
+
+        let initial = client.start_storage_migration(&contract_name, &1, &2, &1, &signers);
+        assert!(!initial.completed);
+        let completed = client.execute_migration_step(&contract_name, &1, &signers);
+        assert!(completed.completed);
+
+        client.schedule_upgrade(&wasm_hash, &contract_name, &2, &wasm_hash, &signers);
+        assert!(client.get_pending_upgrade().is_some());
     }
 
     #[test]

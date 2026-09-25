@@ -1,7 +1,5 @@
 #![no_std]
 
-pub mod pagination;
-pub mod pause_guard;
 pub mod privacy;
 use soroban_sdk::contracterror;
 
@@ -27,6 +25,7 @@ pub mod key_management;
 pub mod learner_protection;
 pub mod outcome_authenticity;
 pub mod pagination;
+pub mod params;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod safe_math;
@@ -85,20 +84,13 @@ pub mod content_protection;
 pub mod ip_verification; 
 pub mod usage_rights_management;
 
-pub use pagination::{Pagination, MAX_PAGE_SIZE};
-pub use pause_guard::{
-    is_paused, pause, pause_guardian, pause_state, require_not_paused, require_pause_guardian,
-    set_pause_guardian, set_paused, unpause, PauseState,
-};
-pub use privacy::{
-    contain_data_breach, detect_cross_session_leak, leak_log, record_session_owner, session_owner,
-    CrossSessionLeakResult, LeakLogEntry,
-};
-pub use state_machine::StateMachine;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privacy::{
+        contain_data_breach, detect_cross_session_leak, leak_log, record_session_owner,
+        session_owner, CrossSessionLeakResult, LeakLogEntry,
+    };
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env};
 
@@ -108,7 +100,7 @@ mod tests {
     fn pause_state_defaults_to_active() {
         let env = Env::default();
         assert_eq!(pause_state(&env), PauseState::Active);
-        assert!(!is_paused(&env));
+        assert!(!pause_guard_is_paused(&env));
     }
 
     #[test]
@@ -122,20 +114,20 @@ mod tests {
         assert_eq!(pause_guardian(&env), Some(guardian.clone()));
 
         pause(&env);
-        assert!(is_paused(&env));
+        assert!(pause_guard_is_paused(&env));
         require_pause_guardian(&env);
 
         unpause(&env);
-        assert!(!is_paused(&env));
+        assert!(!pause_guard_is_paused(&env));
     }
 
     #[test]
     fn set_paused_writes_the_flag_without_auth() {
         let env = Env::default();
         set_paused(&env, true);
-        assert!(is_paused(&env));
+        assert!(pause_guard_is_paused(&env));
         set_paused(&env, false);
-        assert!(!is_paused(&env));
+        assert!(!pause_guard_is_paused(&env));
     }
 
     #[test]
@@ -143,13 +135,13 @@ mod tests {
     fn require_not_paused_panics_while_paused() {
         let env = Env::default();
         set_paused(&env, true);
-        require_not_paused(&env);
+        require_not_paused_locally(&env);
     }
 
     #[test]
     fn require_not_paused_passes_while_active() {
         let env = Env::default();
-        require_not_paused(&env);
+        require_not_paused_locally(&env);
     }
 
     // ── pagination ───────────────────────────────────────────────────────────
@@ -372,6 +364,18 @@ pub use outcome_authenticity::{
 };
 pub use pagination::{
     BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
+};
+pub use params::{
+    get_all_params, get_param, governance_admin_role, init_protocol_params, key_cooldown_days,
+    key_interest_rate_bps, key_min_bond, key_min_credit_score, key_platform_fee_bps,
+    key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver, set_param, ParamKey,
+    DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
+    DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
+    DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
+};
+pub use pause_guard::{
+    pause, pause_guard_is_paused, pause_guardian, pause_state, require_not_paused_locally,
+    require_pause_guardian, set_pause_guardian, set_paused, unpause, PauseState,
 };
 pub use pricing_protection::{
     compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,

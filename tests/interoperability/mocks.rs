@@ -107,6 +107,15 @@ impl MockStaking {
 }
 
 #[contract]
+pub struct MockCreditScore;
+#[contractimpl]
+impl MockCreditScore {
+    pub fn get_score(_env: Env, _user: Address) -> u32 {
+        750
+    }
+}
+
+#[contract]
 pub struct MockLendingPool;
 #[contractimpl]
 impl MockLendingPool {

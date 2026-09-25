@@ -205,6 +205,7 @@ pub enum DataKey {
     StakeSnapshotMeta(u32),
     /// Ordered Vec<u32> of retained staking DR snapshot IDs.
     StakeSnapshotIndex,
+    NextStakeSnapshotId,
     /// Vec<Address> of up to 7 emergency signers for staking rollback.
     StakeEmergencySigners,
     /// RollbackProposal for staking rollback proposal `n`.
@@ -857,13 +858,14 @@ impl StakingContract {
             &env,
             evt_staking_staked(&env),
             StakedEventData {
-                mentor,
+                mentor: mentor.clone(),
                 amount,
                 unlock_at,
                 unlock_cooldown_until: None,
                 tier,
             },
         );
+        Self::record_stake_snapshot_index(&env);
 
         // Report health metric for staking TVL
         if let Some(dashboard) = env
@@ -891,6 +893,32 @@ impl StakingContract {
     // -----------------------------------------------------------------------
     // Ring-buffer action-log helpers (pattern detection + analytics)
     // -----------------------------------------------------------------------
+
+    fn record_stake_snapshot_index(env: &Env) {
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextStakeSnapshotId)
+            .unwrap_or(0);
+        let next = current.checked_add(1).expect("snapshot index overflow");
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshotIndex)
+            .unwrap_or(Vec::new(env));
+        push_snapshot_index(&mut index, next);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeSnapshotIndex, &index);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StakeSnapshotIndex,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextStakeSnapshotId, &next);
+    }
 
     fn load_action_log(env: &Env, staker: &Address) -> Vec<StakingActionRecord> {
         env.storage()
@@ -1154,6 +1182,7 @@ impl StakingContract {
                 amount: record.amount,
             },
         );
+        Self::record_stake_snapshot_index(&env);
 
         // Report health metric for staking TVL after unstake
         if let Some(dashboard) = env
@@ -1235,7 +1264,7 @@ impl StakingContract {
     /// helper; callers wanting the full list page through with `offset`.
     pub fn get_stakers(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<Address> {
         let count = Self::get_staker_count(env.clone());
-        let (start, end) = Pagination::new(offset, limit).bounds(count);
+        let (start, end) = Pagination::bounds(count, offset, limit);
         let mut out = soroban_sdk::Vec::new(&env);
         for i in start..end {
             if let Some(addr) = env
@@ -1593,7 +1622,7 @@ impl StakingContract {
         // itself has grown large — `.min(count)` alone doesn't bound the
         // per-call work, since it degenerates to `count` for any
         // sufficiently large `limit`.
-        let (start, end) = Pagination::new(offset, limit).bounds(count);
+        let (start, end) = Pagination::bounds(count, offset, limit);
 
         // === OPTIMIZATION: Batch storage operations to reduce N+1 query problem ===
         let mut batch_updates: soroban_sdk::Vec<(Address, i128)> = soroban_sdk::Vec::new(&env);
@@ -1821,8 +1850,9 @@ impl StakingContract {
 
         env.events().publish(
             (Symbol::new(&env, "reward"), Symbol::new(&env, "claimed")),
-            (staker, total_claimable, current_epoch),
+            (staker.clone(), total_claimable, current_epoch),
         );
+        Self::record_stake_snapshot_index(&env);
 
         Ok(())
     }
@@ -4058,5 +4088,89 @@ mod test {
         f.client().stake(&mentor, &2_000, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 3);
+    }
+
+    #[test]
+    fn snapshot_index_advances_after_successful_staking_operations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = 100;
+            ledger.timestamp = 1_000;
+        });
+        let admin = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let token_id = env.register_contract(None, MockMNT);
+        MockMNTClient::new(&env, &token_id).mint(&mentor, &1_000i128);
+        let staking_id = env.register_contract(None, StakingContract);
+        let client = StakingContractClient::new(&env, &staking_id);
+        client.initialize(&admin, &token_id, &None);
+
+        client.stake(&mentor, &100, &30);
+        let mut index: Vec<u32> = env
+            .as_contract(&staking_id, || {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::StakeSnapshotIndex)
+                    .unwrap()
+            });
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(0), Some(1));
+
+        assert_eq!(
+            client.try_stake(&mentor, &100, &30),
+            Err(Ok(Error::AlreadyStaked))
+        );
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(0), Some(1));
+
+        env.as_contract(&staking_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingRewards(mentor.clone()), &10i128);
+        });
+        client.claim_rewards(&mentor, &token_id);
+        client.unstake(&mentor);
+
+        index = env.as_contract(&staking_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::StakeSnapshotIndex)
+                .unwrap()
+        });
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.get(0), Some(1));
+        assert_eq!(index.get(1), Some(2));
+        assert_eq!(index.get(2), Some(3));
+    }
+
+    #[test]
+    fn snapshot_index_overflow_does_not_modify_existing_entries() {
+        let env = Env::default();
+        let existing = Vec::from_array(&env, [1, 2, 3]);
+        let staking_id = env.register_contract(None, StakingContract);
+        env.as_contract(&staking_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::NextStakeSnapshotId, &u32::MAX);
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakeSnapshotIndex, &existing);
+        });
+
+        let result = env.as_contract(&staking_id, || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                StakingContract::record_stake_snapshot_index(&env)
+            }))
+        });
+
+        assert!(result.is_err());
+        let index: Vec<u32> = env.as_contract(&staking_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::StakeSnapshotIndex)
+                .unwrap()
+        });
+        assert_eq!(index, existing);
     }
 }

@@ -19,8 +19,7 @@ pub trait CreditScoreContractTrait {
 
 use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
-    key_interest_rate_bps, key_min_credit_score,
-    DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_CREDIT_SCORE,
+    key_interest_rate_bps, key_min_credit_score, DEFAULT_MIN_CREDIT_SCORE,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,6 +56,9 @@ pub enum DataKey {
     RateModelSlope2Bps,        // slope2 above kink in bps
     /// Minimum credit score required to borrow (defaults to MIN_CREDIT_SCORE).
     MinCreditScore,
+    RegulatoryReporting,
+    LiquidationAuction(Address),
+    BadDebt,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +201,7 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::RateModelSlope2Bps, &DEFAULT_SLOPE2_BPS);
         
         // Initialize regulatory reporting with placeholder
-        env.storage().instance().set(&DataKey::RegulatoryReporting, &Address::generate(&env));
+        env.storage().instance().set(&DataKey::RegulatoryReporting, &admin);
 
         init_protocol_params(&env, &rbac_contract);
         Ok(())
@@ -238,7 +240,7 @@ impl LendingPool {
             .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
         {
             use soroban_sdk::IntoVal;
-            let _ = env.try_invoke_contract::<(), _>(
+            let _ = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
                 &reporting_addr,
                 &Symbol::new(env, "record_large_tx"),
                 (
@@ -342,7 +344,7 @@ impl LendingPool {
         env.storage()
             .instance()
             .get(&DataKey::MinCreditScore)
-            .unwrap_or(MIN_CREDIT_SCORE)
+            .unwrap_or(DEFAULT_MIN_CREDIT_SCORE as u32)
     }
 
     /// Get current interest rate based on pool utilization
@@ -527,6 +529,7 @@ impl LendingPool {
 
         lender.require_auth();
 
+        let deposit_ledger_key = DataKey::LenderDepositLedger(lender.clone());
         let deposit_ledger: u32 = env
             .storage()
             .persistent()
@@ -627,7 +630,7 @@ impl LendingPool {
             .storage()
             .instance()
             .get(&DataKey::MinCreditScore)
-            .unwrap_or(MIN_CREDIT_SCORE);
+            .unwrap_or(DEFAULT_MIN_CREDIT_SCORE as u32);
         let credit_score = CreditScoreClient::new(&env, &credit_contract).get_score(&borrower);
         if credit_score < min_credit_score {
             return Err(Error::LowCreditScore);
@@ -671,6 +674,7 @@ impl LendingPool {
             .checked_div(10_000)
             .unwrap_or(i128::MAX);
 
+        let borrow_ledger_key = DataKey::BlockBorrowLedger(borrower.clone());
         let borrow_ledger: u32 = env
             .storage()
             .persistent()
@@ -1270,9 +1274,11 @@ mod test {
         let score_id = env.register_contract(None, MockCreditScore);
         let score = MockCreditScoreClient::new(&env, &score_id);
 
+        let rbac_id = Address::generate(&env);
+
         let pool_id = env.register_contract(None, LendingPool);
         let pool = LendingPoolClient::new(&env, &pool_id);
-        pool.initialize(&admin, &token_id, &score_id);
+        pool.initialize(&admin, &token_id, &score_id, &rbac_id);
 
         // Seed the pool with liquidity from a lender.
         let lender = Address::generate(&env);
