@@ -1,6 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use shared::pagination::Pagination;
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -30,6 +31,15 @@ pub struct GrantProgram {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Grant {
+    pub grant_id: u32,
+    pub recipient: Address,
+    pub program_id: u32,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
@@ -45,6 +55,12 @@ pub enum DataKey {
     EligibilityProof(Address, u32),
     /// Total program count
     ProgramCount,
+    /// Grant history: sequential index -> grant
+    GrantIndex(u32),
+    /// Grant history indexes for a recipient
+    RecipientGrants(Address),
+    /// Total grant count
+    GrantCount,
     /// Total committed to all grants
     TotalCommitted,
 }
@@ -232,6 +248,33 @@ impl Grants {
         // Store learner allocation
         env.storage().instance().set(&allocation_key, &amount);
 
+        let grant_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GrantCount)
+            .unwrap_or(0);
+        let grant = Grant {
+            grant_id: grant_count,
+            recipient: learner.clone(),
+            program_id,
+            amount,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::GrantIndex(grant_count), &grant);
+
+        let recipient_key = DataKey::RecipientGrants(learner.clone());
+        let mut recipient_grants: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        recipient_grants.push_back(grant_count);
+        env.storage().instance().set(&recipient_key, &recipient_grants);
+        env.storage()
+            .instance()
+            .set(&DataKey::GrantCount, &(grant_count + 1));
+
         env.events().publish(
             (symbol_short!("grant"), Symbol::new(&env, "grant_approved")),
             (learner.clone(), program_id, amount),
@@ -262,6 +305,58 @@ impl Grants {
             .instance()
             .get(&DataKey::ProgramCount)
             .unwrap_or(0)
+    }
+
+    /// Get total number of approved grants.
+    pub fn get_grant_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GrantCount)
+            .unwrap_or(0)
+    }
+
+    /// Get a bounded page of approved grants in creation order.
+    pub fn get_grants_page(env: Env, offset: u32, limit: u32) -> Vec<Grant> {
+        let count = Self::get_grant_count(env.clone());
+        let (start, end) = Pagination::new(offset, limit).bounds(count);
+        let mut result = Vec::new(&env);
+        for index in start..end {
+            if let Some(grant) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Grant>(&DataKey::GrantIndex(index))
+            {
+                result.push_back(grant);
+            }
+        }
+        result
+    }
+
+    /// Get a bounded page of grants approved for a recipient.
+    pub fn get_grants_by_recipient(
+        env: Env,
+        recipient: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Grant> {
+        let indexes: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecipientGrants(recipient))
+            .unwrap_or_else(|| Vec::new(&env));
+        let (start, end) = Pagination::new(offset, limit).bounds(indexes.len() as u32);
+        let mut result = Vec::new(&env);
+        for position in start..end {
+            let grant_id = indexes.get(position).unwrap();
+            if let Some(grant) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Grant>(&DataKey::GrantIndex(grant_id))
+            {
+                result.push_back(grant);
+            }
+        }
+        result
     }
 
     /// Get total committed to all grants in basis points (as percentage of treasury).
@@ -486,6 +581,20 @@ mod tests {
         // Verify program allocated increased
         let program = client.get_grant_program(&program_id);
         assert_eq!(program.allocated, 50);
+
+        assert_eq!(client.get_grant_count(), 1);
+
+        let grants = client.get_grants_page(&0, &10_000);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants.get(0).unwrap(), Grant {
+            grant_id: 0,
+            recipient: learner.clone(),
+            program_id,
+            amount: 50,
+        });
+
+        let recipient_grants = client.get_grants_by_recipient(&learner, &0, &10_000);
+        assert_eq!(recipient_grants, grants);
     }
 
     #[test]
