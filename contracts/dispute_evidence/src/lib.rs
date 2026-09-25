@@ -199,6 +199,19 @@ pub enum DataKey {
     /// Cached combined justice-protection intervention record for a given
     /// escrow.
     JusticeIntervention(u64),
+    /// Most recent rulings (oldest first) by a given arbitrator, capped at
+    /// `MAX_ARBITRATOR_HISTORY`, exposed for off-chain bias audits.
+    ArbitratorHistory(Address),
+}
+
+/// One entry in an arbitrator's public ruling history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorRuling {
+    pub escrow_id: u64,
+    /// `mentor` if funds were released to the mentor, `learner` otherwise.
+    pub outcome: Symbol,
+    pub timestamp: u64,
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -669,6 +682,7 @@ impl DisputeEvidenceContract {
                 .set(&DataKey::AppealPeriodEnds(escrow_id), &appeal_deadline);
         }
 
+        let resolution_timestamp = resolution.resolved_at;
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), escrow_id),
             resolution,
@@ -687,6 +701,27 @@ impl DisputeEvidenceContract {
             history.remove(0);
         }
         env.storage().persistent().set(&history_key, &history);
+
+        let rulings_key = DataKey::ArbitratorHistory(arbitrator.clone());
+        let mut rulings: Vec<ArbitratorRuling> = env
+            .storage()
+            .persistent()
+            .get(&rulings_key)
+            .unwrap_or(Vec::new(&env));
+        rulings.push_back(ArbitratorRuling {
+            escrow_id,
+            outcome: if release_to_mentor {
+                Symbol::new(&env, "mentor")
+            } else {
+                Symbol::new(&env, "learner")
+            },
+            timestamp: resolution_timestamp,
+        });
+        while rulings.len() > MAX_ARBITRATOR_HISTORY {
+            rulings.pop_front();
+        }
+        env.storage().persistent().set(&rulings_key, &rulings);
+
         Self::protect_arbitration_fairness(env.clone(), arbitrator.clone());
         Self::get_justice_status(env.clone(), escrow_id, arbitrator);
 
@@ -783,6 +818,23 @@ impl DisputeEvidenceContract {
             );
         }
         result
+    }
+
+    /// Public ruling history for `arbitrator`, oldest first. Bounded to the
+    /// most recent `MAX_ARBITRATOR_HISTORY` rulings, so no pagination is
+    /// needed. Returns an empty Vec for an arbitrator with no rulings.
+    pub fn get_arbitrator_history(env: Env, arbitrator: Address) -> Vec<ArbitratorRuling> {
+        let history: Vec<ArbitratorRuling> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorHistory(arbitrator))
+            .unwrap_or(Vec::new(&env));
+        let len = history.len();
+        if len > MAX_ARBITRATOR_HISTORY {
+            history.slice(len - MAX_ARBITRATOR_HISTORY..len)
+        } else {
+            history
+        }
     }
 
     /// Assess an arbitrator's recent ruling history for systematic bias
@@ -2162,5 +2214,61 @@ mod tests {
 
         let resolution = client.get_resolution(&1);
         assert!(resolution.release_to_mentor);
+    }
+
+    // ── #1105 arbitrator ruling history ─────────────────────────────────
+
+    #[test]
+    fn test_arbitrator_history_updated_on_resolution() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        assert_eq!(client.get_arbitrator_history(&arb).len(), 0);
+
+        env.ledger().set_timestamp(5_000);
+        client.submit_resolution(&1, &arb, &false, &true, &Symbol::new(&env, "ok"));
+        env.ledger().set_timestamp(6_000);
+        client.submit_resolution(&2, &arb, &false, &false, &Symbol::new(&env, "ok"));
+
+        let history = client.get_arbitrator_history(&arb);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history.get(0).unwrap(),
+            ArbitratorRuling {
+                escrow_id: 1,
+                outcome: Symbol::new(&env, "mentor"),
+                timestamp: 5_000,
+            }
+        );
+        assert_eq!(
+            history.get(1).unwrap(),
+            ArbitratorRuling {
+                escrow_id: 2,
+                outcome: Symbol::new(&env, "learner"),
+                timestamp: 6_000,
+            }
+        );
+
+        // History is tracked per arbitrator.
+        let other = Address::generate(&env);
+        assert_eq!(client.get_arbitrator_history(&other).len(), 0);
+    }
+
+    #[test]
+    fn test_arbitrator_history_capped_drops_oldest() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        let total = MAX_ARBITRATOR_HISTORY as u64 + 5;
+
+        for escrow_id in 1..=total {
+            client.submit_resolution(&escrow_id, &arb, &false, &true, &Symbol::new(&env, "ok"));
+        }
+
+        let history = client.get_arbitrator_history(&arb);
+        assert_eq!(history.len(), MAX_ARBITRATOR_HISTORY);
+        assert_eq!(history.get(0).unwrap().escrow_id, 6);
+        assert_eq!(
+            history.get(MAX_ARBITRATOR_HISTORY - 1).unwrap().escrow_id,
+            total
+        );
     }
 }

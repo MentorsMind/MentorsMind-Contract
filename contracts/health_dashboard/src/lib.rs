@@ -3,6 +3,7 @@
 use shared::health_reporter::{
     AlertSeverity, HealthMetric, HealthThresholds, MetricCategory, SystemHealth,
 };
+use shared::pagination::{OperationBudget, Pagination, MAX_PAGE_SIZE};
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Env, IntoVal, Map, Symbol, Vec,
 };
@@ -90,8 +91,9 @@ pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Config,
-    /// `(ledger_sequence, cached stats)` — invalidated when ledger advances.
-    Cache,
+    /// `(ledger_sequence, cached stats)` for a given `(offset, limit)` page
+    /// of escrows — invalidated when ledger advances.
+    Cache(u32, u32),
     /// Platform-wide dispute aggregate ([`DisputeStats`]).
     DisputeStats,
     /// Number of disputes ever opened against a given mentor, used by
@@ -202,24 +204,29 @@ impl HealthDashboardContract {
         );
     }
 
-    /// Returns platform-wide metrics, using a one-ledger cache to limit
-    /// cross-contract work within the same ledger.
-    pub fn get_platform_stats(env: Env) -> PlatformStats {
+    /// Returns platform metrics aggregated over one page of escrows
+    /// (`offset` is 0-based; `limit` is clamped to `MAX_PAGE_SIZE`), using a
+    /// one-ledger cache per page to limit cross-contract work within the
+    /// same ledger. Escrow-derived fields (TVL, active escrows, disputes,
+    /// mentors, learners, flagged learners) cover only that page; callers
+    /// page through `offset` to cover every escrow.
+    pub fn get_platform_stats(env: Env, offset: u32, limit: u32) -> PlatformStats {
         let ledger = env.ledger().sequence();
+        let cache_key = DataKey::Cache(offset, limit);
         if let Some((cached_ledger, stats)) = env
             .storage()
             .persistent()
-            .get::<_, (u32, PlatformStats)>(&DataKey::Cache)
+            .get::<_, (u32, PlatformStats)>(&cache_key)
         {
             if cached_ledger == ledger {
                 return stats;
             }
         }
 
-        let stats = Self::compute_platform_stats(&env);
+        let stats = Self::compute_platform_stats(&env, offset, limit);
         env.storage()
             .persistent()
-            .set(&DataKey::Cache, &(ledger, stats.clone()));
+            .set(&cache_key, &(ledger, stats.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "stats_refreshed"),),
@@ -353,7 +360,11 @@ impl HealthDashboardContract {
     /// Aggregate solvency view across treasury, insurance, staking, and
     /// lending pool. Emits a `SolvencyAlert` event if the protocol is
     /// detected as insolvent (is_solvent == false).
-    pub fn get_protocol_solvency(env: Env) -> SolvencyReport {
+    ///
+    /// `pending_allocations` sums one page of the treasury's pending
+    /// allocations (`offset` is 0-based; `limit` is clamped to
+    /// `MAX_PAGE_SIZE`); callers page through `offset` to cover them all.
+    pub fn get_protocol_solvency(env: Env, offset: u32, limit: u32) -> SolvencyReport {
         let cfg: Config = env
             .storage()
             .persistent()
@@ -378,7 +389,12 @@ impl HealthDashboardContract {
             )
             .unwrap_or(Ok(0))
             .unwrap_or(0);
-        for i in 0..pending_count {
+        let (start, end) = Pagination::new(offset, limit).bounds(pending_count);
+        let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+        for i in start..end {
+            if budget.consume().is_err() {
+                break;
+            }
             if let Ok(Ok(Some(pending))) = env
                 .try_invoke_contract::<Option<PendingAllocationView>, soroban_sdk::Error>(
                     &cfg.treasury,
@@ -576,7 +592,11 @@ impl HealthDashboardContract {
 
     /// Determine if the system is healthy based on configurable thresholds.
     /// Checks: error rate, TVL, critical alert count, and warning alert count.
-    pub fn is_system_healthy(env: Env) -> SystemHealth {
+    ///
+    /// Evaluates metric pages `[offset, offset + limit)` (see
+    /// `get_metric_page_count`), with `limit` clamped to `MAX_PAGE_SIZE` and
+    /// at most `MAX_PAGE_SIZE` metrics inspected per call.
+    pub fn is_system_healthy(env: Env, offset: u32, limit: u32) -> SystemHealth {
         let thresholds: HealthThresholds = env
             .storage()
             .persistent()
@@ -602,7 +622,9 @@ impl HealthDashboardContract {
         let mut error_count: u32 = 0;
         let mut active_sources: Map<Address, bool> = Map::new(&env);
 
-        for page_idx in 0..page_count {
+        let (start, end) = Pagination::new(offset, limit).bounds(page_count);
+        let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+        'pages: for page_idx in start..end {
             let metrics: Vec<HealthMetric> = env
                 .storage()
                 .persistent()
@@ -610,6 +632,9 @@ impl HealthDashboardContract {
                 .unwrap_or_else(|| Vec::new(&env));
 
             for metric in metrics.iter() {
+                if budget.consume().is_err() {
+                    break 'pages;
+                }
                 total_metrics += 1;
 
                 if metric.recorded_at > last_updated {
@@ -696,7 +721,7 @@ impl HealthDashboardContract {
 }
 
 impl HealthDashboardContract {
-    fn compute_platform_stats(env: &Env) -> PlatformStats {
+    fn compute_platform_stats(env: &Env, offset: u32, limit: u32) -> PlatformStats {
         let cfg: Config = env
             .storage()
             .persistent()
@@ -718,7 +743,15 @@ impl HealthDashboardContract {
         let mut mentor_vec: Vec<Address> = Vec::new(env);
         let mut learner_vec: Vec<Address> = Vec::new(env);
 
-        for id in 1u64..=escrow_count {
+        // Escrow ids are 1-based; page over them 0-based.
+        let total = u32::try_from(escrow_count).unwrap_or(u32::MAX);
+        let (start, end) = Pagination::new(offset, limit).bounds(total);
+        let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+        for idx in start..end {
+            if budget.consume().is_err() {
+                break;
+            }
+            let id = idx as u64 + 1;
             let e: Escrow = env.invoke_contract(
                 &cfg.escrow,
                 &Symbol::new(env, "get_escrow"),
@@ -1164,7 +1197,7 @@ mod test {
     fn test_stats_aggregation() {
         let (env, dashboard, _mnt) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let s = client.get_platform_stats();
+        let s = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
 
         assert_eq!(s.total_value_locked, 1000);
         assert_eq!(s.active_escrows, 1);
@@ -1190,8 +1223,8 @@ mod test {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
 
-        let s1 = client.get_platform_stats();
-        let s2 = client.get_platform_stats();
+        let s1 = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
+        let s2 = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
         assert_eq!(s1.total_sessions, s2.total_sessions);
         assert_eq!(s1.mnt_staked, s2.mnt_staked);
     }
@@ -1200,13 +1233,13 @@ mod test {
     fn test_cache_invalidates_next_ledger() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let _ = client.get_platform_stats();
+        let _ = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
 
         env.ledger().with_mut(|li| {
             li.sequence_number += 1;
         });
 
-        let _ = client.get_platform_stats();
+        let _ = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1217,7 +1250,7 @@ mod test {
     fn test_get_protocol_solvency_returns_all_fields() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         // All fields must be non-negative (overflow-protected)
         assert!(report.treasury_balance >= 0);
@@ -1271,7 +1304,7 @@ mod test {
         );
 
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         assert!(!report.is_solvent, "insolvent when treasury < pending");
         assert_eq!(report.treasury_balance, 500);
@@ -1314,7 +1347,7 @@ mod test {
         );
 
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
         assert!(!report.is_solvent);
 
         // Check that SolvencyAlert event was emitted
@@ -1329,7 +1362,7 @@ mod test {
     fn test_solvency_all_fields_non_negative_during_normal_ops() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         // Verify all numeric fields are >= 0 (overflow protection)
         assert!(report.treasury_balance >= 0);
@@ -1346,7 +1379,7 @@ mod test {
     fn test_solvency_exact_values_match_mocks() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         assert_eq!(report.treasury_balance, 100_000);
         assert_eq!(report.pending_allocations, 10_000);
@@ -1580,5 +1613,150 @@ mod test {
         client.record_appeal(&1);
         client.record_appeal(&2);
         assert_eq!(client.get_dispute_stats().total_appealed, 2);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Pagination (#1103)
+    // ═════════════════════════════════════════════════════════════════════
+
+    const MANY_ESCROWS: u64 = MAX_PAGE_SIZE as u64 + 5;
+
+    /// Escrow mock with more escrows than fit in one page. Every escrow is
+    /// Active with amount 10 and a distinct mentor/learner.
+    #[contract]
+    pub struct MockEscrowMany;
+
+    #[contractimpl]
+    impl MockEscrowMany {
+        pub fn get_escrow_count(_env: Env) -> u64 {
+            MANY_ESCROWS
+        }
+
+        pub fn get_escrow(env: Env, id: u64) -> Escrow {
+            let t = Address::generate(&env);
+            Escrow {
+                id,
+                mentor: Address::generate(&env),
+                learner: Address::generate(&env),
+                amount: 10,
+                session_id: symbol_short!("s"),
+                status: EscrowStatus::Active,
+                created_at: 0,
+                token_address: t.clone(),
+                platform_fee: 0,
+                net_amount: 0,
+                session_end_time: 0,
+                auto_release_delay: 0,
+                dispute_reason: symbol_short!("none"),
+                resolved_at: 0,
+                usd_amount: 0,
+                quoted_token_amount: 0,
+                send_asset: t.clone(),
+                dest_asset: t,
+                total_sessions: 1,
+                sessions_completed: 0,
+            }
+        }
+    }
+
+    /// Treasury mock with more pending allocations than fit in one page,
+    /// each worth 1.
+    #[contract]
+    pub struct MockTreasuryMany;
+
+    #[contractimpl]
+    impl MockTreasuryMany {
+        pub fn get_balance(_env: Env, _token: Address) -> i128 {
+            1_000_000
+        }
+        pub fn pending_allocation_count(_env: Env) -> u32 {
+            MAX_PAGE_SIZE + 5
+        }
+        pub fn get_pending_allocation(env: Env, id: u32) -> Option<PendingAllocationView> {
+            Some(PendingAllocationView {
+                id,
+                token: Address::generate(&env),
+                recipient: Address::generate(&env),
+                amount: 1,
+                approvals_count: 1,
+                executed: false,
+                created_at: 0,
+            })
+        }
+    }
+
+    fn setup_many() -> (Env, HealthDashboardContractClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+
+        let mnt = env.register_contract(None, MockMntToken);
+        let dashboard = env.register_contract(None, HealthDashboardContract);
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        client.initialize(
+            &Address::generate(&env),
+            &env.register_contract(None, MockEscrowMany),
+            &env.register_contract(None, MockSessionRegistry),
+            &env.register_contract(None, MockStakingForSolvency),
+            &mnt,
+            &env.register_contract(None, MockReputation),
+            &env.register_contract(None, MockInterfaceRegistry),
+            &env.register_contract(None, MockTreasuryMany),
+            &env.register_contract(None, MockInsurance),
+            &env.register_contract(None, MockLendingPool),
+            &env.register_contract(None, MockMntToken),
+        );
+        (env, client)
+    }
+
+    #[test]
+    fn test_platform_stats_limit_clamped_to_max_page_size() {
+        let (_env, client) = setup_many();
+        let s = client.get_platform_stats(&0, &u32::MAX);
+        assert_eq!(s.active_escrows, MAX_PAGE_SIZE);
+        assert_eq!(s.total_value_locked, 10 * MAX_PAGE_SIZE as i128);
+        assert_eq!(s.total_mentors, MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_platform_stats_pages_cover_all_escrows() {
+        let (_env, client) = setup_many();
+        let first = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
+        let second = client.get_platform_stats(&MAX_PAGE_SIZE, &MAX_PAGE_SIZE);
+        assert_eq!(first.active_escrows, MAX_PAGE_SIZE);
+        assert_eq!(second.active_escrows, 5);
+        assert_eq!(
+            (first.active_escrows + second.active_escrows) as u64,
+            MANY_ESCROWS
+        );
+
+        let partial = client.get_platform_stats(&3, &4);
+        assert_eq!(partial.active_escrows, 4);
+
+        let past_end = client.get_platform_stats(&(MANY_ESCROWS as u32), &10);
+        assert_eq!(past_end.active_escrows, 0);
+        assert_eq!(past_end.total_value_locked, 0);
+    }
+
+    #[test]
+    fn test_platform_stats_cache_is_per_page() {
+        let (_env, client) = setup_many();
+        let a = client.get_platform_stats(&0, &2);
+        let b = client.get_platform_stats(&0, &3);
+        assert_eq!(a.active_escrows, 2);
+        assert_eq!(b.active_escrows, 3);
+    }
+
+    #[test]
+    fn test_solvency_pending_allocations_paginated() {
+        let (_env, client) = setup_many();
+        let first = client.get_protocol_solvency(&0, &u32::MAX);
+        assert_eq!(first.pending_allocations, MAX_PAGE_SIZE as i128);
+
+        let second = client.get_protocol_solvency(&MAX_PAGE_SIZE, &MAX_PAGE_SIZE);
+        assert_eq!(second.pending_allocations, 5);
+
+        let past_end = client.get_protocol_solvency(&(MAX_PAGE_SIZE + 5), &10);
+        assert_eq!(past_end.pending_allocations, 0);
     }
 }

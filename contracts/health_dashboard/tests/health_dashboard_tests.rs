@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use shared::health_reporter::{AlertSeverity, HealthMetric, HealthThresholds, MetricCategory};
+use shared::pagination::MAX_PAGE_SIZE;
 use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
 
 extern crate mentorminds_health_dashboard;
@@ -133,7 +134,7 @@ fn test_is_system_healthy_empty() {
     let (env, contract_address, _admin) = setup();
 
     env.as_contract(&contract_address, || {
-        let health = HealthDashboardContract::is_system_healthy(env.clone());
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, MAX_PAGE_SIZE);
         assert!(health.is_healthy);
         assert_eq!(health.total_metrics, 0);
         assert_eq!(health.warning_count, 0);
@@ -157,7 +158,7 @@ fn test_is_system_healthy_with_metrics() {
         let m2 = make_metric(&env, "warning_metric", MetricCategory::Availability, 0, AlertSeverity::Warning);
         HealthDashboardContract::record_metric(env.clone(), m2);
 
-        let health = HealthDashboardContract::is_system_healthy(env.clone());
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, MAX_PAGE_SIZE);
         assert!(health.is_healthy);
         assert_eq!(health.total_metrics, 2);
         assert_eq!(health.warning_count, 1);
@@ -196,7 +197,7 @@ fn test_is_system_healthy_unhealthy_on_critical() {
             HealthDashboardContract::record_metric(env.clone(), m);
         }
 
-        let health = HealthDashboardContract::is_system_healthy(env.clone());
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, MAX_PAGE_SIZE);
         assert!(!health.is_healthy);
         assert_eq!(health.critical_count, 2);
     });
@@ -238,7 +239,7 @@ fn test_metric_alert_counts() {
         let m3 = make_metric(&env, "crit", MetricCategory::Availability, 10, AlertSeverity::Critical);
         HealthDashboardContract::record_metric(env.clone(), m3);
 
-        let health = HealthDashboardContract::is_system_healthy(env.clone());
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, MAX_PAGE_SIZE);
         assert_eq!(health.total_metrics, 3);
         assert_eq!(health.warning_count, 1);
         assert_eq!(health.critical_count, 1);
@@ -267,7 +268,41 @@ fn test_error_rate_calculation() {
             HealthDashboardContract::record_metric(env.clone(), m);
         }
 
-        let health = HealthDashboardContract::is_system_healthy(env.clone());
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, MAX_PAGE_SIZE);
         assert_eq!(health.error_rate_bps, 5000);
+    });
+}
+
+#[test]
+fn test_is_system_healthy_paginates_metric_pages() {
+    let (env, contract_address, _admin) = setup();
+
+    env.as_contract(&contract_address, || {
+        for i in 0..3 {
+            let m = make_metric(
+                &env,
+                &format!("metric_{}", i),
+                MetricCategory::Liquidity,
+                100,
+                AlertSeverity::Info,
+            );
+            HealthDashboardContract::record_metric(env.clone(), m);
+        }
+        let page_count = HealthDashboardContract::get_metric_page_count(env.clone());
+        assert_eq!(page_count, 1);
+
+        // Page 0 holds all three metrics.
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, 1);
+        assert_eq!(health.total_metrics, 3);
+        assert_eq!(health.total_tvl, 300);
+
+        // An oversized limit is clamped and still only covers existing pages.
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 0, u32::MAX);
+        assert_eq!(health.total_metrics, 3);
+
+        // Offsets past the last page evaluate nothing.
+        let health = HealthDashboardContract::is_system_healthy(env.clone(), 1, MAX_PAGE_SIZE);
+        assert_eq!(health.total_metrics, 0);
+        assert!(health.is_healthy);
     });
 }
