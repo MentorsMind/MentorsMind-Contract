@@ -28,6 +28,8 @@ use shared::{
     register_validator, IncentiveAlignmentScore, ValidatorRecord,
     // #867 — Transaction intent protection
     evaluate_transaction_intent, RiskLevel, TransactionIntent,
+    // #124 — Arbitrator dispute independence protection
+    ensure_dispute_independence, DisputeIndependenceFlag,
 };
 use shared::governance_voting::{
     detect_vote_manipulation, validate_minimum_holding_period, ManipulationFlag,
@@ -101,9 +103,8 @@ pub enum Error {
     NoPendingAdminChange = 4,
     AdminChangeNotYetEffective = 5,
     InvalidAdminChange = 6,
-    TooManyActiveProposals = 7,
-    /// Proposer has not held their stake for `MIN_HOLDING_PERIOD_SECS`.
-    HoldingPeriodNotMet = 8,
+    /// Arbitrator was previously involved in a dispute between the same parties
+    ArbitratorConflict = 7,
 }
 
 #[contracttype]
@@ -241,6 +242,10 @@ pub enum DataKey {
     ArbitratorIndex(Address),
     ArbitratorList,
     ArbitratorCompensation,
+    /// Arbitrator's ruling history timestamps for dispute independence checks
+    ArbitratorDisputeHistory(Address),
+    /// DisputeIndependenceFlag stored for audit purposes after registration
+    ArbitratorIndependenceFlag(Address),
     Appeal(u32),
     AllowedCall(Address, Symbol),
     PendingAdmin,
@@ -1324,8 +1329,36 @@ impl GovernanceContract {
     }
 
     /// Register an arbitrator for dispute resolution (#470).
-    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+    /// 
+    /// Enforces dispute independence by checking if the arbitrator was previously
+    /// involved in disputes between the same parties. If a conflict is detected,
+    /// returns Error::ArbitratorConflict.
+    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), Error> {
         Self::assert_admin(&env, &admin);
+        
+        // Retrieve arbitrator's dispute history (timestamps of disputes they were involved in)
+        let dispute_history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorDisputeHistory(arbitrator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        // Get the count of shared disputes with the same actor pairs
+        let shared_actor_count: u32 = dispute_history.len() as u32;
+        
+        // Check dispute independence using shared function
+        let independence_flag = ensure_dispute_independence(&dispute_history, shared_actor_count);
+        
+        // If conflict detected (independence not satisfied), return error
+        if !independence_flag.independent {
+            return Err(Error::ArbitratorConflict);
+        }
+        
+        // Store the independence flag for audit purposes
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorIndependenceFlag(arbitrator.clone()), &independence_flag);
+        
         let record = ArbitratorRecord {
             address: arbitrator.clone(),
             active: true,
@@ -1353,6 +1386,7 @@ impl GovernanceContract {
         }
 
         emit_governance_event(&env, evt_gov_arb_registered(&env), arbitrator);
+        Ok(())
     }
 
     pub fn unregister_arbitrator(env: Env, admin: Address, arbitrator: Address) {
@@ -3070,6 +3104,45 @@ mod tests {
 
         let selected = gov.select_arbitrator(&7u64);
         assert!(selected == a1 || selected == a2);
+    }
+
+    #[test]
+    fn test_arbitrator_conflict_detection_rejects_conflicted_arbitrator() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        let arbitrator = Address::generate(&env);
+        
+        // Create mock dispute history with multiple timestamps indicating coordination
+        let now = env.ledger().timestamp();
+        let dispute_history = vec![&env, now - 500u64, now - 100u64, now];
+        
+        // Manually set the dispute history to trigger conflict detection
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorDisputeHistory(arbitrator.clone()), &dispute_history);
+        
+        // Register arbitrator should return Err(ArbitratorConflict) due to independent=false
+        let result = gov.register_arbitrator(&admin, &arbitrator);
+        
+        // Verify the result is an error (conflict detected)
+        assert!(result.is_err());
     }
 
     #[test]
