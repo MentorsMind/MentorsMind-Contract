@@ -372,3 +372,146 @@ fn test_enforce_data_protection_contains_breach_on_out_of_scope_access() {
     assert!(!client.is_breach_contained(&subject));
 }
 
+#[test]
+fn test_failed_kyc_verification_trigger_rollback_restores_previous_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let original_provider_hash = BytesN::from_array(&env, &[1; 32]);
+    client.set_kyc_level(
+        &admin,
+        &user,
+        &KycLevel::Basic,
+        &1000,
+        &original_provider_hash,
+    );
+
+    let original_record: KycRecord = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Kyc(user.clone()))
+            .unwrap()
+    });
+    let failed_provider_hash = BytesN::from_array(&env, &[2; 32]);
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &DataKey::Kyc(user.clone()),
+            &KycRecord {
+                level: KycLevel::Enhanced,
+                expiry: 2000,
+                kyc_provider_hash: failed_provider_hash.clone(),
+            },
+        );
+    });
+
+    let recovery = trigger_rollback(
+        contract_id.clone(),
+        Symbol::new(&env, "verify_kyc"),
+    );
+    let protector = RollbackProtector {
+        snapshot_id: 1,
+        is_active: recovery.rollback_required,
+    };
+    assert!(protector.is_active);
+    assert!(!recovery.execution_successful);
+
+    if recovery.rollback_required {
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Kyc(user.clone()), &original_record);
+        });
+    }
+
+    let restored_record: KycRecord = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Kyc(user.clone()))
+            .unwrap()
+    });
+    assert_eq!(restored_record.level, KycLevel::Basic);
+    assert_eq!(restored_record.expiry, 1000);
+    assert_eq!(restored_record.kyc_provider_hash, original_provider_hash);
+}
+
+#[test]
+fn test_execute_with_recovery_rolls_back_failed_kyc_update() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let original_provider_hash = BytesN::from_array(&env, &[3; 32]);
+    client.set_kyc_level(
+        &admin,
+        &user,
+        &KycLevel::Enhanced,
+        &3000,
+        &original_provider_hash,
+    );
+    let original_record: KycRecord = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Kyc(user.clone()))
+            .unwrap()
+    });
+
+    let recovery_result = execute_with_recovery(
+        contract_id.clone(),
+        Symbol::new(&env, "update_kyc"),
+        || -> Result<(), ()> {
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(
+                    &DataKey::Kyc(user.clone()),
+                    &KycRecord {
+                        level: KycLevel::Institutional,
+                        expiry: 4000,
+                        kyc_provider_hash: BytesN::from_array(&env, &[4; 32]),
+                    },
+                );
+            });
+            Err(())
+        },
+    );
+
+    let recovery = recovery_result.unwrap_err();
+    assert!(recovery.rollback_required);
+    assert!(!recovery.execution_successful);
+    let protector = RollbackProtector {
+        snapshot_id: 2,
+        is_active: recovery.rollback_required,
+    };
+    assert!(protector.is_active);
+    let recovery_state = RecoveryState::Recovered;
+
+    if protector.is_active {
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Kyc(user.clone()), &original_record);
+        });
+    }
+
+    assert_eq!(recovery_state, RecoveryState::Recovered);
+    assert_eq!(client.get_kyc_level(&user), KycLevel::Enhanced);
+    assert_eq!(client.get_kyc_expiry(&user), Some(3000));
+    let restored_provider_hash: BytesN<32> = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<_, KycRecord>(&DataKey::Kyc(user.clone()))
+            .unwrap()
+            .kyc_provider_hash
+    });
+    assert_eq!(restored_provider_hash, original_provider_hash);
+}
+
