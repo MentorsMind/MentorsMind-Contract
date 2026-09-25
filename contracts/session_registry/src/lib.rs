@@ -1,5 +1,8 @@
 #![no_std]
 
+use shared::privacy::{
+    contain_data_breach, detect_cross_session_leak, record_session_owner, CrossSessionLeakResult,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -97,6 +100,10 @@ impl SessionRegistry {
             .persistent()
             .extend_ttl(&session_key, TTL_THRESHOLD, TTL_BUMP);
 
+        // Records who this learner's data belongs to, so a later read by a
+        // different mentor can be told apart from a legitimate one.
+        record_session_owner(&env, &learner, &mentor);
+
         // Index by mentor
         let mentor_key = DataKey::MentorSessions(mentor.clone());
         let mut mentor_sessions: Vec<Symbol> = env
@@ -193,6 +200,69 @@ impl SessionRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Get a session record on behalf of `accessor`, flagging cross-mentor
+    /// privacy leaks.
+    ///
+    /// A mentor reading a session they do not own is the pattern behind
+    /// cross-session privacy leakage: one mentor inspecting a learner's data
+    /// from a different mentor's session. The read is still served — mentors
+    /// legitimately review learner history and blocking them would be a
+    /// regression — but the access is logged and a `CrossSessionLeakAlert` is
+    /// emitted so governance can act on the pattern.
+    pub fn get_session_as(env: Env, accessor: Address, session_id: Symbol) -> SessionRecord {
+        let record: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Session(session_id))
+            .expect("Session not found");
+
+        let result = detect_cross_session_leak(&env, &accessor, &record.learner);
+        Self::report_leak(&env, &record.learner, &result);
+
+        record
+    }
+
+    /// Get all session IDs for a learner, flagging cross-mentor privacy leaks.
+    ///
+    /// Same advisory semantics as `get_session_as`: listing a learner's
+    /// sessions from a mentor who does not own them is logged and alerted on,
+    /// but not blocked.
+    pub fn get_sessions_by_learner_as(
+        env: Env,
+        accessor: Address,
+        learner: Address,
+    ) -> Vec<Symbol> {
+        let result = detect_cross_session_leak(&env, &accessor, &learner);
+        Self::report_leak(&env, &learner, &result);
+
+        Self::get_sessions_by_learner(env, learner)
+    }
+
+    /// Distinct mentors that have read `learner`'s session data without owning
+    /// it. Lets governance scope a breach before notifying the learner.
+    pub fn get_breach_report(env: Env, learner: Address) -> Vec<Address> {
+        contain_data_breach(&env, &learner)
+    }
+
+    fn report_leak(env: &Env, learner: &Address, result: &CrossSessionLeakResult) {
+        let (owner, accessor, prior) = match result {
+            CrossSessionLeakResult::Leak(owner, accessor, prior) => (owner, accessor, *prior),
+            CrossSessionLeakResult::NoLeak => return,
+        };
+
+        // Topic 0 marks the event as privacy telemetry, topic 1 is the alert
+        // name and topic 2 identifies the offending mentor, so indexers can
+        // filter alerts without decoding the data payload.
+        env.events().publish(
+            (
+                symbol_short!("privacy"),
+                Symbol::new(env, "cross_session_leak_alert"),
+                accessor.clone(),
+            ),
+            (owner, learner.clone(), prior),
+        );
+    }
+
     fn require_backend(env: &Env) -> Address {
         env.storage()
             .instance()
@@ -205,7 +275,8 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{Env, TryFromVal};
 
     fn setup() -> (Env, SessionRegistryClient<'static>, Address) {
         let env = Env::default();
@@ -328,5 +399,157 @@ mod tests {
 
         client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
         client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
+    }
+
+    // ── Cross-session privacy leak detection (#1115) ─────────────────────────
+
+    /// Registers one session owned by `mentor_a` about `learner`.
+    fn seed_session(env: &Env, client: &SessionRegistryClient, mentor_a: &Address, learner: &Address) -> Symbol {
+        let session_id = Symbol::new(env, "sess_owned");
+        client.register_session(
+            &session_id,
+            mentor_a,
+            learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &dummy_token(env),
+        );
+        session_id
+    }
+
+    /// Number of `cross_session_leak_alert` events emitted so far.
+    ///
+    /// Compared before and after the read under test, because `all()` replays
+    /// the whole event log and registration emits events of its own.
+    fn leak_alert_count(env: &Env) -> u32 {
+        let alert = Symbol::new(env, "cross_session_leak_alert");
+
+        env.events()
+            .all()
+            .iter()
+            .filter(|(_, topics, _)| {
+                topics
+                    .iter()
+                    .any(|topic| Symbol::try_from_val(env, &topic).ok().as_ref() == Some(&alert))
+            })
+            .count() as u32
+    }
+
+    #[test]
+    fn test_owning_mentor_read_raises_no_alert() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let session_id = seed_session(&env, &client, &mentor, &learner);
+
+        let before = leak_alert_count(&env);
+
+        let record = client.get_session_as(&mentor, &session_id);
+        assert_eq!(record.learner, learner);
+        assert_eq!(leak_alert_count(&env), before);
+        assert_eq!(client.get_breach_report(&learner).len(), 0);
+    }
+
+    #[test]
+    fn test_learner_self_read_raises_no_alert() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let session_id = seed_session(&env, &client, &mentor, &learner);
+
+        let before = leak_alert_count(&env);
+
+        let record = client.get_session_as(&learner, &session_id);
+        assert_eq!(record.learner, learner);
+        assert_eq!(leak_alert_count(&env), before);
+    }
+
+    #[test]
+    fn test_foreign_mentor_read_fires_alert_but_is_not_blocked() {
+        let (env, client, _backend) = setup();
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let session_id = seed_session(&env, &client, &mentor_a, &learner);
+
+        let before = leak_alert_count(&env);
+
+        // Mentor B reads mentor A's session about the learner.
+        let record = client.get_session_as(&mentor_b, &session_id);
+
+        // Advisory only: the read still returns the full record.
+        assert_eq!(record.mentor, mentor_a);
+        assert_eq!(record.learner, learner);
+        assert_eq!(record.duration_mins, 60);
+
+        assert_eq!(leak_alert_count(&env), before + 1);
+    }
+
+    #[test]
+    fn test_leak_alert_names_the_offending_mentor() {
+        let (env, client, _backend) = setup();
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let session_id = seed_session(&env, &client, &mentor_a, &learner);
+
+        client.get_session_as(&mentor_b, &session_id);
+
+        let offenders = client.get_breach_report(&learner);
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders.get(0).unwrap(), mentor_b);
+    }
+
+    #[test]
+    fn test_repeat_foreign_reads_each_raise_an_alert() {
+        let (env, client, _backend) = setup();
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let session_id = seed_session(&env, &client, &mentor_a, &learner);
+
+        let before = leak_alert_count(&env);
+
+        client.get_session_as(&mentor_b, &session_id);
+        client.get_session_as(&mentor_b, &session_id);
+        client.get_session_as(&mentor_b, &session_id);
+
+        assert_eq!(leak_alert_count(&env), before + 3);
+
+        // Still one distinct offender, so governance reports stay actionable.
+        assert_eq!(client.get_breach_report(&learner).len(), 1);
+    }
+
+    #[test]
+    fn test_listing_another_mentors_learner_fires_alert() {
+        let (env, client, _backend) = setup();
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let learner = Address::generate(&env);
+        seed_session(&env, &client, &mentor_a, &learner);
+
+        let before = leak_alert_count(&env);
+
+        let sessions = client.get_sessions_by_learner_as(&mentor_b, &learner);
+
+        // Not blocked: the listing is still returned.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(leak_alert_count(&env), before + 1);
+    }
+
+    #[test]
+    fn test_breach_report_is_scoped_to_the_learner() {
+        let (env, client, _backend) = setup();
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let other_learner = Address::generate(&env);
+
+        let sid = seed_session(&env, &client, &mentor_a, &learner);
+        client.get_session_as(&mentor_b, &sid);
+
+        assert_eq!(client.get_breach_report(&learner).len(), 1);
+        assert_eq!(client.get_breach_report(&other_learner).len(), 0);
     }
 }
