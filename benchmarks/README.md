@@ -1,142 +1,320 @@
 # MentorsMind Soroban Benchmarks
 
-Measures CPU instruction count, memory usage, and WASM binary size for critical
-contract entry points. CI fails on any metric regressing more than **10%** from
-the recorded baseline.
+This directory contains the performance benchmark harness for all MentorsMind smart contracts. It measures CPU instruction count, memory usage, and WASM binary size for each contract entry point using the Soroban SDK testutils budget API, then compares results against a committed baseline to catch regressions automatically in CI.
 
-## Running locally
+---
 
-```bash
-# From workspace root
+## Table of Contents
 
-# 1. Build WASM binaries (populates wasm_bytes in the report)
-cargo build \
-  --target wasm32v1-none \
-  --release \
-  -p mentorminds-escrow \
-  -p mentorminds-staking \
-  -p mentorminds-governance \
-  -p mentorminds-timelock \
-  -p mentorminds-upgrade-registry \
-  -p mentorminds-dispute-evidence
+1. [Running the Benchmarks](#1-running-the-benchmarks)
+2. [Understanding the Output](#2-understanding-the-output)
+3. [Metrics Captured](#3-metrics-captured)
+4. [The 10% Regression Gate](#4-the-10-regression-gate)
+5. [Updating Baselines](#5-updating-baselines)
+6. [The history/ Directory and Trend Charts](#6-the-history-directory-and-trend-charts)
+7. [Adding a New Suite](#7-adding-a-new-suite)
+8. [CI Integration](#8-ci-integration)
 
-# 2. Run benchmarks (compare against baselines.json, exit 1 on regression)
+---
+
+## 1. Running the Benchmarks
+
+Run from the **workspace root** (not from inside `benchmarks/`):
+
+```sh
 cargo run -p mentorminds-benchmarks
 ```
 
-Reports are written to `benchmarks/results/`:
-- `report.json` — machine-readable per-function metrics
-- `report.html` — human-readable table with interactive trend charts
-- `bench.log` — captured in CI as an artifact
+The binary must be run from the workspace root so that relative paths to `benchmarks/baselines.json`, `benchmarks/history/`, and `benchmarks/results/` resolve correctly.
 
-Historical snapshots are stored in `benchmarks/history/` as
-`YYYY-MM-DD_<short-sha>.json` and committed to the repo after each main-branch
-run. The HTML report renders up to 30 of these as sparkline trend charts.
+### Optional: include WASM sizes
 
-## Updating the baseline
+WASM sizes are read from `target/wasm32v1-none/release/<crate_name>.wasm`. To populate them, build the contracts for the WASM target first:
 
-The baseline should only be updated intentionally, not on every PR.
-
-**Option A — CI (recommended):** Trigger the `Soroban Benchmarks` workflow
-manually from the Actions tab with `update_baseline = true`. It runs the
-benchmarks, copies `results/report.json` → `baselines.json`, and commits.
-
-**Option B — local:**
-```bash
+```sh
+cargo build --target wasm32v1-none --release
 cargo run -p mentorminds-benchmarks
-cp benchmarks/results/report.json benchmarks/baselines.json
-git commit benchmarks/baselines.json -m "chore(bench): update baselines"
 ```
 
-## How it works
+Without a prior WASM build the `wasm_bytes` column will show `0` / `N/A` and the WASM regression gate is skipped for that entry.
 
-The harness uses `soroban-sdk` testutils `Env::budget()` to capture host-level
-metrics:
+---
+
+## 2. Understanding the Output
+
+The run sequence is:
+
+1. All suites execute and collect `BenchResult` records.
+2. **`benchmarks/results/report.json`** — full machine-readable results for this run.
+3. **`benchmarks/results/report.html`** — human-readable per-function table with trend charts (open in a browser).
+4. **`benchmarks/results/gas_accuracy.json`** — gas estimation accuracy report.
+5. **`benchmarks/history/<date>_<sha>.json`** — this run is appended to the history directory.
+6. Regression check runs against `benchmarks/baselines.json`. The process exits with code `1` if any metric regressed; `0` otherwise.
+
+Console output looks like this on a clean run:
+
+```
+── escrow ──
+  create_escrow                  cpu=       890,000  mem=    15,680
+  release_funds                  cpu=       650,000  mem=    12,240
+  ...
+
+✅  All metrics within 10% of baseline.
+📚  History record written to benchmarks/history/2026-09-25_a1b2c3d4.json
+```
+
+On a regression:
+
+```
+❌  REGRESSIONS DETECTED (1 total):
+  [escrow] create_escrow — cpu_instructions exceeded baseline by 15.3% (baseline=890000, measured=1026270)
+```
+
+---
+
+## 3. Metrics Captured
+
+Each `BenchResult` record carries the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `cpu_instructions` | `u64` | Soroban host CPU instruction count consumed by the call, measured via `env.budget().cpu_instruction_cost()`. |
+| `mem_bytes` | `u64` | Memory bytes consumed by the call, measured via `env.budget().memory_bytes()`. |
+| `storage_reads` | `u32` | Storage read operations (currently `0`; placeholder for a future Soroban SDK version that exposes per-call storage metrics). |
+| `storage_writes` | `u32` | Storage write operations (same placeholder caveat). |
+| `wasm_bytes` | `u64` | Compiled WASM binary size in bytes, read from `target/wasm32v1-none/release/<crate>.wasm`. `0` when the WASM target has not been built. |
+
+**How measurement works:** before each call the harness resets the host budget with `env.budget().reset_default()`, runs the closure under test, then snapshots the counters. This isolates the measured function from setup costs.
+
+**Gas accuracy:** the `gas_estimation` suite also compares estimated CPU against actual CPU for each operation. Estimates within 20% of actual pass; failures are reported separately in `gas_accuracy.json` and printed to stderr.
+
+---
+
+## 4. The 10% Regression Gate
+
+After all suites run, `harness::check_regressions` loads `benchmarks/baselines.json` and checks every metric in the table above against the stored baseline. A regression is triggered when:
+
+```
+(measured - baseline) / baseline > 0.10
+```
+
+i.e., the measured value is **more than 10% higher** than the baseline. Improvements (lower values) never trigger a failure.
+
+**Special cases:**
+
+- If a metric's baseline value is `0`, that metric is skipped — it was not available when the baseline was recorded.
+- **WASM size** additionally has a hard alert at **64 KB**: any WASM binary exceeding this limit prints a warning regardless of the percentage change.
+- New entry points (present in results but missing from `baselines.json`) are logged as informational and do not fail the run. They will be included the next time you update the baseline.
+
+---
+
+## 5. Updating Baselines
+
+**When to update:** after an intentional change that raises resource usage (e.g., a new feature that adds storage writes), or after an optimization that lowers it.
+
+**How to update:**
+
+1. Run the benchmarks and confirm the new numbers look correct:
+   ```sh
+   cargo run -p mentorminds-benchmarks
+   ```
+2. Copy `benchmarks/results/report.json` over `benchmarks/baselines.json`:
+   ```sh
+   # PowerShell
+   Copy-Item benchmarks\results\report.json benchmarks\baselines.json
+
+   # bash / macOS / Linux
+   cp benchmarks/results/report.json benchmarks/baselines.json
+   ```
+3. Commit `baselines.json` together with the code change that caused the measurement shift. This keeps the baseline and the code in sync in the same commit.
+
+**First-time setup:** if `benchmarks/baselines.json` does not exist when you run the harness, it is created automatically from the current results and the process exits `0`. Commit the generated file before pushing so CI has a baseline to check against.
+
+---
+
+## 6. The `history/` Directory and Trend Charts
+
+Every benchmark run writes a snapshot to `benchmarks/history/` with the filename pattern:
+
+```
+YYYY-MM-DD_<short-git-sha>.json
+```
+
+For example: `2026-09-25_a1b2c3d.json`
+
+The date comes from the `BENCH_DATE` environment variable (set by CI). The SHA comes from `GITHUB_SHA`. When running locally these fall back to `unknown-date` and `local` respectively, producing a file like `unknown-date_local.json`.
+
+**File format:**
+
+```json
+{
+  "date": "2026-09-25",
+  "sha": "a1b2c3d4e5f6...",
+  "ref_name": "main",
+  "results": [ /* array of BenchResult objects, same schema as baselines.json */ ]
+}
+```
+
+**Why it's committed:** history files are committed to the repository so trends persist across CI runs without relying on artifact retention windows.
+
+**Trend charts:** `benchmarks/results/report.html` renders a Chart.js line graph for each `(contract, entry_point)` pair showing CPU instruction counts over the last 30 runs, sorted chronologically by filename. Charts only appear after **at least 2 history records** exist.
+
+**Reading the charts:**
+
+- A flat line is good — stable performance.
+- A sudden upward spike indicates a regression was introduced around that commit.
+- A downward step indicates an optimization landed.
+- The X-axis labels show `YYYY-MM-DD (short-sha)` so you can correlate a data point directly to a commit.
+
+---
+
+## 7. Adding a New Suite
+
+Follow the `escrow.rs` pattern in `benchmarks/src/suites/`.
+
+### Step 1 — Create the suite file
+
+Create `benchmarks/src/suites/<contract_name>.rs`. The minimal structure is:
 
 ```rust
-env.budget().reset_default();      // zero the counters
-contract_client.some_fn(...);      // the measured call
-let cpu = env.budget().cpu_instruction_count();
-let mem = env.budget().memory_bytes_count();
+extern crate std;
+
+use crate::harness::{measure, wasm_size, BenchResult};
+use mentorminds_<contract_name>::{MyContract, MyContractClient};
+use soroban_sdk::{testutils::Address as _, Address, Env};
+
+const CONTRACT: &str = "<contract_name>";       // used in BenchResult.contract
+const WASM_CRATE: &str = "mentorminds_<contract_name>"; // maps to WASM filename
+
+// ---------------------------------------------------------------------------
+// Fixture — set up a clean environment for each measured call
+// ---------------------------------------------------------------------------
+
+struct Fixture {
+    env: Env,
+    contract_id: Address,
+    // add any addresses / tokens your contract needs
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(MyContract, ());
+        let admin = Address::generate(&env);
+
+        // initialize the contract, mint tokens, etc.
+        MyContractClient::new(&env, &contract_id).initialize(&admin);
+
+        Fixture { env, contract_id }
+    }
+
+    fn client(&self) -> MyContractClient<'_> {
+        MyContractClient::new(&self.env, &self.contract_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite entry point
+// ---------------------------------------------------------------------------
+
+pub fn run() -> Vec<BenchResult> {
+    let wasm = wasm_size(WASM_CRATE);
+    let mut results: Vec<BenchResult> = Vec::new();
+
+    // --- my_entry_point ---
+    {
+        let f = Fixture::new();
+        let snap = measure(&f.env, || {
+            f.client().my_entry_point(/* args */);
+        });
+        results.push(BenchResult {
+            contract: CONTRACT.into(),
+            entry_point: "my_entry_point".into(),
+            cpu_instructions: snap.cpu_instructions,
+            mem_bytes: snap.mem_bytes,
+            storage_reads: 0,
+            storage_writes: 0,
+            wasm_bytes: wasm,
+        });
+    }
+
+    print_suite(&results);
+    results
+}
+
+fn print_suite(results: &[BenchResult]) {
+    println!("\n── {} ──", CONTRACT);
+    for r in results {
+        println!(
+            "  {:30} cpu={:>12}  mem={:>10}",
+            r.entry_point, r.cpu_instructions, r.mem_bytes
+        );
+    }
+}
 ```
 
-Each entry point gets its own fresh `Env` and contract fixture so measurements
-are isolated — setup cost does not contaminate the measured function.
+Key points from the `escrow.rs` pattern:
+- Use a **fresh `Fixture`** for each measured entry point — don't share state between measurements.
+- Call `env.mock_all_auths()` in `Fixture::new()` so auth checks don't interfere with measurements.
+- Any **setup work** (e.g. calling `create_escrow` before benchmarking `release_funds`) goes **outside** the `measure(...)` closure so it is not counted.
+- `wasm_size(WASM_CRATE)` is called once per suite and reused across all results in that suite.
 
-## Historical tracking
+### Step 2 — Register the suite in `mod.rs`
 
-After every successful run on `main` (push or nightly schedule), the benchmark
-binary writes a timestamped record to `benchmarks/history/`. CI commits those
-files automatically using the `stefanzweifel/git-auto-commit-action` step.
+Add a `pub mod` line to `benchmarks/src/suites/mod.rs`:
 
-History files are named `YYYY-MM-DD_<short-sha>.json` and contain the full
-`BenchResult` array plus run metadata (date, full SHA, ref name). The HTML
-dashboard reads up to 30 of the most recent records to draw per-entry-point
-CPU trend charts.
+```rust
+pub mod <contract_name>;
+```
 
-To bootstrap history on an existing repo, run `cargo run -p mentorminds-benchmarks`
-locally (with `BENCH_DATE`, `GITHUB_SHA`, and `GITHUB_REF_NAME` set) and commit
-the generated files:
+### Step 3 — Call the suite in `main.rs`
 
-```bash
-export BENCH_DATE=$(date '+%Y-%m-%d')
-export GITHUB_SHA=$(git rev-parse HEAD)
-export GITHUB_REF_NAME=$(git branch --show-current)
+Add a line to `run_all_suites()` in `benchmarks/src/main.rs`:
+
+```rust
+all.extend(suites::<contract_name>::run());
+```
+
+### Step 4 — Add the contract dependency to `benchmarks/Cargo.toml`
+
+```toml
+[dependencies.mentorminds-<contract-name>]
+path = "../contracts/<contract_name>"
+features = ["testutils"]
+```
+
+### Step 5 — Regenerate the baseline
+
+Run the benchmarks once so the new entry points appear in `baselines.json`:
+
+```sh
 cargo run -p mentorminds-benchmarks
-git add benchmarks/history/
-git commit -m "chore(bench): bootstrap performance history"
+cp benchmarks/results/report.json benchmarks/baselines.json
 ```
 
-## Covered entry points
+Commit both `baselines.json` and your new suite file together.
 
-| Contract    | Entry Points |
-|-------------|-------------|
-| escrow      | `create_escrow`, `release_funds`, `dispute`, `resolve_dispute` |
-| staking     | `stake`, `unstake`, `distribute_revenue_batch`, `claim_rewards` |
-| governance  | `create_proposal`, `vote`, `execute_proposal` |
-| timelock    | `schedule`, `execute` |
+---
 
-## Thresholds
+## 8. CI Integration
 
-| Metric | Regression gate | Alert |
-|--------|----------------|-------|
-| `cpu_instructions` | > 10% increase | GitHub Actions annotation |
-| `mem_bytes` | > 10% increase | GitHub Actions annotation |
-| `storage_reads` | > 10% increase | GitHub Actions annotation |
-| `storage_writes` | > 10% increase | GitHub Actions annotation |
-| `wasm_bytes` | > 10% increase | Annotation + hard alert if > 64 KB |
+The benchmark binary integrates with GitHub Actions automatically when the following environment variables are set by the runner:
 
-## Regression alerts
+| Variable | Purpose |
+|---|---|
+| `GITHUB_SHA` | Full commit SHA — embedded in the history filename and summary. |
+| `GITHUB_REF_NAME` | Branch or tag name — embedded in the history record. |
+| `BENCH_DATE` | Date string (e.g. `2026-09-25`) — used as the date prefix in the history filename. Set this in your workflow with `echo "BENCH_DATE=$(date -u +%F)" >> $GITHUB_ENV`. |
+| `GITHUB_STEP_SUMMARY` | Path to the job summary file — the harness appends a Markdown results table automatically. |
 
-When a regression is detected the benchmark binary:
+**Regression annotations:** when regressions are found, the harness emits GitHub Actions `::error` workflow commands that surface as annotations directly in the PR diff view:
 
-1. Exits with code **1** — failing the CI check.
-2. Emits `::error` GitHub Actions [workflow commands][wf-cmds] so each
-   regression appears as an inline annotation in the PR diff view.
-3. Writes a detailed **job summary** (visible on the Actions run page) listing
-   every regressed metric with baseline, measured value, and percentage delta.
+```
+::error title=Performance Regression [escrow/create_escrow]::Metric `cpu_instructions` exceeded 10% baseline — baseline=890000, measured=1026270, delta=+15.3%
+```
 
-[wf-cmds]: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions
-
-## CI behaviour
-
-The `Soroban Benchmarks` workflow runs on:
-- Every PR touching benchmarked contracts or `benchmarks/`
-- Every push to `main` (same path filters)
-- A **nightly schedule** at 03:00 UTC to catch drift not triggered by code changes
-
-### Steps
-
-1. Build WASM release binaries for size tracking.
-2. Run `cargo run -p mentorminds-benchmarks`.
-3. Upload `report.json`, `report.html`, and `bench.log` as artifacts (90-day retention).
-4. **Commit history record** to `benchmarks/history/` (main/schedule only).
-5. Post a summary table as a PR comment (updates on re-runs).
-6. Exits with code 1 and fails the check if any metric exceeds the 10% gate.
-
-## Adding a new benchmark
-
-1. Add a function to the relevant suite in `benchmarks/src/suites/`.
-2. Push a new `BenchResult` to the `results` vec in that suite's `run()`.
-3. Run locally to generate a `report.json`, then copy it to `baselines.json`.
-4. After merging, CI will start tracking the new entry point in history.
+**Exit codes:**
+- `0` — all metrics within baseline (or no baseline exists yet).
+- `1` — one or more regressions detected, or gas estimation accuracy failures.

@@ -372,3 +372,236 @@ pub fn apply_bps_multiplier(amount: i128, bps: u32) -> i128 {
     }
     ((amount as u128) * (bps as u128) / (BASIS_POINTS as u128)) as i128
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests — compute_early_unstake_penalty
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_early_unstake_penalty, BASIS_POINTS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
+        EARLY_UNSTAKE_PENALTY_MIN_BPS, MIN_STAKING_DURATION_SECS,
+    };
+
+    /// Principal used across most tests: 1,000,000 base units.
+    const PRINCIPAL: i128 = 1_000_000;
+
+    /// A plausible unlock timestamp that is comfortably beyond the
+    /// MIN_STAKING_DURATION_SECS boundary so the early-penalty path is always
+    /// exercised unless current_time >= original_unlock_at.
+    const UNLOCK_AT: u64 = MIN_STAKING_DURATION_SECS * 3; // 3× min duration
+
+    // -----------------------------------------------------------------------
+    // Boundary: t = 0 (unstake immediately after staking)
+    // -----------------------------------------------------------------------
+
+    /// At t = 0 the staker has been staked for zero seconds.
+    /// Expected: penalty_bps == EARLY_UNSTAKE_PENALTY_MAX_BPS (50 %).
+    ///
+    /// Formula: remaining = MIN − 0 = MIN; addend = MIN×range/MIN = range = 4000;
+    ///          penalty_bps = MIN_BPS + range = 1000 + 4000 = 5000.
+    #[test]
+    fn penalty_at_stake_time_is_max_bps() {
+        let staked_at: u64 = 1_000_000;
+        let current_time = staked_at; // t = 0
+
+        let result = compute_early_unstake_penalty(staked_at, current_time, UNLOCK_AT, PRINCIPAL);
+
+        assert_eq!(
+            result.penalty_bps,
+            EARLY_UNSTAKE_PENALTY_MAX_BPS,
+            "penalty_bps should be MAX ({}) when unstaked immediately",
+            EARLY_UNSTAKE_PENALTY_MAX_BPS
+        );
+        assert_eq!(result.staked_duration_secs, 0);
+        assert!(result.below_min_duration, "should be below min duration at t=0");
+
+        // Amount check: 50 % of 1_000_000 = 500_000
+        let expected_penalty =
+            (PRINCIPAL as u128 * EARLY_UNSTAKE_PENALTY_MAX_BPS as u128 / BASIS_POINTS as u128)
+                as i128;
+        assert_eq!(result.penalty_amount, expected_penalty);
+        assert_eq!(result.returned_amount, PRINCIPAL - expected_penalty);
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary: t = MIN_STAKING_DURATION_SECS (exactly at the threshold)
+    // -----------------------------------------------------------------------
+
+    /// At exactly MIN_STAKING_DURATION_SECS the formula switches to the flat
+    /// minimum penalty branch.
+    /// Expected: penalty_bps == EARLY_UNSTAKE_PENALTY_MIN_BPS (10 %).
+    #[test]
+    fn penalty_at_min_duration_is_min_bps() {
+        let staked_at: u64 = 0;
+        let current_time = MIN_STAKING_DURATION_SECS;
+
+        let result = compute_early_unstake_penalty(staked_at, current_time, UNLOCK_AT, PRINCIPAL);
+
+        assert_eq!(
+            result.penalty_bps,
+            EARLY_UNSTAKE_PENALTY_MIN_BPS,
+            "penalty_bps should be MIN ({}) at exactly MIN_STAKING_DURATION_SECS",
+            EARLY_UNSTAKE_PENALTY_MIN_BPS
+        );
+        assert_eq!(result.staked_duration_secs, MIN_STAKING_DURATION_SECS);
+        // Exactly at the threshold means the staker just crossed into eligibility.
+        assert!(
+            !result.below_min_duration,
+            "should NOT be below min duration at exactly MIN_STAKING_DURATION_SECS"
+        );
+
+        // Amount check: 10 % of 1_000_000 = 100_000
+        let expected_penalty =
+            (PRINCIPAL as u128 * EARLY_UNSTAKE_PENALTY_MIN_BPS as u128 / BASIS_POINTS as u128)
+                as i128;
+        assert_eq!(result.penalty_amount, expected_penalty);
+        assert_eq!(result.returned_amount, PRINCIPAL - expected_penalty);
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary: t ≥ original_unlock_at (normal / on-time unstake)
+    // -----------------------------------------------------------------------
+
+    /// Once current_time >= original_unlock_at the staker is past the
+    /// lock-up period. No penalty should apply regardless of duration.
+    #[test]
+    fn penalty_is_zero_after_unlock_at() {
+        let staked_at: u64 = 0;
+        let original_unlock_at: u64 = MIN_STAKING_DURATION_SECS * 2;
+
+        // Test exactly at unlock_at and also one second beyond.
+        for current_time in [original_unlock_at, original_unlock_at + 1] {
+            let result =
+                compute_early_unstake_penalty(staked_at, current_time, original_unlock_at, PRINCIPAL);
+
+            assert_eq!(
+                result.penalty_bps, 0,
+                "penalty_bps must be 0 at current_time={current_time} (>= unlock_at={original_unlock_at})"
+            );
+            assert_eq!(result.penalty_amount, 0);
+            assert_eq!(
+                result.returned_amount, PRINCIPAL,
+                "full principal must be returned when past unlock_at"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Linear interpolation: midpoint
+    // -----------------------------------------------------------------------
+
+    /// At the halfway point (t = MIN/2) the remaining time until the
+    /// minimum duration is also MIN/2.
+    ///
+    /// Formula:
+    ///   remaining = MIN − MIN/2 = MIN/2
+    ///   range     = MAX_BPS − MIN_BPS = 5000 − 1000 = 4000
+    ///   addend    = (MIN/2 × 4000) / MIN = 2000
+    ///   penalty_bps = MIN_BPS + addend = 1000 + 2000 = 3000  (30 %)
+    #[test]
+    fn penalty_midpoint_linear_interpolation() {
+        let staked_at: u64 = 0;
+        let current_time = MIN_STAKING_DURATION_SECS / 2;
+
+        let result = compute_early_unstake_penalty(staked_at, current_time, UNLOCK_AT, PRINCIPAL);
+
+        let expected_bps: u32 = {
+            let remaining = MIN_STAKING_DURATION_SECS / 2;
+            let range =
+                EARLY_UNSTAKE_PENALTY_MAX_BPS.saturating_sub(EARLY_UNSTAKE_PENALTY_MIN_BPS);
+            let addend =
+                (remaining as u128 * range as u128 / MIN_STAKING_DURATION_SECS as u128) as u32;
+            EARLY_UNSTAKE_PENALTY_MIN_BPS.saturating_add(addend)
+        };
+        // Verify the expected_bps is the midpoint value (3000 = 30 %).
+        assert_eq!(expected_bps, 3_000, "mid-point bps should be 3000");
+
+        assert_eq!(
+            result.penalty_bps, expected_bps,
+            "penalty_bps at half-duration should equal {expected_bps}"
+        );
+
+        let expected_penalty =
+            (PRINCIPAL as u128 * expected_bps as u128 / BASIS_POINTS as u128) as i128;
+        assert_eq!(result.penalty_amount, expected_penalty);
+        assert_eq!(result.returned_amount, PRINCIPAL - expected_penalty);
+        assert!(result.below_min_duration, "midpoint is still below min duration");
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge: principal = 0
+    // -----------------------------------------------------------------------
+
+    /// When principal is zero the early-exit path fires regardless of time.
+    /// No penalty amounts should be non-zero.
+    #[test]
+    fn penalty_zero_on_zero_principal() {
+        let staked_at: u64 = 0;
+        let current_time: u64 = 1; // t ≈ 0, would normally be max penalty
+
+        let result = compute_early_unstake_penalty(staked_at, current_time, UNLOCK_AT, 0);
+
+        assert_eq!(result.penalty_bps, 0, "penalty_bps must be 0 for zero principal");
+        assert_eq!(result.penalty_amount, 0);
+        assert_eq!(result.returned_amount, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-min but still before unlock: flat min penalty
+    // -----------------------------------------------------------------------
+
+    /// After MIN_STAKING_DURATION_SECS but before original_unlock_at the
+    /// penalty stays flat at EARLY_UNSTAKE_PENALTY_MIN_BPS (10 %).
+    /// This verifies the function does NOT drop to 0 before the unlock date.
+    #[test]
+    fn penalty_stays_at_min_bps_between_min_duration_and_unlock() {
+        let staked_at: u64 = 0;
+        // Pick a time clearly past min duration but still before unlock.
+        let current_time = MIN_STAKING_DURATION_SECS + MIN_STAKING_DURATION_SECS / 2;
+
+        let result = compute_early_unstake_penalty(staked_at, current_time, UNLOCK_AT, PRINCIPAL);
+
+        assert_eq!(
+            result.penalty_bps,
+            EARLY_UNSTAKE_PENALTY_MIN_BPS,
+            "penalty should remain at MIN_BPS between min_duration and unlock_at"
+        );
+        assert!(!result.below_min_duration);
+    }
+
+    // -----------------------------------------------------------------------
+    // Monotonicity: penalty is non-increasing as staked duration grows
+    // -----------------------------------------------------------------------
+
+    /// The penalty rate must never increase as time passes (it should be
+    /// monotonically non-increasing from max → min → 0).
+    #[test]
+    fn penalty_bps_is_monotonically_non_increasing_over_time() {
+        let staked_at: u64 = 0;
+        let original_unlock_at = MIN_STAKING_DURATION_SECS * 4;
+
+        // Sample at regular intervals from t=0 to t=unlock_at+1.
+        let step = MIN_STAKING_DURATION_SECS / 8;
+        let mut prev_bps = u32::MAX;
+
+        let mut t = staked_at;
+        while t <= original_unlock_at + 1 {
+            let current_time = staked_at + t;
+            let result = compute_early_unstake_penalty(
+                staked_at,
+                current_time,
+                original_unlock_at,
+                PRINCIPAL,
+            );
+            assert!(
+                result.penalty_bps <= prev_bps,
+                "penalty_bps should not increase: at t={t} got {}, previous was {prev_bps}",
+                result.penalty_bps
+            );
+            prev_bps = result.penalty_bps;
+            t = t.saturating_add(step);
+        }
+    }
+}

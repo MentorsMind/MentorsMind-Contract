@@ -12,9 +12,6 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 [features]
 testutils = ["soroban-sdk/testutils"]
 
-[dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
-
 [lib]
 path = "src/lib.rs"
 crate-type = ["rlib"]
