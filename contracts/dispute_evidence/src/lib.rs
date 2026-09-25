@@ -997,6 +997,61 @@ impl DisputeEvidenceContract {
             return Err(Error::AppealAlreadySubmitted);
         }
 
+        // Justice intervention: compute whether systemic arbitration bias warrants
+        // blocking re-arbitration until a fair-resolution window opens.
+        // Load the three cached signals (same pattern as get_justice_status).
+        let independence: DisputeIndependenceFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeIndependence(escrow_id))
+            .unwrap_or(DisputeIndependenceFlag {
+                independent: true,
+                risk_score: 0,
+                shared_actor_count: 0,
+                clustered_timing_count: 0,
+            });
+        let evidence: SharedEvidenceAuthenticity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EvidenceAuthenticityRecord(escrow_id))
+            .unwrap_or(SharedEvidenceAuthenticity {
+                authentic: true,
+                tampering_risk_score: 0,
+                duplicate_submission_count: 0,
+                suspicious_timing_count: 0,
+            });
+        let bias: ArbitrationBiasFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationFairness(resolution.arbitrator.clone()))
+            .unwrap_or(ArbitrationBiasFlag {
+                fair: true,
+                bias_risk_score: 0,
+                one_sided_ratio_bps: 0,
+                ruling_count: 0,
+            });
+        let intervention = compute_justice_intervention(
+            &env,
+            independence,
+            evidence,
+            bias,
+            JUSTICE_RESTORATION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::JusticeIntervention(escrow_id), &intervention);
+
+        if intervention.intervene {
+            env.events().publish(
+                (Symbol::new(&env, "JusticeInterventionRequired"), escrow_id),
+                (intervention.combined_risk_score, intervention.reason.clone()),
+            );
+            // Block re-arbitration until the restoration cooldown has elapsed.
+            if !is_justice_restoration_eligible(&intervention, env.ledger().timestamp()) {
+                return Err(Error::JusticeRestorationNotEligible);
+            }
+        }
+
         let governance: Address = env
             .storage()
             .instance()
@@ -2162,5 +2217,92 @@ mod tests {
 
         let resolution = client.get_resolution(&1);
         assert!(resolution.release_to_mentor);
+    }
+
+    // ─── justice intervention: arbitration bias ───────────────────────────
+
+    /// Verifies that a pattern of one-sided rulings by the same arbitrator
+    /// causes `submit_appeal_for_dispute` to:
+    ///   1. Compute a justice intervention with `intervene = true`.
+    ///   2. Store a `JusticeInterventionRecord` under the escrow.
+    ///   3. Emit a `JusticeInterventionRequired` event.
+    ///   4. Block the appeal (return `JusticeRestorationNotEligible`) because
+    ///      the restoration cooldown has not elapsed.
+    ///
+    /// Bias threshold: `ruling_count >= 3` AND `one_sided_ratio_bps >= 8000`.
+    /// We drive 4 all-mentor rulings through escrows 2–5 so the arbitrator's
+    /// rolling `ArbitratorFavorHistory` is saturated before the appeal on
+    /// escrow 1 is attempted.
+    #[test]
+    fn justice_intervention_triggered_after_biased_arbitrator_rulings() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let _governance = setup_disputed_with_governance(&env, &client, &admin);
+
+        // Shared biased arbitrator used across all resolutions.
+        let biased_arb = Address::generate(&env);
+
+        // ── Step 1: Build up a biased ruling history on escrows 2–5.
+        // MockEscrow returns a Disputed escrow for every escrow_id, so we
+        // can resolve multiple escrow IDs without additional setup.
+        for extra_escrow in [2u64, 3u64, 4u64, 5u64] {
+            client.record_dispute_opened(&extra_escrow).unwrap();
+            advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+            // All rulings favour the mentor — this is the one-sided pattern.
+            client
+                .submit_resolution(
+                    &extra_escrow,
+                    &biased_arb,
+                    &false,
+                    &true,
+                    &Symbol::new(&env, "mentor_wins"),
+                )
+                .unwrap();
+        }
+
+        // Confirm the fairness scorer now sees a biased arbitrator.
+        let bias_flag = client.protect_arbitration_fairness(&biased_arb);
+        assert!(!bias_flag.fair, "arbitrator should be flagged as biased after 4 one-sided rulings");
+        assert!(bias_flag.ruling_count >= 3);
+        assert!(bias_flag.one_sided_ratio_bps >= 8_000);
+
+        // ── Step 2: Set up escrow 1 with a prior resolution from biased_arb
+        //           so the appeal path is reachable.
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &biased_arb, &false, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        // ── Step 3: Attempt appeal — must be blocked by justice intervention.
+        let appeal_reason = hash32(&env, 42);
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &appeal_reason);
+        assert!(
+            result.is_err(),
+            "appeal should be blocked when arbitration bias warrants intervention"
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::JusticeRestorationNotEligible,
+            "error must be JusticeRestorationNotEligible"
+        );
+
+        // ── Step 4: Verify the JusticeInterventionRecord was stored.
+        let record = client.get_justice_status(&1, &biased_arb);
+        assert!(record.intervene, "intervention record must have intervene=true");
+        assert_eq!(
+            record.reason,
+            Symbol::new(&env, "arbitration_bias"),
+            "reason must be arbitration_bias"
+        );
+
+        // ── Step 5: Verify the JusticeInterventionRequired event was emitted.
+        let events = env.events().all();
+        let intervention_event = events.iter().find(|e| {
+            e.1 == (Symbol::new(&env, "JusticeInterventionRequired"), 1u64).into_val(&env)
+        });
+        assert!(
+            intervention_event.is_some(),
+            "JusticeInterventionRequired event must be emitted on appeal path"
+        );
     }
 }

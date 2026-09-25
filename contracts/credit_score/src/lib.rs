@@ -66,6 +66,18 @@ pub struct ScoreBreakdown {
     pub dispute_history: u32,
 }
 
+/// A single entry in the auditable score-change history for an address.
+/// Written on every `set_score` and `refresh_score` call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreRecord {
+    pub score: u32,
+    pub timestamp: u64,
+    /// Human-readable label for why the score changed, e.g. `"refresh"`,
+    /// `"admin_set"`, or a custom reason passed by the caller.
+    pub reason: Symbol,
+}
+
 #[contracttype]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
@@ -76,6 +88,10 @@ pub enum DataKey {
     UserScore(Address),     // Persistent: long-term user data
     UserBreakdown(Address), // Persistent: long-term user data
     LastUpdate(Address),    // Temporary: rate limiting, auto-expires
+    /// Individual score-history entry: (address, sequential index).
+    ScoreHistory(Address, u32),
+    /// Total number of history entries stored for an address.
+    ScoreHistoryLen(Address),
 }
 
 const MIN_SCORE: u32 = 300;
@@ -83,11 +99,13 @@ const MAX_SCORE: u32 = 850;
 const DAY_SECONDS: u64 = 86_400;
 const DAY_SECONDS_TTL: u32 = 86_400;
 
+/// Hard ceiling on items returned by a single `get_score_history_page` call.
+/// Mirrors `shared::pagination::MAX_PAGE_SIZE`.
+pub const MAX_PAGE_SIZE: u32 = 50;
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
-
-}
 
 #[contractevent]
 #[derive(Clone)]
@@ -139,6 +157,37 @@ impl CreditScoreContract {
             })
     }
 
+    /// Admin-only: directly set a score for `user` with an explicit `reason`.
+    ///
+    /// The change is appended to the address's auditable history so that
+    /// lending-pool and governance consumers can detect manual manipulation.
+    pub fn set_score(env: Env, admin: Address, user: Address, score: u32, reason: Symbol) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+
+        let clamped = score.clamp(MIN_SCORE, MAX_SCORE);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserScore(user.clone()), &clamped);
+
+        Self::append_history(&env, user.clone(), clamped, reason.clone());
+
+        ScoreUpdatedEvent {
+            category: symbol_short!("score"),
+            action: symbol_short!("set"),
+            user,
+            score: clamped,
+        }
+        .publish(env);
+    }
+
     pub fn refresh_score(env: Env, user: Address) {
         let last_update: u64 = env
             .storage()
@@ -168,6 +217,8 @@ impl CreditScoreContract {
             DAY_SECONDS_TTL,
         );
 
+        Self::append_history(&env, user.clone(), score, symbol_short!("refresh"));
+
         ScoreUpdatedEvent {
             category: symbol_short!("score"),
             action: symbol_short!("updated"),
@@ -180,9 +231,89 @@ impl CreditScoreContract {
         let (score, _) = Self::do_compute(env, user);
         score
     }
+
+    /// Return a paginated slice of the score-change history for `user`.
+    ///
+    /// `offset` is zero-based; `limit` is clamped to [`MAX_PAGE_SIZE`] (50).
+    /// Returns an empty `Vec` when `offset` is past the end of the history.
+    pub fn get_score_history_page(
+        env: Env,
+        user: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<ScoreRecord> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ScoreHistoryLen(user.clone()))
+            .unwrap_or(0);
+
+        let (start, end) = Self::pagination_bounds(total, offset, limit);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, ScoreRecord>(&DataKey::ScoreHistory(user.clone(), i))
+            {
+                page.push_back(record);
+            }
+        }
+        page
+    }
 }
 
 impl CreditScoreContract {
+    /// Append a new `ScoreRecord` to `user`'s history and increment the
+    /// history length counter.
+    fn append_history(env: &Env, user: Address, score: u32, reason: Symbol) {
+        let len: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ScoreHistoryLen(user.clone()))
+            .unwrap_or(0);
+
+        let record = ScoreRecord {
+            score,
+            timestamp: env.ledger().timestamp(),
+            reason,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoreHistory(user.clone(), len), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoreHistoryLen(user.clone()), &(len + 1));
+    }
+
+    /// Resolve a `(total, offset, limit)` triple into a concrete `[start, end)`
+    /// index range, clamping `limit` to [`MAX_PAGE_SIZE`].
+    ///
+    /// Mirrors `shared::pagination::Pagination::bounds` so this contract can
+    /// remain `shared`-free.
+    fn pagination_bounds(total: u32, offset: u32, limit: u32) -> (u32, u32) {
+        let limit = if limit == 0 {
+            1
+        } else if limit > MAX_PAGE_SIZE {
+            MAX_PAGE_SIZE
+        } else {
+            limit
+        };
+
+        if offset >= total {
+            return (total, total);
+        }
+
+        let remaining = total - offset;
+        let end = if limit >= remaining {
+            total
+        } else {
+            offset + limit
+        };
+
+        (offset, end)
+    }
+
     fn do_compute(env: Env, user: Address) -> (u32, ScoreBreakdown) {
         let escrow_addr: Address = env
             .storage()
@@ -375,5 +506,192 @@ mod test {
 
         let user = Address::generate(&env);
         assert_eq!(client.get_score(&user), 300);
+    }
+
+    // ── History accumulation ──────────────────────────────────────────────
+
+    /// Creates a contract with no mock dependencies (for set_score tests that
+    /// don't invoke the escrow/staking contracts). Returns `(admin, contract_id)`.
+    fn setup_no_mock(env: &Env) -> (Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let escrow = Address::generate(env);
+        let staking = Address::generate(env);
+        let cid = env.register_contract(None, CreditScoreContract);
+        let client = CreditScoreContractClient::new(env, &cid);
+        client.initialize(&admin, &escrow, &staking);
+        (admin, cid)
+    }
+
+    #[test]
+    fn set_score_appends_history_entry() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        client.set_score(&admin, &user, &600, &Symbol::new(&env, "admin_set"));
+
+        let page = client.get_score_history_page(&user, &0, &10);
+        assert_eq!(page.len(), 1, "one history entry expected");
+        let rec = page.get(0).unwrap();
+        assert_eq!(rec.score, 600);
+        assert_eq!(rec.timestamp, 1_000);
+        assert_eq!(rec.reason, Symbol::new(&env, "admin_set"));
+    }
+
+    #[test]
+    fn multiple_set_score_calls_accumulate_history() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        client.set_score(&admin, &user, &400, &Symbol::new(&env, "admin_set"));
+
+        // Advance time so we can distinguish the two entries.
+        env.ledger().set_timestamp(2_000);
+        client.set_score(&admin, &user, &500, &Symbol::new(&env, "admin_set"));
+
+        env.ledger().set_timestamp(3_000);
+        client.set_score(&admin, &user, &600, &Symbol::new(&env, "admin_set"));
+
+        let page = client.get_score_history_page(&user, &0, &50);
+        assert_eq!(page.len(), 3, "three history entries expected");
+
+        assert_eq!(page.get(0).unwrap().score, 400);
+        assert_eq!(page.get(0).unwrap().timestamp, 1_000);
+
+        assert_eq!(page.get(1).unwrap().score, 500);
+        assert_eq!(page.get(1).unwrap().timestamp, 2_000);
+
+        assert_eq!(page.get(2).unwrap().score, 600);
+        assert_eq!(page.get(2).unwrap().timestamp, 3_000);
+    }
+
+    #[test]
+    fn refresh_score_appends_history_entry() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let admin = Address::generate(&env);
+        let escrow = env.register_contract(None, MockEscrow);
+        let staking = env.register_contract(None, MockStaking);
+        let cid = env.register_contract(None, CreditScoreContract);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        client.initialize(&admin, &escrow, &staking);
+
+        let user = Address::generate(&env);
+        client.refresh_score(&user);
+
+        let page = client.get_score_history_page(&user, &0, &10);
+        assert_eq!(page.len(), 1, "refresh_score must append one history entry");
+        let rec = page.get(0).unwrap();
+        assert_eq!(rec.reason, symbol_short!("refresh"));
+        assert_eq!(rec.score, client.get_score(&user));
+        assert_eq!(rec.timestamp, 1_000_000);
+    }
+
+    // ── Pagination ────────────────────────────────────────────────────────
+
+    /// Populate `count` history entries via `set_score`, incrementing the
+    /// ledger timestamp by 1 for each entry so timestamps are distinguishable.
+    fn populate_history(
+        env: &Env,
+        admin: &Address,
+        user: &Address,
+        client: &CreditScoreContractClient,
+        count: u32,
+    ) {
+        for i in 0..count {
+            env.ledger().set_timestamp(1_000 + i as u64);
+            client.set_score(
+                admin,
+                user,
+                &(300 + i).min(850),
+                &Symbol::new(env, "admin_set"),
+            );
+        }
+    }
+
+    #[test]
+    fn history_page_returns_correct_slice() {
+        let env = Env::default();
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        populate_history(&env, &admin, &user, &client, 10);
+
+        // offset=0, limit=3 → entries 0, 1, 2
+        let page = client.get_score_history_page(&user, &0, &3);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.get(0).unwrap().score, 300);
+        assert_eq!(page.get(2).unwrap().score, 302);
+
+        // offset=7, limit=5 → only 3 entries remain (7, 8, 9)
+        let page = client.get_score_history_page(&user, &7, &5);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.get(0).unwrap().score, 307);
+        assert_eq!(page.get(2).unwrap().score, 309);
+    }
+
+    #[test]
+    fn history_page_offset_past_end_returns_empty() {
+        let env = Env::default();
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        populate_history(&env, &admin, &user, &client, 5);
+
+        let page = client.get_score_history_page(&user, &10, &5);
+        assert_eq!(page.len(), 0, "offset past end must yield empty page");
+    }
+
+    #[test]
+    fn history_page_no_history_returns_empty() {
+        let env = Env::default();
+        let (_admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        let page = client.get_score_history_page(&user, &0, &10);
+        assert_eq!(page.len(), 0, "user with no history must return empty page");
+    }
+
+    #[test]
+    fn history_page_limit_clamped_to_max_page_size() {
+        let env = Env::default();
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        // Write MAX_PAGE_SIZE + 10 entries so we can prove the cap bites.
+        populate_history(&env, &admin, &user, &client, MAX_PAGE_SIZE + 10);
+
+        // Requesting u32::MAX must be clamped to MAX_PAGE_SIZE.
+        let page = client.get_score_history_page(&user, &0, &u32::MAX);
+        assert_eq!(
+            page.len(),
+            MAX_PAGE_SIZE,
+            "limit must be clamped to MAX_PAGE_SIZE ({})",
+            MAX_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn history_is_scoped_per_user() {
+        let env = Env::default();
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user_a = Address::generate(&env);
+        let user_b = Address::generate(&env);
+
+        populate_history(&env, &admin, &user_a, &client, 3);
+        // user_b has no entries
+        let page = client.get_score_history_page(&user_b, &0, &10);
+        assert_eq!(page.len(), 0, "user_b history must be empty when only user_a has entries");
     }
 }
