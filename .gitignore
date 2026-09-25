@@ -29,9 +29,19 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
+analysis_output/
+
+# Benchmark generated output (committed intentionally: history/ and baselines.json)
+benchmarks/results/
+
+# Storage validator generated output — snapshots (*.json) are committed intentionally
+storage-snapshots/migration-report.json
+storage-snapshots/migration-report.md
+storage-snapshots/check.log
 
 .agents/
 .claude/
 issue.md
 node_modules/
 package-lock.json.bk
+.opencode

@@ -1,0 +1,10 @@
+# Cargo configuration for MentorsMind Contract
+# Uses alternative target directory to avoid Windows permission issues
+
+[build]
+target-dir = "target"
+
+# Ensure WASM target is available for Soroban contracts
+# Using wasm32v1-none for Soroban SDK v25.3.2+ compatibility with Rust 1.84+
+[target.wasm32v1-none]
+rustflags = ["-C", "opt-level=z", "-C", "strip=symbols"]

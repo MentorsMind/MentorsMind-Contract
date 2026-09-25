@@ -3,6 +3,7 @@
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
+    IntoVal, MuxedAddress,
 };
 use soroban_token_sdk::metadata::TokenMetadata;
 
@@ -67,11 +68,14 @@ pub struct TransferEventData {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Allowance(Address, Address), // (owner, spender)
     Balance(Address),
     TotalSupply,
     Metadata,
+    PauseGuardian,
 }
 
 const SUPPLY_CAP: i128 = 100_000_000 * 10_000_000; // 100M with 7 decimals
@@ -126,6 +130,8 @@ impl MNTToken {
             .expect("Not initialized");
         admin.require_auth();
 
+        Self::assert_not_paused(&env);
+
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -171,6 +177,7 @@ impl MNTToken {
     /// - Insufficient balance
     pub fn do_burn(env: Env, from: Address, amount: i128) {
         from.require_auth();
+        Self::assert_not_paused(&env);
 
         if amount <= 0 {
             panic!("Amount must be positive");
@@ -196,6 +203,35 @@ impl MNTToken {
             .persistent()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0)
+    }
+
+    /// Set the pause guardian contract address. Admin only.
+    pub fn set_pause_guardian(env: Env, guardian: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    /// Panics if the pause guardian reports the system is paused.
+    fn assert_not_paused(env: &Env) {
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::PauseGuardian)
+        {
+            let is_paused: bool = env.invoke_contract(
+                &guardian,
+                &soroban_sdk::Symbol::new(env, "is_paused"),
+                soroban_sdk::Vec::new(env),
+            );
+            if is_paused {
+                panic!("Contract is paused");
+            }
+        }
     }
 }
 
@@ -256,8 +292,9 @@ impl TokenInterface for MNTToken {
     /// - Caller fails authorization check
     /// - Amount is not positive
     /// - Insufficient balance
-    fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
         from.require_auth();
+        Self::assert_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -267,14 +304,15 @@ impl TokenInterface for MNTToken {
             panic!("Insufficient balance");
         }
 
-        let to_balance = Self::balance(env.clone(), to.clone());
+        let to_addr = to.address();
+        let to_balance = Self::balance(env.clone(), to_addr.clone());
 
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+            .set(&DataKey::Balance(to_addr.clone()), &(to_balance + amount));
 
         env.events().publish(
             (
@@ -282,7 +320,7 @@ impl TokenInterface for MNTToken {
                 Symbol::new(&env, "Transfer"),
                 from.clone(),
             ),
-            TransferEventData { to, amount },
+            TransferEventData { to: to_addr, amount },
         );
     }
 
@@ -299,6 +337,7 @@ impl TokenInterface for MNTToken {
     /// - Insufficient balance
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
+        Self::assert_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -347,6 +386,7 @@ impl TokenInterface for MNTToken {
 
     fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
         spender.require_auth();
+        Self::assert_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -417,7 +457,7 @@ mod test {
     extern crate std;
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{vec, Env, IntoVal, Symbol};
+    use soroban_sdk::{vec, Env, IntoVal, Symbol, TryFromVal};
 
     #[test]
     fn test_initialization() {
@@ -459,7 +499,8 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(last_event.2, MintEventData { amount: 1000 }.into_val(&env));
+        let mint_data = MintEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(mint_data.amount, 1000);
 
         client.burn(&user, &400);
         assert_eq!(client.balance(&user), 600);
@@ -477,7 +518,8 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(last_event.2, BurnEventData { amount: 400 }.into_val(&env));
+        let burn_data = BurnEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(burn_data.amount, 400);
     }
 
     #[test]
@@ -510,14 +552,9 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            last_event.2,
-            TransferEventData {
-                to: user2.clone(),
-                amount: 300
-            }
-            .into_val(&env)
-        );
+        let transfer_data = TransferEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(transfer_data.to, user2.clone());
+        assert_eq!(transfer_data.amount, 300);
     }
 
     #[test]
@@ -549,14 +586,9 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            last_event.2,
-            ApproveEventData {
-                spender: user2.clone(),
-                amount: 500
-            }
-            .into_val(&env)
-        );
+        let approve_data = ApproveEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(approve_data.spender, user2.clone());
+        assert_eq!(approve_data.amount, 500);
 
         client.transfer_from(&user2, &user1, &user2, &200);
         assert_eq!(client.balance(&user1), 800);
@@ -576,14 +608,9 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            last_event.2,
-            TransferEventData {
-                to: user2.clone(),
-                amount: 200
-            }
-            .into_val(&env)
-        );
+        let transfer_from_data = TransferEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(transfer_from_data.to, user2.clone());
+        assert_eq!(transfer_from_data.amount, 200);
     }
 
     #[test]

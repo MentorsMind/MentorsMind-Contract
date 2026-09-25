@@ -37,6 +37,8 @@ pub struct CallRecord {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     CallCount(Address, Symbol),
     WindowStart(Address, Symbol),
@@ -72,6 +74,7 @@ impl RateLimiterContract {
         max_calls: u32,
         window_seconds: u32,
     ) -> bool {
+        caller.require_auth();
         // Check if caller is whitelisted
         if env
             .storage()
@@ -95,7 +98,9 @@ impl RateLimiterContract {
         let window_seconds_u64 = window_seconds as u64;
 
         // Check if we need to reset the window
-        if now >= window_start + window_seconds_u64 {
+        if now >= window_start.saturating_add(window_seconds_u64) {
+            // Reset the counter and window timestamp together so the TTL always
+            // reflects the active policy window rather than the previous one.
             // New window - reset counter
             env.storage().temporary().set(&window_start_key, &now);
             env.storage().temporary().set(&call_count_key, &1u32);
@@ -112,13 +117,11 @@ impl RateLimiterContract {
         }
 
         // Within current window - check and increment counter
-        let current_count: u32 = env
-            .storage()
-            .temporary()
-            .get(&call_count_key)
-            .unwrap_or(0);
+        let current_count: u32 = env.storage().temporary().get(&call_count_key).unwrap_or(0);
 
         if current_count >= max_calls {
+            // Emit a dedicated event so operators can tell policy enforcement
+            // apart from genuine execution failures in downstream logs.
             // Rate limit exceeded - emit event
             env.events().publish(
                 (
@@ -132,11 +135,13 @@ impl RateLimiterContract {
         }
 
         // Increment counter
-        let new_count = current_count + 1;
+        let new_count = current_count.checked_add(1).expect("call count overflow");
         env.storage().temporary().set(&call_count_key, &new_count);
 
-        // Extend TTL
-        let remaining_seconds = (window_start + window_seconds_u64 - now) as u32;
+        // Extend TTL only for the remaining time in the window so the counter
+        // expires with the policy interval.
+        let remaining_u64 = window_start.saturating_add(window_seconds_u64).saturating_sub(now);
+        let remaining_seconds = remaining_u64.min(u32::MAX as u64) as u32;
         env.storage()
             .temporary()
             .extend_ttl(&call_count_key, remaining_seconds, remaining_seconds);
@@ -216,9 +221,7 @@ impl RateLimiterContract {
 
     /// Check if an address is whitelisted.
     pub fn is_whitelisted(env: Env, address: Address) -> bool {
-        env.storage()
-            .instance()
-            .has(&DataKey::Whitelist(address))
+        env.storage().instance().has(&DataKey::Whitelist(address))
     }
 }
 

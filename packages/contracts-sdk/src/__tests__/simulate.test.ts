@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { estimateFee, parseStateChanges, simulateTransaction } from "../simulate";
+import { estimateFee, parseStateChanges, simulateTransaction } from "../simulate.js";
 
 test("successful simulation parsing", async () => {
   const originalFetch = globalThis.fetch;

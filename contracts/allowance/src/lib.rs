@@ -1,5 +1,8 @@
 #![no_std]
 
+use shared::events::{
+    emit_allowance_event, evt_allowance_authorized, evt_allowance_pulled, evt_allowance_revoked,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Symbol,
 };
@@ -20,6 +23,8 @@ pub struct AllowanceRecord {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Allowance(Address, Address, Address), // (owner, spender, token)
 }
 
@@ -63,19 +68,10 @@ impl RecurringAllowanceContract {
 
         env.storage().persistent().set(&key, &record);
 
-        env.events().publish(
-            (
-                symbol_short!("allowance"),
-                Symbol::new(&env, "authorized"),
-                owner,
-            ),
-            (
-                spender,
-                token,
-                amount_per_period,
-                max_periods,
-                period_seconds,
-            ),
+        emit_allowance_event(
+            &env,
+            evt_allowance_authorized(&env),
+            (spender, token, amount_per_period, max_periods, period_seconds),
         );
     }
 
@@ -129,12 +125,9 @@ impl RecurringAllowanceContract {
         record.last_pull_timestamp = now;
         env.storage().persistent().set(&key, &record);
 
-        env.events().publish(
-            (
-                symbol_short!("allowance"),
-                Symbol::new(&env, "payment_pulled"),
-                owner,
-            ),
+        emit_allowance_event(
+            &env,
+            evt_allowance_pulled(&env),
             (spender, token, amount, record.periods_used),
         );
     }
@@ -148,10 +141,7 @@ impl RecurringAllowanceContract {
         }
 
         env.storage().persistent().remove(&key);
-        env.events().publish(
-            (symbol_short!("allowance"), symbol_short!("revoked"), owner),
-            (spender, token),
-        );
+        emit_allowance_event(&env, evt_allowance_revoked(&env), (spender, token));
     }
 
     pub fn get_allowance(

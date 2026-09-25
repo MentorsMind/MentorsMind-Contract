@@ -81,7 +81,7 @@ impl BenchmarkFixture {
         let client = EscrowContractClient::new(&env, &contract_id);
         let mut approved = Vec::new(&env);
         approved.push_back(token_address.clone());
-        client.initialize(&admin, &treasury, &500, &approved, &0);
+        client.initialize(&admin, &treasury, &500, &approved, &0, &None);
 
         Self {
             env,

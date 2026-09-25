@@ -320,7 +320,15 @@ fn test_upgrade_path_preserves_storage_and_enables_new_features() {
     let v2 = EscrowV2Client::new(&env, &fixed_id);
     assert_eq!(v2.get_auto_release_delay(), 72 * 60 * 60);
     let token_client = TokenClient::new(&env, &token_address);
-    let eid_new = v2.create_escrow(&mentor, &learner, &1_000, &symbol_short!("S3"), &token_address, &now, &1u32);
+    let eid_new = v2.create_escrow(
+        &mentor,
+        &learner,
+        &1_000,
+        &symbol_short!("S3"),
+        &token_address,
+        &now,
+        &1u32,
+    );
     let before_mentor = token_client.balance(&mentor);
     let before_treasury = token_client.balance(&treasury);
     v2.release_funds(&learner, &eid_new);
@@ -329,7 +337,7 @@ fn test_upgrade_path_preserves_storage_and_enables_new_features() {
     let reinit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let other = Address::generate(&env);
         let empty: Vec<Address> = Vec::new(&env);
-        v2.initialize(&other, &treasury, &500u32, &empty, &0u64);
+        v2.initialize(&other, &treasury, &500u32, &empty, &0u64, &None);
     }));
     assert!(reinit.is_err());
 }

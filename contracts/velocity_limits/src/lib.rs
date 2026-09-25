@@ -43,6 +43,8 @@ pub struct TxRecord {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     KycRegistry,
     LastDailyReset,
@@ -160,14 +162,13 @@ impl VelocityLimitsContract {
 
     pub fn get_usage(env: Env, user: Address) -> (i128, i128) {
         let now = env.ledger().timestamp();
-        let (txs, daily_used, monthly_used) = Self::load_usage(&env, &user.clone(), now);
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserTxs(user), &txs);
+        let (_txs, daily_used, monthly_used) = Self::load_usage(&env, &user.clone(), now);
         (daily_used, monthly_used)
     }
 
     pub fn reset_daily(env: Env) {
+        Self::require_admin(&env);
+
         let now = env.ledger().timestamp();
         let last: u64 = env
             .storage()
@@ -376,11 +377,26 @@ mod tests {
         assert!(f.velocity().check_and_record(&f.user, &500));
         assert_eq!(f.velocity().get_usage(&f.user).0, 500);
 
-        // Move past 24h and run permissionless reset.
+        // Move past 24h and run the admin-only reset.
         f.env.ledger().set_timestamp(1_000 + DAY_SECS + 1);
         f.velocity().reset_daily();
 
         // Daily usage drops to zero due to rolling 24h window expiry, monthly stays.
+        let usage = f.velocity().get_usage(&f.user);
+        assert_eq!(usage.0, 0);
+        assert_eq!(usage.1, 500);
+    }
+
+    #[test]
+    fn test_daily_usage_expires_without_reset() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(1_000);
+
+        assert!(f.velocity().check_and_record(&f.user, &500));
+        assert_eq!(f.velocity().get_usage(&f.user).0, 500);
+
+        f.env.ledger().set_timestamp(1_000 + DAY_SECS + 1);
+
         let usage = f.velocity().get_usage(&f.user);
         assert_eq!(usage.0, 0);
         assert_eq!(usage.1, 500);
@@ -400,5 +416,25 @@ mod tests {
         f.kyc().set_level(&f.user, &KycLevel::Enhanced);
         assert_eq!(f.velocity().get_tier(&f.user), LimitTier::Enhanced);
         assert!(f.velocity().check_and_record(&f.user, &2_000));
+    }
+
+    #[test]
+    fn test_kyc_expiry_drops_velocity_tier_to_basic() {
+        // Simulates issue #678: an Enhanced-tier user whose KYC expires mid-test
+        // must immediately fall back to Basic limits on the next check, since
+        // velocity_limits re-queries kyc_level_for on every call (no caching).
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(1_000);
+
+        f.kyc().set_level(&f.user, &KycLevel::Enhanced);
+        assert_eq!(f.velocity().get_tier(&f.user), LimitTier::Enhanced);
+        assert!(f.velocity().check_and_record(&f.user, &5_000));
+
+        // Simulate KYC expiry: mock registry now reports None once "expired".
+        f.kyc().set_level(&f.user, &KycLevel::None);
+
+        assert_eq!(f.velocity().get_tier(&f.user), LimitTier::Basic);
+        // Enhanced-tier amount now exceeds the Basic per-tx limit (500).
+        assert!(!f.velocity().check_and_record(&f.user, &600));
     }
 }

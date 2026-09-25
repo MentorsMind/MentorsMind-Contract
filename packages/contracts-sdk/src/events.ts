@@ -1,4 +1,4 @@
-import { ContractEvent, HorizonEvent } from "./event-types";
+import { ContractEvent, HorizonEvent } from "./event-types.js";
 
 export const EVENT_TOPICS = {
   ESCROW: ["Escrow", "escrow"],
@@ -38,7 +38,7 @@ function decodeTopics(raw: HorizonEvent): unknown[] {
   }
 
   if (Array.isArray(raw.topic_xdr)) {
-    return raw.topic_xdr.map((t) => decodeScValXdr(t));
+    return raw.topic_xdr.map((t: string) => decodeScValXdr(t));
   }
 
   return [];

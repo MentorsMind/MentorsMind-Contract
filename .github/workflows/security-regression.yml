@@ -1,0 +1,177 @@
+name: Security Regression Suite
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'contracts/rbac/**'
+      - 'contracts/upgrade_registry/**'
+      - 'contracts/timelock/**'
+      - 'contracts/governance/**'
+      - 'contracts/performance_bond/**'
+      - 'contracts/shared/src/params.rs'
+      - 'contracts/shared/src/sig_validation.rs'
+      - 'multisig/**'
+      - 'escrow/**'
+      - 'tests/security_regression.rs'
+      - 'tests/sig_validation_tests.rs'
+      - 'tests/upgrade_safety_tests.rs'
+      - '.github/workflows/security-regression.yml'
+  push:
+    branches: [main]
+  # Nightly run catches drift from indirect dependency changes.
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  security-regression:
+    name: Security Regression Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85'
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-reg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-reg-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-security-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('tests/security_regression.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-security-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-security-
+
+      # ── Privilege escalation ───────────────────────────────────────────────
+      - name: '[priv_esc] Privilege escalation tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            priv_esc -- --nocapture 2>&1 | tee /tmp/priv_esc.log
+
+      # ── Replay attacks ─────────────────────────────────────────────────────
+      - name: '[replay] Replay attack tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            replay -- --nocapture 2>&1 | tee /tmp/replay.log
+
+      # Also run the dedicated sig_validation replay suite.
+      - name: '[replay] Signature replay tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test sig_validation_tests \
+            -- --nocapture 2>&1 | tee /tmp/sig_replay.log
+
+      # ── Unauthorized upgrades ──────────────────────────────────────────────
+      - name: '[unauth_upgrade] Unauthorized upgrade tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            unauth_upgrade -- --nocapture 2>&1 | tee /tmp/unauth_upgrade.log
+
+      # Also run the dedicated upgrade safety suite.
+      - name: '[unauth_upgrade] Upgrade safety tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test upgrade_safety_tests \
+            -- --nocapture 2>&1 | tee /tmp/upgrade_safety.log
+
+      # ── Multisig bypass ────────────────────────────────────────────────────
+      - name: '[multisig_bypass] Multisig bypass tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            multisig_bypass -- --nocapture 2>&1 | tee /tmp/multisig_bypass.log
+
+      # ── Timelock manipulation ──────────────────────────────────────────────
+      - name: '[timelock_manip] Timelock manipulation tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            timelock_manip -- --nocapture 2>&1 | tee /tmp/timelock_manip.log
+
+      # ── Re-initialization ──────────────────────────────────────────────────
+      - name: '[reinit] Re-initialization guard tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            reinit -- --nocapture 2>&1 | tee /tmp/reinit.log
+
+      # ── Parameter abuse ────────────────────────────────────────────────────
+      - name: '[param_abuse] Parameter abuse tests'
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            param_abuse -- --nocapture 2>&1 | tee /tmp/param_abuse.log
+
+      # ── Full suite (catch-all) ─────────────────────────────────────────────
+      - name: Full security regression suite
+        run: |
+          cargo test -p mentorminds-integration-tests --test security_regression \
+            -- --nocapture 2>&1 | tee /tmp/security_full.log
+
+      # Upload all logs as artifacts regardless of pass/fail.
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-regression-logs-${{ github.sha }}
+          path: /tmp/*.log
+          retention-days: 30
+
+      # Post a summary to the PR on failure.
+      - name: Post failure comment
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## ❌ Security Regression Failure
+
+            One or more security regression tests failed on this PR.
+            This means a previously-closed attack vector may have been re-opened.
+
+            **Required action:** review the test logs attached to this run before merging.
+
+            [View logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            > Tests cover: privilege escalation · replay attacks · unauthorized upgrades ·
+            > multisig bypass · timelock manipulation · re-initialization · parameter abuse`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Security Regression Failure')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

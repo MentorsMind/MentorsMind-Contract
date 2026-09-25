@@ -1,0 +1,206 @@
+name: Storage Migration Validation
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'contracts/**/*.rs'
+      - 'escrow/**/*.rs'
+      - 'multisig/**/*.rs'
+      - 'contracts/shared/src/storage.rs'
+      - 'storage-snapshots/**'
+      - '.github/workflows/storage-migration-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/**/*.rs'
+      - 'escrow/**/*.rs'
+      - 'multisig/**/*.rs'
+      - 'contracts/shared/src/storage.rs'
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: 'Write current schema as the new baseline snapshot'
+        required: false
+        default: 'false'
+      baseline_version:
+        description: 'Baseline snapshot version to compare against (default: latest)'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  validate-storage:
+    name: Validate Storage Schemas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85'
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-reg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-reg-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-tools-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('tools/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-tools-
+
+      - name: Build storage-validator
+        run: cargo build --release -p state-transition-analyzer --bin storage-validator
+
+      - name: Set run metadata
+        run: |
+          echo "BENCH_DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "GITHUB_SHA=${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "GITHUB_REF_NAME=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      # On PRs: check against the latest committed baseline snapshot.
+      - name: Determine baseline version
+        id: baseline
+        run: |
+          # Use input if provided, otherwise pick the latest snapshot version.
+          INPUT="${{ github.event.inputs.baseline_version }}"
+          if [ -n "$INPUT" ]; then
+            echo "version=$INPUT" >> "$GITHUB_OUTPUT"
+          else
+            LATEST=$(ls storage-snapshots/ | grep -v '\.gitkeep' | sort | tail -1)
+            if [ -z "$LATEST" ]; then
+              echo "version=" >> "$GITHUB_OUTPUT"
+            else
+              echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # If no baseline exists yet, create one and skip the diff.
+      - name: Create initial baseline (first run)
+        if: steps.baseline.outputs.version == ''
+        run: |
+          ./target/release/storage-validator snapshot \
+            --version "baseline" \
+            --workspace .
+          echo "INITIAL_BASELINE=true" >> "$GITHUB_ENV"
+
+      # On subsequent runs: snapshot current state and diff.
+      - name: Run migration validation check
+        if: steps.baseline.outputs.version != ''
+        id: check
+        run: |
+          ./target/release/storage-validator check \
+            --baseline "${{ steps.baseline.outputs.version }}" \
+            --version "${{ github.sha }}" \
+            --workspace . \
+            2>&1 | tee storage-snapshots/check.log
+
+      # On workflow_dispatch with update_baseline=true, snapshot and commit as new baseline.
+      - name: Update baseline snapshot (manual trigger)
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.update_baseline == 'true'
+        run: |
+          ./target/release/storage-validator snapshot \
+            --version "baseline" \
+            --workspace .
+          echo "Baseline snapshot updated."
+
+      # Commit snapshots only on main pushes or explicit baseline updates.
+      # PRs (especially from forks) cannot push back to the head branch.
+      - name: Commit snapshots
+        if: >
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.update_baseline == 'true')
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(storage): update schema snapshots [${{ github.sha }}]'
+          file_pattern: storage-snapshots/**/*.json
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
+
+      # Always upload reports as artifacts.
+      - name: Upload migration reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-migration-report-${{ github.sha }}
+          path: |
+            storage-snapshots/migration-report.json
+            storage-snapshots/migration-report.md
+            storage-snapshots/check.log
+            storage-snapshots/${{ github.sha }}/schema.json
+          retention-days: 90
+
+      # Post PR comment with migration report.
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const mdPath = 'storage-snapshots/migration-report.md';
+
+            let body;
+            if (fs.existsSync(mdPath)) {
+              body = fs.readFileSync(mdPath, 'utf8');
+              body += `\n> [Full report artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+            } else {
+              const passed = '${{ steps.check.outcome }}' === 'success';
+              body = passed
+                ? '## ✅ Storage Migration Validation\n\nNo schema changes detected.'
+                : '## ❌ Storage Migration Validation\n\nValidation failed — check the workflow logs.';
+            }
+
+            try {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+
+              const existing = comments.find(c =>
+                c.user.type === 'Bot' && c.body.includes('Storage Migration Validation')
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (error) {
+              // Fork PRs often lack issues:write — don't fail the job on comment ACL errors.
+              console.error('Failed to post storage migration PR comment:', error.message);
+            }

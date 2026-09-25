@@ -1,0 +1,8 @@
+[package]
+name = "storage-scanner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "storage-scanner"
+path = "src/main.rs"

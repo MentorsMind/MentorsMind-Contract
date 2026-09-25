@@ -7,6 +7,7 @@ use soroban_sdk::Env;
 fn test_escrow_state_machine_transitions() {
     let env = Env::default();
     let states = [
+        EscrowStatus::Pending,
         EscrowStatus::Active,
         EscrowStatus::Released,
         EscrowStatus::Disputed,
@@ -19,11 +20,13 @@ fn test_escrow_state_machine_transitions() {
             let is_valid = EscrowStatus::is_valid_transition(&env, from, to);
             let expected_valid = matches!(
                 (from, to),
-                (EscrowStatus::Active, EscrowStatus::Released)
-                    | (EscrowStatus::Active, EscrowStatus::Disputed)
-                    | (EscrowStatus::Active, EscrowStatus::Refunded)
+                (EscrowStatus::Pending,  EscrowStatus::Active)
+                    | (EscrowStatus::Active,   EscrowStatus::Released)
+                    | (EscrowStatus::Active,   EscrowStatus::Disputed)
+                    | (EscrowStatus::Active,   EscrowStatus::Refunded)
                     | (EscrowStatus::Disputed, EscrowStatus::Resolved)
                     | (EscrowStatus::Disputed, EscrowStatus::Refunded)
+                    | (EscrowStatus::Pending,  EscrowStatus::Refunded)
             );
             assert_eq!(
                 is_valid, expected_valid,

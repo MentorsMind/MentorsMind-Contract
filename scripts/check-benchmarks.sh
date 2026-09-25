@@ -2,6 +2,7 @@
 
 # MentorsMind Contract Benchmark CI Check
 # Fails if any benchmark exceeds 120M CPU instructions (>20% over 100M limit)
+# Mini Changes
 
 set -e
 

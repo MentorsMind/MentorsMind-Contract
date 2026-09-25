@@ -222,6 +222,21 @@ soroban contract invoke \
   -- get_all_prices
 ```
 
+## 🧪 Testing Guidelines
+
+- Keep contract tests close to the behavior they exercise. Unit tests belong next to the contract crate, while cross-contract and end-to-end checks belong in `tests/`.
+- Cover both the happy path and at least one failure case for every new control-flow branch.
+- Prefer deterministic fixtures and explicit ledger timestamps so test output stays stable across runs.
+- When a change affects storage layout, authorization, or upgrade behavior, add a regression test before merging.
+- Use coverage reports as a signal, not a target; the real goal is to keep critical security and state-transition paths exercised.
+
+## 📝 Commenting Guidelines
+
+- Add inline comments only where the intent is not obvious from the code alone: state transitions, pricing math, authorization shortcuts, or storage TTL handling.
+- Explain the assumption being made, not the line of code itself.
+- Keep TODO and FIXME notes concrete, time-bound, and easy to search for during follow-up work.
+- Remove comments once the implementation becomes self-explanatory or the assumption no longer applies.
+
 ## 🔍 Debugging
 
 ### Common Issues

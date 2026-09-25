@@ -64,6 +64,17 @@ This checklist tracks all preparations required before engaging a third-party se
   - [x] Monitoring tools setup
   - [x] Auditor checklist
 
+### 1.1b Automated Audit Tooling
+
+- [x] **Audit Toolkit Script** (`scripts/audit_toolkit.py`)
+  - [x] Contract inventory generation
+  - [x] Privileged function mapping (`require_auth`)
+  - [x] Storage schema mapping
+  - [x] Event inventory extraction
+- [x] **Upgrade Path Documentation** (`docs/upgrade-path.md`)
+  - [x] UUPS architecture explanation
+  - [x] Authorization boundaries defined
+
 ### 1.2 Technical Documentation
 
 - [x] **README.md** (Root)
@@ -355,6 +366,8 @@ contracts/referral/src/lib.rs        # Tertiary
 - [x] Test environment setup guide
 - [x] Access to GitHub repository
 - [x] Testnet contract addresses (once deployed)
+- [x] **Automated Audit Inventory** (`docs/AUDIT-INVENTORY-REPORT.md` generated via toolkit)
+- [x] **Upgrade Path Documentation** (`docs/upgrade-path.md`)
 - [x] Funded test accounts
 - [x] Previous internal audit reports (if any)
 

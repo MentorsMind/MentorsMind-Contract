@@ -7,6 +7,8 @@ const MAX_BATCH: u32 = 100;
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     /// BytesN<32> hash -> bool (present = sanctioned)
     Sanctioned(BytesN<32>),

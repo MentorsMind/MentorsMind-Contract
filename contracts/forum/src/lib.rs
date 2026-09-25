@@ -104,11 +104,13 @@ pub struct UserReputation {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Post(u32),
     Reply(u32),
     Category(u32),
     UserReputation(Address),
-    Vote(u32, Address), // For posts
+    Vote(u32, Address),      // For posts
     ReplyVote(u32, Address), // For replies
     Moderation(u32, Address),
     CategoryPost(u32, u32), // category_id, post_id
@@ -149,9 +151,13 @@ impl ForumContract {
 
         env.storage().persistent().set(&ADMIN, &admin);
         env.storage().persistent().set(&TOKEN, &mnt_token);
-        env.storage().persistent().set(&REPUTATION_THRESHOLD, &rep_threshold);
+        env.storage()
+            .persistent()
+            .set(&REPUTATION_THRESHOLD, &rep_threshold);
         env.storage().persistent().set(&MIN_POST_STAKE, &min_stake);
-        env.storage().persistent().set(&MODERATION_THRESHOLD, &mod_threshold);
+        env.storage()
+            .persistent()
+            .set(&MODERATION_THRESHOLD, &mod_threshold);
         env.storage().persistent().set(&POST_COUNT, &0u32);
         env.storage().persistent().set(&CATEGORY_COUNT, &0u32);
 
@@ -169,8 +175,12 @@ impl ForumContract {
         stake_amount: i128,
     ) -> u32 {
         author.require_auth();
-        
-        let min_stake: i128 = env.storage().persistent().get(&MIN_POST_STAKE).unwrap_or(DEFAULT_MIN_POST_STAKE);
+
+        let min_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&MIN_POST_STAKE)
+            .unwrap_or(DEFAULT_MIN_POST_STAKE);
         if stake_amount < min_stake {
             panic!("stake amount below minimum");
         }
@@ -182,7 +192,11 @@ impl ForumContract {
         }
 
         // Check reputation threshold for certain post types
-        let rep_threshold: i128 = env.storage().persistent().get(&REPUTATION_THRESHOLD).unwrap_or(DEFAULT_REPUTATION_THRESHOLD);
+        let rep_threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&REPUTATION_THRESHOLD)
+            .unwrap_or(DEFAULT_REPUTATION_THRESHOLD);
         match post_type {
             PostType::Announcement => {
                 let user_rep = Self::get_user_reputation(env.clone(), author.clone()).reputation;
@@ -227,15 +241,17 @@ impl ForumContract {
 
         env.storage().persistent().set(&POST_COUNT, &count);
         env.storage().persistent().set(&DataKey::Post(count), &post);
-        env.storage().persistent().set(&DataKey::CategoryPost(category_id, count), &true);
-        env.storage().persistent().set(&DataKey::UserPost(author.clone(), count), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CategoryPost(category_id, count), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserPost(author.clone(), count), &true);
 
         // Update user reputation
-        Self::update_user_reputation(&env, &author, |rep| {
-            UserReputation {
-                posts_created: rep.posts_created + 1,
-                ..rep
-            }
+        Self::update_user_reputation(&env, &author, |rep| UserReputation {
+            posts_created: rep.posts_created + 1,
+            ..rep
         });
 
         // Update category post count
@@ -263,7 +279,11 @@ impl ForumContract {
             panic!("post not active");
         }
 
-        let min_stake: i128 = env.storage().persistent().get(&MIN_POST_STAKE).unwrap_or(DEFAULT_MIN_POST_STAKE);
+        let min_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&MIN_POST_STAKE)
+            .unwrap_or(DEFAULT_MIN_POST_STAKE);
         if stake_amount < min_stake {
             panic!("stake amount below minimum");
         }
@@ -271,7 +291,10 @@ impl ForumContract {
         // Transfer stake tokens to contract
         Self::transfer_tokens(&env, &author, &env.current_contract_address(), stake_amount);
 
-        let reply_id = post.reply_count.checked_add(1).expect("reply count overflow");
+        let reply_id = post
+            .reply_count
+            .checked_add(1)
+            .expect("reply count overflow");
         let now = env.ledger().timestamp();
 
         let reply = Reply {
@@ -288,21 +311,25 @@ impl ForumContract {
             is_best_answer: false,
         };
 
-        env.storage().persistent().set(&DataKey::Reply(reply_id), &reply);
-        env.storage().persistent().set(&DataKey::UserReply(author.clone(), reply_id), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reply(reply_id), &reply);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserReply(author.clone(), reply_id), &true);
 
         // Update post reply count
         let mut updated_post = post;
         updated_post.reply_count = reply_id;
         updated_post.updated_at = now;
-        env.storage().persistent().set(&DataKey::Post(post_id), &updated_post);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Post(post_id), &updated_post);
 
         // Update user reputation
-        Self::update_user_reputation(&env, &author, |rep| {
-            UserReputation {
-                replies_created: rep.replies_created + 1,
-                ..rep
-            }
+        Self::update_user_reputation(&env, &author, |rep| UserReputation {
+            replies_created: rep.replies_created + 1,
+            ..rep
         });
 
         env.events().publish(
@@ -330,23 +357,37 @@ impl ForumContract {
         let vote_weight = if voter_rep > 0 { voter_rep } else { 1 };
 
         if upvote {
-            post.upvotes = post.upvotes.checked_add(vote_weight).expect("upvote overflow");
+            post.upvotes = post
+                .upvotes
+                .checked_add(vote_weight)
+                .expect("upvote overflow");
         } else {
-            post.downvotes = post.downvotes.checked_add(vote_weight).expect("downvote overflow");
+            post.downvotes = post
+                .downvotes
+                .checked_add(vote_weight)
+                .expect("downvote overflow");
         }
 
         env.storage().persistent().set(&vote_key, &upvote);
-        env.storage().persistent().set(&DataKey::Post(post_id), &post);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Post(post_id), &post);
 
         // Update author reputation
         let reputation_change = if upvote { vote_weight } else { -vote_weight };
-        Self::update_user_reputation(&env, &post.author, |rep| {
-            UserReputation {
-                reputation: rep.reputation + reputation_change,
-                upvotes_received: if upvote { rep.upvotes_received + vote_weight } else { rep.upvotes_received },
-                downvotes_received: if !upvote { rep.downvotes_received + vote_weight } else { rep.downvotes_received },
-                ..rep
-            }
+        Self::update_user_reputation(&env, &post.author, |rep| UserReputation {
+            reputation: rep.reputation + reputation_change,
+            upvotes_received: if upvote {
+                rep.upvotes_received + vote_weight
+            } else {
+                rep.upvotes_received
+            },
+            downvotes_received: if !upvote {
+                rep.downvotes_received + vote_weight
+            } else {
+                rep.downvotes_received
+            },
+            ..rep
         });
 
         env.events().publish(
@@ -359,7 +400,7 @@ impl ForumContract {
         voter.require_auth();
 
         let mut reply = Self::get_reply(env.clone(), reply_id);
-        
+
         let vote_key = DataKey::ReplyVote(reply_id, voter.clone());
         if env.storage().persistent().has(&vote_key) {
             panic!("already voted");
@@ -369,23 +410,37 @@ impl ForumContract {
         let vote_weight = if voter_rep > 0 { voter_rep } else { 1 };
 
         if upvote {
-            reply.upvotes = reply.upvotes.checked_add(vote_weight).expect("upvote overflow");
+            reply.upvotes = reply
+                .upvotes
+                .checked_add(vote_weight)
+                .expect("upvote overflow");
         } else {
-            reply.downvotes = reply.downvotes.checked_add(vote_weight).expect("downvote overflow");
+            reply.downvotes = reply
+                .downvotes
+                .checked_add(vote_weight)
+                .expect("downvote overflow");
         }
 
         env.storage().persistent().set(&vote_key, &upvote);
-        env.storage().persistent().set(&DataKey::Reply(reply_id), &reply);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reply(reply_id), &reply);
 
         // Update author reputation
         let reputation_change = if upvote { vote_weight } else { -vote_weight };
-        Self::update_user_reputation(&env, &reply.author, |rep| {
-            UserReputation {
-                reputation: rep.reputation + reputation_change,
-                upvotes_received: if upvote { rep.upvotes_received + vote_weight } else { rep.upvotes_received },
-                downvotes_received: if !upvote { rep.downvotes_received + vote_weight } else { rep.downvotes_received },
-                ..rep
-            }
+        Self::update_user_reputation(&env, &reply.author, |rep| UserReputation {
+            reputation: rep.reputation + reputation_change,
+            upvotes_received: if upvote {
+                rep.upvotes_received + vote_weight
+            } else {
+                rep.upvotes_received
+            },
+            downvotes_received: if !upvote {
+                rep.downvotes_received + vote_weight
+            } else {
+                rep.downvotes_received
+            },
+            ..rep
         });
 
         env.events().publish(
@@ -410,10 +465,16 @@ impl ForumContract {
 
         // Remove best answer from any previous reply
         for i in 1..=reply.id {
-            if let Some(mut existing_reply) = env.storage().persistent().get::<_, Reply>(&DataKey::Reply(i)) {
+            if let Some(mut existing_reply) = env
+                .storage()
+                .persistent()
+                .get::<_, Reply>(&DataKey::Reply(i))
+            {
                 if existing_reply.post_id == reply.post_id && existing_reply.is_best_answer {
                     existing_reply.is_best_answer = false;
-                    env.storage().persistent().set(&DataKey::Reply(i), &existing_reply);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Reply(i), &existing_reply);
                 }
             }
         }
@@ -421,14 +482,14 @@ impl ForumContract {
         let reply_author = reply.author.clone();
         let mut updated_reply = reply;
         updated_reply.is_best_answer = true;
-        env.storage().persistent().set(&DataKey::Reply(reply_id), &updated_reply);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reply(reply_id), &updated_reply);
 
         // Reward reply author with bonus reputation
-        Self::update_user_reputation(&env, &reply_author, |rep| {
-            UserReputation {
-                reputation: rep.reputation + 50,
-                ..rep
-            }
+        Self::update_user_reputation(&env, &reply_author, |rep| UserReputation {
+            reputation: rep.reputation + 50,
+            ..rep
         });
 
         env.events().publish(
@@ -447,7 +508,11 @@ impl ForumContract {
     ) {
         moderator.require_auth();
 
-        let mod_threshold: u32 = env.storage().persistent().get(&MODERATION_THRESHOLD).unwrap_or(DEFAULT_MODERATION_THRESHOLD);
+        let mod_threshold: u32 = env
+            .storage()
+            .persistent()
+            .get(&MODERATION_THRESHOLD)
+            .unwrap_or(DEFAULT_MODERATION_THRESHOLD);
         let moderator_rep = Self::get_user_reputation(env.clone(), moderator.clone()).reputation;
         if moderator_rep < mod_threshold as i128 {
             panic!("insufficient reputation for moderation");
@@ -455,7 +520,10 @@ impl ForumContract {
 
         if is_reply {
             let mut reply = Self::get_reply(env.clone(), target_id);
-            reply.moderation_count = reply.moderation_count.checked_add(1).expect("moderation count overflow");
+            reply.moderation_count = reply
+                .moderation_count
+                .checked_add(1)
+                .expect("moderation count overflow");
 
             match action {
                 ModerationAction::Hide => {
@@ -463,21 +531,33 @@ impl ForumContract {
                     if post.status == PostStatus::Active {
                         let mut updated_post = post;
                         updated_post.status = PostStatus::Hidden;
-                        env.storage().persistent().set(&DataKey::Post(reply.post_id), &updated_post);
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::Post(reply.post_id), &updated_post);
                     }
                 }
                 ModerationAction::Delete => {
                     // Refund stakes proportionally
                     let refund_amount = reply.stake_amount / 2;
-                    Self::transfer_tokens(&env, &env.current_contract_address(), &reply.author, refund_amount);
+                    Self::transfer_tokens(
+                        &env,
+                        &env.current_contract_address(),
+                        &reply.author,
+                        refund_amount,
+                    );
                 }
                 _ => {}
             }
 
-            env.storage().persistent().set(&DataKey::Reply(target_id), &reply);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Reply(target_id), &reply);
         } else {
             let mut post = Self::get_post(env.clone(), target_id);
-            post.moderation_count = post.moderation_count.checked_add(1).expect("moderation count overflow");
+            post.moderation_count = post
+                .moderation_count
+                .checked_add(1)
+                .expect("moderation count overflow");
 
             match action {
                 ModerationAction::Hide => post.status = PostStatus::Hidden,
@@ -486,15 +566,24 @@ impl ForumContract {
                     post.status = PostStatus::Deleted;
                     // Refund stakes proportionally
                     let refund_amount = post.stake_amount / 2;
-                    Self::transfer_tokens(&env, &env.current_contract_address(), &post.author, refund_amount);
+                    Self::transfer_tokens(
+                        &env,
+                        &env.current_contract_address(),
+                        &post.author,
+                        refund_amount,
+                    );
                 }
             }
 
-            env.storage().persistent().set(&DataKey::Post(target_id), &post);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Post(target_id), &post);
         }
 
         // Record moderation action
-        env.storage().persistent().set(&DataKey::Moderation(target_id, moderator.clone()), &action);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Moderation(target_id, moderator.clone()), &action);
 
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("MOD_ACT"), target_id),
@@ -502,13 +591,12 @@ impl ForumContract {
         );
     }
 
-    pub fn create_category(
-        env: Env,
-        admin: Address,
-        name: Bytes,
-        description: Bytes,
-    ) -> u32 {
-        let admin_address: Address = env.storage().persistent().get(&ADMIN).expect("not initialized");
+    pub fn create_category(env: Env, admin: Address, name: Bytes, description: Bytes) -> u32 {
+        let admin_address: Address = env
+            .storage()
+            .persistent()
+            .get(&ADMIN)
+            .expect("not initialized");
         if admin != admin_address {
             panic!("only admin can create categories");
         }
@@ -529,7 +617,9 @@ impl ForumContract {
         };
 
         env.storage().persistent().set(&CATEGORY_COUNT, &count);
-        env.storage().persistent().set(&DataKey::Category(count), &category);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Category(count), &category);
 
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("CAT_CREAT"), count),
@@ -580,19 +670,24 @@ impl ForumContract {
         let mut posts = Vec::new(&env);
         let max_results = limit;
         let mut found = 0u32;
-        
-        for current_id in 1..=1000 { // Reasonable limit to prevent infinite loops
+
+        for current_id in 1..=1000 {
+            // Reasonable limit to prevent infinite loops
             if found >= max_results {
                 break;
             }
-            if let Some(post) = env.storage().persistent().get::<_, Post>(&DataKey::Post(current_id)) {
+            if let Some(post) = env
+                .storage()
+                .persistent()
+                .get::<_, Post>(&DataKey::Post(current_id))
+            {
                 if post.category_id == category_id && post.status == PostStatus::Active {
                     posts.push_back(current_id);
                     found += 1;
                 }
             }
         }
-        
+
         posts
     }
 
@@ -600,33 +695,53 @@ impl ForumContract {
         let mut replies = Vec::new(&env);
         let max_results = limit;
         let mut found = 0u32;
-        
-        for current_id in 1..=1000 { // Reasonable limit to prevent infinite loops
+
+        for current_id in 1..=1000 {
+            // Reasonable limit to prevent infinite loops
             if found >= max_results {
                 break;
             }
-            if let Some(reply) = env.storage().persistent().get::<_, Reply>(&DataKey::Reply(current_id)) {
+            if let Some(reply) = env
+                .storage()
+                .persistent()
+                .get::<_, Reply>(&DataKey::Reply(current_id))
+            {
                 if reply.post_id == post_id {
                     replies.push_back(current_id);
                     found += 1;
                 }
             }
         }
-        
+
         replies
     }
 
     // Helper functions
     fn create_default_categories(env: &Env) {
         let _admin: Address = env.storage().persistent().get(&ADMIN).unwrap();
-        
+
         let categories = vec![
             env,
-            (Bytes::from_slice(env, b"General Discussion"), Bytes::from_slice(env, b"General topics and discussions")),
-            (Bytes::from_slice(env, b"Technical Support"), Bytes::from_slice(env, b"Get help with technical issues")),
-            (Bytes::from_slice(env, b"Feature Requests"), Bytes::from_slice(env, b"Suggest new features and improvements")),
-            (Bytes::from_slice(env, b"Bug Reports"), Bytes::from_slice(env, b"Report bugs and issues")),
-            (Bytes::from_slice(env, b"Announcements"), Bytes::from_slice(env, b"Official announcements and news")),
+            (
+                Bytes::from_slice(env, b"General Discussion"),
+                Bytes::from_slice(env, b"General topics and discussions"),
+            ),
+            (
+                Bytes::from_slice(env, b"Technical Support"),
+                Bytes::from_slice(env, b"Get help with technical issues"),
+            ),
+            (
+                Bytes::from_slice(env, b"Feature Requests"),
+                Bytes::from_slice(env, b"Suggest new features and improvements"),
+            ),
+            (
+                Bytes::from_slice(env, b"Bug Reports"),
+                Bytes::from_slice(env, b"Report bugs and issues"),
+            ),
+            (
+                Bytes::from_slice(env, b"Announcements"),
+                Bytes::from_slice(env, b"Official announcements and news"),
+            ),
         ];
 
         for (name, description) in categories {
@@ -643,31 +758,52 @@ impl ForumContract {
             };
 
             env.storage().persistent().set(&CATEGORY_COUNT, &count);
-            env.storage().persistent().set(&DataKey::Category(count), &category);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Category(count), &category);
         }
     }
 
-    fn update_user_reputation(env: &Env, address: &Address, updater: impl FnOnce(UserReputation) -> UserReputation) {
+    fn update_user_reputation(
+        env: &Env,
+        address: &Address,
+        updater: impl FnOnce(UserReputation) -> UserReputation,
+    ) {
         let current = Self::get_user_reputation(env.clone(), address.clone());
         let updated = updater(current);
-        env.storage().persistent().set(&DataKey::UserReputation(address.clone()), &updated);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserReputation(address.clone()), &updated);
     }
 
     fn update_category_post_count(env: &Env, category_id: u32, delta: u32) {
         let mut category = Self::get_category(env.clone(), category_id);
-        category.post_count = category.post_count.checked_add(delta).expect("category post count overflow");
-        env.storage().persistent().set(&DataKey::Category(category_id), &category);
+        category.post_count = category
+            .post_count
+            .checked_add(delta)
+            .expect("category post count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::Category(category_id), &category);
     }
 
     fn transfer_tokens(env: &Env, from: &Address, to: &Address, amount: i128) {
         let token = Self::token_address(env);
         let fn_name = Symbol::new(env, "transfer");
-        let args = vec![env, from.clone().into_val(env), to.clone().into_val(env), amount.into_val(env)];
+        let args = vec![
+            env,
+            from.clone().into_val(env),
+            to.clone().into_val(env),
+            amount.into_val(env),
+        ];
         env.invoke_contract::<()>(&token, &fn_name, args);
     }
 
     fn token_address(env: &Env) -> Address {
-        env.storage().persistent().get(&TOKEN).expect("token not set")
+        env.storage()
+            .persistent()
+            .get(&TOKEN)
+            .expect("token not set")
     }
 }
 
@@ -692,7 +828,7 @@ mod tests {
 
         pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
             from.require_auth();
-            
+
             let from_balance = Self::balance(env.clone(), from.clone());
             if from_balance < amount {
                 panic!("insufficient balance");
@@ -701,7 +837,7 @@ mod tests {
             env.storage()
                 .persistent()
                 .set(&(symbol_short!("BAL"), from), &(from_balance - amount));
-            
+
             let to_balance = Self::balance(env.clone(), to.clone());
             env.storage()
                 .persistent()
@@ -736,7 +872,10 @@ mod tests {
 
         // Verify default categories were created
         let category1 = forum.get_category(&1);
-        assert_eq!(category1.name, Bytes::from_slice(&env, b"General Discussion"));
+        assert_eq!(
+            category1.name,
+            Bytes::from_slice(&env, b"General Discussion")
+        );
     }
 
     #[test]
@@ -751,13 +890,19 @@ mod tests {
 
         let admin = Address::generate(&env);
         let author = Address::generate(&env);
-        
-        forum.initialize(&admin, &token_id, &Some(10i128), &Some(1_000_000i128), &Some(3u32));
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
         token.mint(&author, &10_000_000i128);
 
         let title = Bytes::from_slice(&env, b"Test Question");
         let content_hash = BytesN::from_array(&env, &[1u8; 32]);
-        
+
         let post_id = forum.create_post(
             &author,
             &title,
@@ -786,8 +931,14 @@ mod tests {
         let admin = Address::generate(&env);
         let author = Address::generate(&env);
         let voter = Address::generate(&env);
-        
-        forum.initialize(&admin, &token_id, &Some(10i128), &Some(1_000_000i128), &Some(3u32));
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
         token.mint(&author, &10_000_000i128);
         token.mint(&voter, &10_000_000i128);
 
@@ -826,8 +977,14 @@ mod tests {
         let admin = Address::generate(&env);
         let author = Address::generate(&env);
         let responder = Address::generate(&env);
-        
-        forum.initialize(&admin, &token_id, &Some(10i128), &Some(1_000_000i128), &Some(3u32));
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
         token.mint(&author, &10_000_000i128);
         token.mint(&responder, &10_000_000i128);
 
@@ -845,12 +1002,7 @@ mod tests {
 
         // Create reply
         let reply_hash = BytesN::from_array(&env, &[2u8; 32]);
-        let reply_id = forum.create_reply(
-            &responder,
-            &post_id,
-            &reply_hash,
-            &1_000_000i128,
-        );
+        let reply_id = forum.create_reply(&responder, &post_id, &reply_hash, &1_000_000i128);
 
         // Mark as best answer
         forum.mark_best_answer(&author, &reply_id);

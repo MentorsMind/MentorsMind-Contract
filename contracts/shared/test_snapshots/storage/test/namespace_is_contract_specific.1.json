@@ -1,0 +1,190 @@
+{
+  "generators": {
+    "address": 1,
+    "nonce": 0,
+    "mux_id": 0
+  },
+  "auth": [
+    [],
+    []
+  ],
+  "ledger": {
+    "protocol_version": 25,
+    "sequence_number": 0,
+    "timestamp": 0,
+    "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "base_reserve": 0,
+    "min_persistent_entry_ttl": 4096,
+    "min_temp_entry_ttl": 16,
+    "max_entry_ttl": 6312000,
+    "ledger_entries": [
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Data"
+                  },
+                  {
+                    "bytes": "a97e8533b77781aea0211b9b75578a3c797effbd77fc81aa47f4ba8efac5f02f"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 42
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": "ledger_key_contract_instance",
+              "durability": "persistent",
+              "val": {
+                "contract_instance": {
+                  "executable": {
+                    "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  },
+                  "storage": [
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "Checksum"
+                          },
+                          {
+                            "bytes": "a97e8533b77781aea0211b9b75578a3c797effbd77fc81aa47f4ba8efac5f02f"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "updated_at"
+                            },
+                            "val": {
+                              "u64": "0"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "value_hash"
+                            },
+                            "val": {
+                              "bytes": "efd59a2a41c737f60eaec8d94358e38f5f4def97cfd746fca73599077cc3f7b7"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "Fingerprint"
+                          },
+                          {
+                            "bytes": "a97e8533b77781aea0211b9b75578a3c797effbd77fc81aa47f4ba8efac5f02f"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "key_hash"
+                            },
+                            "val": {
+                              "bytes": "a97e8533b77781aea0211b9b75578a3c797effbd77fc81aa47f4ba8efac5f02f"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "namespace_prefix"
+                            },
+                            "val": {
+                              "bytes": "28d70ccea89651d53aeb30b7471cc09ab22fa147f54a530b484eea7eff7e8215"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "registered_at"
+                            },
+                            "val": {
+                              "u64": "0"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "NamespaceRoot"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "prefix"
+                            },
+                            "val": {
+                              "bytes": "28d70ccea89651d53aeb30b7471cc09ab22fa147f54a530b484eea7eff7e8215"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "scope"
+                            },
+                            "val": {
+                              "symbol": "test_ns"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_code": {
+              "ext": "v0",
+              "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "code": ""
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      }
+    ]
+  },
+  "events": []
+}

@@ -3,6 +3,34 @@
 use soroban_sdk::token;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+// ---------------------------------------------------------------------------
+// Timestamp security constants
+// ---------------------------------------------------------------------------
+
+/// Minimum cliff duration (1 hour). Prevents cliff periods so short that
+/// validator timestamp drift (±30 s on Stellar) is a meaningful fraction
+/// of the window.
+const MIN_CLIFF_SECS: u64 = 60 * 60; // 1 hour
+
+/// Minimum total vesting duration (1 day). Ensures the vesting window is
+/// long enough that timestamp manipulation cannot meaningfully accelerate
+/// token release.
+const MIN_VESTING_SECS: u64 = 24 * 60 * 60; // 1 day
+
+/// Maximum total vesting duration (10 years). Caps schedules to prevent
+/// accidental or malicious creation of effectively permanent locks.
+const MAX_VESTING_SECS: u64 = 10 * 365 * 24 * 60 * 60; // 10 years
+
+/// Tolerance window for time comparisons. Absorbs validator timestamp drift
+/// (Stellar validators may drift up to ~30 s). Using 60 s gives a comfortable
+/// margin without meaningfully weakening the vesting schedule.
+pub const TIMESTAMP_TOLERANCE_SECS: u64 = 60; // 1 minute
+
+/// Maximum allowed clock skew for a caller-supplied `start` timestamp.
+/// A supplied start that is more than this many seconds in the past is
+/// rejected to prevent replaying stale schedule parameters.
+const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -14,6 +42,8 @@ pub enum Error {
     NothingToClaim = 5,
     ScheduleNotFound = 6,
     InsufficientBalance = 7,
+    AlreadyClaimed = 8,
+    InvalidProof = 9,
 }
 
 #[contracttype]
@@ -57,6 +87,8 @@ pub struct ScheduleRevokedEventData {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Token,
     NextScheduleId,
@@ -64,6 +96,8 @@ pub enum DataKey {
     BeneficiarySchedules(Address),
     Balance(Address),
     TotalSupply,
+    MerkleRoot,
+    ClaimedMerkleLeaf(BytesN<32>),
 }
 
 #[contract]
@@ -85,6 +119,14 @@ impl VestingContract {
     }
 
     /// Create a new vesting schedule.
+    ///
+    /// # Timestamp security
+    /// - `cliff_seconds` must be ≥ `MIN_CLIFF_SECS` so that validator drift
+    ///   cannot cause the cliff to be bypassed.
+    /// - `vesting_seconds` must be within [`MIN_VESTING_SECS`, `MAX_VESTING_SECS`].
+    /// - A caller-supplied `start` (non-zero) must be within `MAX_PAST_START_SECS`
+    ///   of the current ledger time to prevent replaying stale parameters.
+    ///
     /// Returns the schedule ID.
     pub fn create_schedule(
         env: Env,
@@ -105,8 +147,22 @@ impl VestingContract {
             panic!("Total amount must be positive");
         }
 
-        if vesting_seconds == 0 {
-            panic!("Vesting duration must be positive");
+        // Enforce minimum vesting duration so timestamp drift is negligible.
+        if vesting_seconds < MIN_VESTING_SECS {
+            panic!("Vesting duration too short");
+        }
+
+        // Enforce maximum vesting duration to prevent accidental permanent locks.
+        if vesting_seconds > MAX_VESTING_SECS {
+            panic!("Vesting duration too long");
+        }
+
+        // Enforce minimum cliff so drift cannot bypass it entirely.
+        // A cliff of 0 is allowed only when the caller explicitly accepts no cliff;
+        // however we still require it to be either 0 or >= MIN_CLIFF_SECS so there
+        // is no ambiguous "almost-zero" cliff that drift could collapse.
+        if cliff_seconds != 0 && cliff_seconds < MIN_CLIFF_SECS {
+            panic!("Cliff duration too short; use 0 for no cliff");
         }
 
         if cliff_seconds > vesting_seconds {
@@ -114,7 +170,20 @@ impl VestingContract {
         }
 
         let current_time = env.ledger().timestamp();
-        let schedule_start = if start == 0 { current_time } else { start };
+
+        // Validate caller-supplied start timestamp to prevent stale replays.
+        let schedule_start = if start == 0 {
+            current_time
+        } else {
+            // Reject start timestamps that are unreasonably far from now.
+            if start < current_time.saturating_sub(MAX_PAST_START_SECS) {
+                panic!("start timestamp too far in the past");
+            }
+            if start > current_time.saturating_add(MAX_PAST_START_SECS) {
+                panic!("start timestamp too far in the future");
+            }
+            start
+        };
 
         let schedule = VestingSchedule {
             beneficiary: beneficiary.clone(),
@@ -170,6 +239,12 @@ impl VestingContract {
     }
 
     /// Calculate the claimable amount for a given schedule.
+    ///
+    /// # Timestamp security
+    /// A tolerance window of `TIMESTAMP_TOLERANCE_SECS` is applied to the cliff
+    /// boundary check.  This means a validator that skews the clock forward by up
+    /// to `TIMESTAMP_TOLERANCE_SECS` cannot cause tokens to become claimable
+    /// before the cliff has genuinely elapsed.
     pub fn claimable_amount(env: Env, schedule_id: u32) -> i128 {
         let schedule: VestingSchedule = env
             .storage()
@@ -179,7 +254,10 @@ impl VestingContract {
 
         let current_time = env.ledger().timestamp();
 
-        if current_time < schedule.cliff_end {
+        // Apply tolerance: require current_time to exceed cliff_end by at least
+        // TIMESTAMP_TOLERANCE_SECS before any tokens become claimable.
+        // This absorbs forward clock drift from validators.
+        if current_time < schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS) {
             return 0;
         }
 
@@ -187,8 +265,10 @@ impl VestingContract {
             return schedule.total - schedule.claimed;
         }
 
-        // Linear vesting between cliff and end
-        let vested_period = current_time - schedule.cliff_end;
+        // Linear vesting between cliff + tolerance and end
+        // Adjust the vested period to account for the tolerance window
+        let effective_start = schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+        let vested_period = current_time.saturating_sub(effective_start);
         let total_period = schedule.vesting_end - schedule.cliff_end;
         let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
 
@@ -206,7 +286,24 @@ impl VestingContract {
 
         schedule.beneficiary.require_auth();
 
-        let claimable = Self::claimable_amount(env.clone(), schedule_id);
+        // Inline claimable calculation with single storage read and timestamp call
+        let current_time = env.ledger().timestamp();
+
+        // Apply tolerance: require current_time to exceed cliff_end by at least
+        // TIMESTAMP_TOLERANCE_SECS before any tokens become claimable.
+        let claimable = if current_time < schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS) {
+            0
+        } else if current_time >= schedule.vesting_end {
+            schedule.total - schedule.claimed
+        } else {
+            // Linear vesting between cliff + tolerance and end
+            // Adjust the vested period to account for the tolerance window
+            let effective_start = schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+            let vested_period = current_time.saturating_sub(effective_start);
+            let total_period = schedule.vesting_end - schedule.cliff_end;
+            let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
+            vested_amount - schedule.claimed
+        };
 
         if claimable <= 0 {
             panic!("Nothing to claim");
@@ -253,6 +350,12 @@ impl VestingContract {
     }
 
     /// Revoke a vesting schedule and return unvested tokens to treasury.
+    ///
+    /// # Timestamp security
+    /// The same tolerance window used in `claimable_amount` is applied here so
+    /// that the vested/unvested split at revocation time is consistent with what
+    /// the beneficiary would see.
+    ///
     /// Only admin can call this.
     pub fn revoke(env: Env, schedule_id: u32) {
         let admin: Address = env
@@ -269,18 +372,25 @@ impl VestingContract {
             .expect("Schedule not found");
 
         let current_time = env.ledger().timestamp();
-        let vested_amount = if current_time < schedule.cliff_end {
+
+        // Apply the same tolerance as claimable_amount for consistency.
+        let vested_amount = if current_time < schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS) {
             0
         } else if current_time >= schedule.vesting_end {
             schedule.total
         } else {
-            let vested_period = current_time - schedule.cliff_end;
-            let total_period = schedule.vesting_end - schedule.cliff_end;
-            (schedule.total * vested_period as i128) / total_period as i128
+            let effective_start = schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+            let vested_period = current_time.saturating_sub(effective_start);
+            let total_period = schedule.vesting_end.checked_sub(schedule.cliff_end).expect("Underflow");
+            schedule.total
+                .checked_mul(vested_period as i128)
+                .expect("Overflow")
+                .checked_div(total_period as i128)
+                .expect("Division error")
         };
 
-        let unvested_amount = schedule.total - vested_amount;
-        let refund_amount = vested_amount - schedule.claimed;
+        let unvested_amount = schedule.total.checked_sub(vested_amount).expect("Underflow");
+        let refund_amount = vested_amount.checked_sub(schedule.claimed).expect("Underflow");
 
         let token: Address = env
             .storage()
@@ -327,7 +437,7 @@ impl VestingContract {
             ScheduleRevokedEventData {
                 schedule_id,
                 beneficiary: schedule.beneficiary.clone(),
-                refunded_amount: refund_amount,
+                refunded_amount: unvested_amount,
             },
         );
     }
@@ -346,6 +456,111 @@ impl VestingContract {
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
             .expect("Schedule not found")
+    }
+
+    pub fn set_merkle_root(env: Env, merkle_root: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::MerkleRoot, &merkle_root);
+    }
+
+    pub fn claim_vesting_merkle(
+        env: Env,
+        beneficiary: Address,
+        total_amount: i128,
+        cliff_seconds: u64,
+        vesting_seconds: u64,
+        start: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> u32 {
+        beneficiary.require_auth();
+
+        let merkle_root: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRoot)
+            .expect("Merkle root not set");
+
+        // Compute leaf hash
+        let mut leaf_data = soroban_sdk::Bytes::new(&env);
+        leaf_data.append(&beneficiary.to_xdr(&env));
+        leaf_data.append(&total_amount.to_xdr(&env));
+        leaf_data.append(&cliff_seconds.to_xdr(&env));
+        leaf_data.append(&vesting_seconds.to_xdr(&env));
+        leaf_data.append(&start.to_xdr(&env));
+        let leaf = env.crypto().sha256(&leaf_data);
+
+        // Verify already claimed
+        if env.storage().persistent().has(&DataKey::ClaimedMerkleLeaf(leaf.clone())) {
+            panic!("Merkle leaf already claimed");
+        }
+
+        // Verify Merkle proof
+        let mut current = leaf.clone();
+        for node in proof.iter() {
+            let mut concat = soroban_sdk::Bytes::new(&env);
+            if current < node {
+                concat.append(&current.clone().into());
+                concat.append(&node.clone().into());
+            } else {
+                concat.append(&node.clone().into());
+                concat.append(&current.clone().into());
+            }
+            current = env.crypto().sha256(&concat);
+        }
+
+        if current != merkle_root {
+            panic!("Invalid Merkle proof");
+        }
+
+        // Mark as claimed
+        env.storage().persistent().set(&DataKey::ClaimedMerkleLeaf(leaf.clone()), &true);
+
+        // Internal call or logic to create schedule
+        let schedule_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextScheduleId)
+            .unwrap_or(0);
+
+        let next_id = schedule_id.checked_add(1).expect("Overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextScheduleId, &next_id);
+
+        let now = env.ledger().timestamp();
+        let actual_start = if start == 0 { now } else { start };
+        let cliff_end = actual_start.saturating_add(cliff_seconds);
+        let vesting_end = actual_start.saturating_add(vesting_seconds);
+
+        let schedule = VestingSchedule {
+            beneficiary: beneficiary.clone(),
+            total: total_amount,
+            claimed: 0,
+            cliff_end,
+            vesting_end,
+            start: actual_start,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+
+        let mut schedules: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BeneficiarySchedules(beneficiary.clone()))
+            .unwrap_or(Vec::new(&env));
+        schedules.push_back(schedule_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiarySchedules(beneficiary.clone()), &schedules);
+
+        schedule_id
     }
 }
 
@@ -416,12 +631,14 @@ mod test {
         let vesting_contract_id = create_vesting_contract(&env, token.clone(), admin.clone());
         let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
 
+        // Use durations that satisfy the minimum guards:
+        // cliff = 3600 (1 h == MIN_CLIFF_SECS), vesting = 86400 (1 day == MIN_VESTING_SECS)
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &3_600,  // cliff: 1 hour
+            &86_400, // vesting: 1 day
+            &0,      // start immediately
         );
 
         assert_eq!(schedule_id, 1);
@@ -435,6 +652,15 @@ mod test {
         assert_eq!(beneficiary_schedules.len(), 1);
         assert_eq!(beneficiary_schedules.get(0).unwrap(), schedule_id);
     }
+
+    // -----------------------------------------------------------------------
+    // Helpers: use durations that satisfy the new minimum constraints.
+    // MIN_CLIFF_SECS = 3600 (1 h), MIN_VESTING_SECS = 86400 (1 day).
+    // We use cliff = 3600 and vesting = 86400 throughout.
+    // -----------------------------------------------------------------------
+
+    const CLIFF: u64 = 3_600;   // 1 hour  (== MIN_CLIFF_SECS)
+    const VEST: u64 = 86_400;   // 1 day   (== MIN_VESTING_SECS)
 
     #[test]
     fn test_claimable_amount_cliff_not_reached() {
@@ -450,14 +676,49 @@ mod test {
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &CLIFF,
+            &VEST,
+            &0, // start immediately
         );
 
-        // Should be 0 before cliff
+        // Should be 0 before cliff + tolerance
         let claimable = vesting_client.claimable_amount(&schedule_id);
         assert_eq!(claimable, 0);
+    }
+
+    #[test]
+    fn test_claimable_amount_at_cliff_boundary_with_tolerance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        let schedule_id = vesting_client.create_schedule(
+            &beneficiary,
+            &1000,
+            &CLIFF,
+            &VEST,
+            &0,
+        );
+
+        // Advance to exactly cliff_end — still 0 because tolerance not yet passed.
+        env.ledger().set_timestamp(CLIFF);
+        let claimable = vesting_client.claimable_amount(&schedule_id);
+        assert_eq!(claimable, 0, "should be 0 at cliff_end before tolerance window");
+
+        // Advance to cliff_end + TIMESTAMP_TOLERANCE_SECS — now claimable.
+        env.ledger().set_timestamp(CLIFF + TIMESTAMP_TOLERANCE_SECS);
+        let claimable = vesting_client.claimable_amount(&schedule_id);
+        assert_eq!(claimable, 0, "should be 0 at exactly cliff_end + tolerance (boundary)");
+
+        // Advance further into vesting period — tokens should be vesting.
+        env.ledger().set_timestamp(CLIFF + TIMESTAMP_TOLERANCE_SECS + 1000);
+        let claimable = vesting_client.claimable_amount(&schedule_id);
+        assert!(claimable > 0, "should be > 0 well past cliff + tolerance");
     }
 
     #[test]
@@ -474,16 +735,20 @@ mod test {
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &CLIFF,
+            &VEST,
+            &0,
         );
 
-        // Advance time to 50% through vesting (after cliff)
-        env.ledger().set_timestamp(600); // 100 cliff + 500 vested
-
+        // Advance to 50% through the vesting window (after cliff + tolerance).
+        // cliff_end = CLIFF, vesting_end = CLIFF + VEST
+        // 50% point = CLIFF + VEST/2
+        env.ledger().set_timestamp(CLIFF + VEST / 2);
         let claimable = vesting_client.claimable_amount(&schedule_id);
-        assert_eq!(claimable, 500); // 50% of 1000
+        // vested_period = VEST/2 - TOLERANCE, total_period = VEST
+        // vested = 1000 * (VEST/2 - TOLERANCE) / VEST
+        let expected = (1000i128 * (VEST / 2 - TIMESTAMP_TOLERANCE_SECS) as i128) / VEST as i128;
+        assert_eq!(claimable, expected);
     }
 
     #[test]
@@ -500,13 +765,13 @@ mod test {
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &CLIFF,
+            &VEST,
+            &0,
         );
 
         // Advance time past vesting end
-        env.ledger().set_timestamp(2000);
+        env.ledger().set_timestamp(CLIFF + VEST + 1);
 
         let claimable = vesting_client.claimable_amount(&schedule_id);
         assert_eq!(claimable, 1000); // Full amount
@@ -530,20 +795,21 @@ mod test {
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &CLIFF,
+            &VEST,
+            &0,
         );
 
-        // Advance time past cliff
-        env.ledger().set_timestamp(600);
+        // Advance time to 50% through vesting (past cliff + tolerance)
+        env.ledger().set_timestamp(CLIFF + VEST / 2);
 
         // Claim tokens
         vesting_client.claim(&schedule_id);
 
         let schedule = vesting_client.get_schedule(&schedule_id);
-        assert_eq!(schedule.claimed, 500);
-        assert_eq!(token_client.balance(&beneficiary), 500);
+        let expected = (1000i128 * (VEST / 2 - TIMESTAMP_TOLERANCE_SECS) as i128) / VEST as i128;
+        assert_eq!(schedule.claimed, expected);
+        assert_eq!(token_client.balance(&beneficiary), expected);
     }
 
     #[test]
@@ -564,19 +830,21 @@ mod test {
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &CLIFF,
+            &VEST,
+            &0,
         );
 
         // Advance time to 50% through vesting
-        env.ledger().set_timestamp(600);
+        env.ledger().set_timestamp(CLIFF + VEST / 2);
 
         // Revoke schedule
         vesting_client.revoke(&schedule_id);
 
-        // Admin should receive unvested tokens (500)
-        assert_eq!(token_client.balance(&admin), 500);
+        // Admin should receive unvested tokens
+        let vested = (1000i128 * (VEST / 2 - TIMESTAMP_TOLERANCE_SECS) as i128) / VEST as i128;
+        let unvested = 1000 - vested;
+        assert_eq!(token_client.balance(&admin), unvested);
 
         // Beneficiary should no longer have schedules
         let beneficiary_schedules = vesting_client.get_schedules_by_beneficiary(&beneficiary);
@@ -598,13 +866,145 @@ mod test {
         let schedule_id = vesting_client.create_schedule(
             &beneficiary,
             &1000,
-            &100,  // cliff
-            &1000, // vesting
-            &0,    // start immediately
+            &CLIFF,
+            &VEST,
+            &0,
         );
 
-        // Try to claim before cliff
+        // Try to claim before cliff + tolerance
         vesting_client.claim(&schedule_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Timestamp manipulation / security tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "Vesting duration too short")]
+    fn test_create_schedule_vesting_too_short() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        // 1 hour vesting — below MIN_VESTING_SECS (1 day)
+        vesting_client.create_schedule(&beneficiary, &1000, &0, &3_600, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Vesting duration too long")]
+    fn test_create_schedule_vesting_too_long() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        // 11 years — above MAX_VESTING_SECS (10 years)
+        let eleven_years = 11u64 * 365 * 24 * 60 * 60;
+        vesting_client.create_schedule(&beneficiary, &1000, &0, &eleven_years, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cliff duration too short")]
+    fn test_create_schedule_cliff_too_short() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        // Cliff of 30 s — non-zero but below MIN_CLIFF_SECS (1 h)
+        vesting_client.create_schedule(&beneficiary, &1000, &30, &VEST, &0);
+    }
+
+    #[test]
+    fn test_create_schedule_zero_cliff_allowed() {
+        // Explicitly zero cliff is permitted (no cliff)
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        let id = vesting_client.create_schedule(&beneficiary, &1000, &0, &VEST, &0);
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "start timestamp too far in the past")]
+    fn test_create_schedule_stale_start_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        // start is 10 minutes in the past — exceeds MAX_PAST_START_SECS (5 min)
+        vesting_client.create_schedule(&beneficiary, &1000, &CLIFF, &VEST, &(10_000 - 600));
+    }
+
+    #[test]
+    #[should_panic(expected = "start timestamp too far in the future")]
+    fn test_create_schedule_future_start_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        // start is 10 minutes in the future — exceeds MAX_PAST_START_SECS (5 min)
+        vesting_client.create_schedule(&beneficiary, &1000, &CLIFF, &VEST, &(10_000 + 600));
+    }
+
+    /// Simulate a validator that skews the clock forward by TIMESTAMP_TOLERANCE_SECS.
+    /// Tokens must NOT become claimable before the cliff has genuinely elapsed.
+    #[test]
+    fn test_manipulated_timestamp_cannot_bypass_cliff() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token, admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        let schedule_id = vesting_client.create_schedule(
+            &beneficiary,
+            &1000,
+            &CLIFF,
+            &VEST,
+            &0,
+        );
+
+        // Validator skews clock forward by exactly TIMESTAMP_TOLERANCE_SECS.
+        // cliff_end = CLIFF; skewed time = CLIFF + TOLERANCE.
+        // claimable_amount requires current_time >= cliff_end + TOLERANCE,
+        // so at exactly cliff_end + TOLERANCE the result is still 0.
+        env.ledger().set_timestamp(CLIFF + TIMESTAMP_TOLERANCE_SECS);
+        let claimable = vesting_client.claimable_amount(&schedule_id);
+        assert_eq!(
+            claimable, 0,
+            "validator drift must not allow early cliff bypass"
+        );
     }
 
     // Mock token for testing

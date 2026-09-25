@@ -1,7 +1,13 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
+};
+
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_min_bond, key_cooldown_days,
+    DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +43,15 @@ pub struct BondRecord {
     pub slash_count: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashEvent {
+    pub amount: i128,
+    pub reason: Symbol,
+    pub timestamp: u64,
+    pub slash_count_at_time: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -46,7 +61,9 @@ const COOLDOWN_DAYS: u64 = 30;
 const COOLDOWN_SECONDS: u64 = COOLDOWN_DAYS * 86_400;
 
 // Slash amounts (with 7 decimals)
+#[allow(dead_code)]
 const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
+#[allow(dead_code)]
 const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 
 // ---------------------------------------------------------------------------
@@ -56,11 +73,26 @@ const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     MntToken,
     InsurancePool,
     Bond(Address),
+    SlashHistory(Address),
+    PerfectSessionsCount(Address),
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time fallbacks (used when governance hasn't acted)
+// ---------------------------------------------------------------------------
+const COOLDOWN_SECONDS_DEFAULT: u64 = (DEFAULT_COOLDOWN_DAYS as u64) * 86_400;
+
+// Slash amounts (with 7 decimals)
+#[allow(dead_code)]
+const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
+#[allow(dead_code)]
+const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -77,6 +109,7 @@ impl PerformanceBondContract {
         admin: Address,
         mnt_token: Address,
         insurance_pool: Address,
+        rbac_contract: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -86,7 +119,27 @@ impl PerformanceBondContract {
         env.storage()
             .instance()
             .set(&DataKey::InsurancePool, &insurance_pool);
+        init_protocol_params(&env, &rbac_contract);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol parameter registry
+    // -----------------------------------------------------------------------
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold `GOVERNANCE_ADMIN`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
     }
 
     /// Post a performance bond.
@@ -102,7 +155,8 @@ impl PerformanceBondContract {
             return Err(Error::InvalidAmount);
         }
 
-        if amount < MINIMUM_BOND {
+        let minimum_bond = get_param(&env, &key_min_bond(), DEFAULT_MIN_BOND);
+        if amount < minimum_bond {
             return Err(Error::BelowMinimum);
         }
 
@@ -204,6 +258,27 @@ impl PerformanceBondContract {
         record.last_slash_at = env.ledger().timestamp();
         record.slash_count += 1;
 
+        // Record slash event in SlashHistory (Issue #751)
+        let mut history: Vec<SlashEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashHistory(mentor.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        history.push_back(SlashEvent {
+            amount,
+            reason: reason.clone(),
+            timestamp: env.ledger().timestamp(),
+            slash_count_at_time: record.slash_count,
+        });
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashHistory(mentor.clone()), &history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerfectSessionsCount(mentor.clone()), &0u32);
+
         if record.amount == 0 {
             // Bond fully slashed - remove record
             env.storage()
@@ -227,6 +302,29 @@ impl PerformanceBondContract {
         Ok(())
     }
 
+    /// Query immutable slash history for a mentor (Issue #751).
+    pub fn get_slash_history(env: Env, mentor: Address) -> Vec<SlashEvent> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashHistory(mentor))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Record a perfect 5-star session for mentor recovery.
+    /// Completing 10 perfect sessions reduces effective slash penalty (Issue #751).
+    pub fn record_perfect_session(env: Env, mentor: Address) -> u32 {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerfectSessionsCount(mentor.clone()))
+            .unwrap_or(0);
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerfectSessionsCount(mentor), &new_count);
+        new_count
+    }
+
     /// Release a mentor's bond after cooldown period with no disputes.
     /// Mentor can withdraw their bond after 30 days with no slashes.
     ///
@@ -247,12 +345,14 @@ impl PerformanceBondContract {
         let now = env.ledger().timestamp();
 
         // Check cooldown period since last slash
-        if record.last_slash_at > 0 && now < record.last_slash_at + COOLDOWN_SECONDS {
+        let cooldown_secs = (get_param(&env, &key_cooldown_days(), DEFAULT_COOLDOWN_DAYS) as u64)
+            .saturating_mul(86_400);
+        if record.last_slash_at > 0 && now < record.last_slash_at + cooldown_secs {
             return Err(Error::StillInCooldown);
         }
 
         // Also check from posting time if no slashes
-        if record.last_slash_at == 0 && now < record.posted_at + COOLDOWN_SECONDS {
+        if record.last_slash_at == 0 && now < record.posted_at + cooldown_secs {
             return Err(Error::StillInCooldown);
         }
 
@@ -294,9 +394,7 @@ impl PerformanceBondContract {
     /// Check if a mentor is bonded (has active bond).
     /// Used by escrow to verify mentor can accept bookings.
     pub fn is_bonded(env: Env, mentor: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Bond(mentor))
+        env.storage().persistent().has(&DataKey::Bond(mentor))
     }
 }
 
@@ -371,9 +469,13 @@ mod test {
             let insurance_pool = Address::generate(&env);
             let mnt_id = env.register_contract(None, MockMNT);
 
-        let bond_id = env.register_contract(None, PerformanceBondContract);
-        PerformanceBondContractClient::new(&env, &bond_id)
-            .initialize(&admin, &mnt_id, &insurance_pool);
+            let bond_id = env.register_contract(None, PerformanceBondContract);
+            PerformanceBondContractClient::new(&env, &bond_id).initialize(
+                &admin,
+                &mnt_id,
+                &insurance_pool,
+                &admin,  // rbac_contract — use admin address in tests
+            );
 
             Fixture {
                 env,

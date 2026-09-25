@@ -1,0 +1,236 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MentorsMind Event Schema",
+  "description": "Standardized event schema for all MentorsMind Soroban contracts. Every event uses the 3-element topic tuple: (contract: Symbol, version: u32, event_type: Symbol).",
+  "schema_version": 1,
+  "topic_layout": {
+    "description": "All events must emit exactly 3 topics: [contract_name, schema_version, event_type]",
+    "contract": "Symbol — identifies the originating contract",
+    "version": "u32 — schema version (currently 1)",
+    "event_type": "Symbol — identifies the specific event within the contract"
+  },
+  "contracts": {
+    "escrow": {
+      "events": {
+        "created": { "description": "Escrow created for a mentoring session" },
+        "released": { "description": "Escrow funds released to mentor" },
+        "auto_released": { "description": "Escrow auto-released on timeout" },
+        "disputed": { "description": "Escrow disputed by a party" },
+        "resolved": { "description": "Dispute resolved" },
+        "refunded": { "description": "Escrow refunded to funder" },
+        "partial_rel": { "description": "Partial release from escrow" },
+        "admin_rel": { "description": "Admin-triggered release" },
+        "stuck_reported": { "description": "Stuck escrow reported" },
+        "emergency_release": { "description": "Emergency release executed" },
+        "tok_approved": { "description": "Token approved for escrow" },
+        "fee_distrib": { "description": "Fee distributed from escrow" }
+      }
+    },
+    "governance": {
+      "events": {
+        "prop_created": { "description": "New proposal created" },
+        "vote_cast": { "description": "Vote cast on proposal" },
+        "prop_passed": { "description": "Proposal passed quorum" },
+        "prop_failed": { "description": "Proposal failed" },
+        "prop_queued": { "description": "Proposal queued for timelock" },
+        "prop_executed": { "description": "Proposal executed" },
+        "prop_cancelled": { "description": "Proposal cancelled" },
+        "prop_cxl_cd": { "description": "Proposal cancelled with cooldown" },
+        "timelock_set": { "description": "Timelock period updated" },
+        "call_allowed": { "description": "Governance call authorized" },
+        "arb_registered": { "description": "Arbiter registered" },
+        "arb_unreg": { "description": "Arbiter unregistered" },
+        "appeal_sub": { "description": "Appeal submitted" },
+        "appeal_res": { "description": "Appeal resolved" },
+        "admin_prop": { "description": "Admin change proposed" },
+        "admin_acc": { "description": "Admin change accepted" },
+        "mkt_intervention": { "description": "Market intervention triggered" },
+        "coord_detected": { "description": "Coordination detected" },
+        "barrier_found": { "description": "Competition barrier found" }
+      }
+    },
+    "staking": {
+      "events": {
+        "staked": { "description": "Tokens staked" },
+        "unstaked": { "description": "Tokens unstaked" },
+        "admin_prop": { "description": "Admin change proposed" }
+      }
+    },
+    "timelock": {
+      "events": {
+        "initialized": { "description": "Timelock initialized" },
+        "scheduled": { "description": "Operation scheduled" },
+        "executed": { "description": "Operation executed" },
+        "cancelled": { "description": "Operation cancelled" },
+        "admin_xfr": { "description": "Admin transfer initiated" },
+        "em_cancel": { "description": "Emergency cancellation" },
+        "guard_set": { "description": "Guardian set" }
+      }
+    },
+    "bounty": {
+      "events": {
+        "posted": { "description": "New bounty posted" },
+        "claimed": { "description": "Bounty claimed by learner" },
+        "verified": { "description": "Bounty completion verified" },
+        "disputed": { "description": "Bounty claim disputed" },
+        "refunded": { "description": "Bounty refunded to poster" }
+      }
+    },
+    "allowance": {
+      "events": {
+        "authorized": { "description": "Payment allowance authorized" },
+        "payment_pull": { "description": "Payment pulled" },
+        "revoked": { "description": "Allowance revoked" }
+      }
+    },
+    "anomaly": {
+      "events": {
+        "hold_placed": { "description": "Anomaly hold placed" },
+        "detected": { "description": "Anomaly detected" },
+        "hold_cleared": { "description": "Anomaly hold cleared" }
+      }
+    },
+    "referral": {
+      "events": {
+        "registered": { "description": "Referral registered" },
+        "reward": { "description": "Referral reward distributed" },
+        "admin_prop": { "description": "Admin change proposed" }
+      }
+    },
+    "verify": {
+      "events": {
+        "verified": { "description": "Credential verified" },
+        "revoked": { "description": "Credential revoked" }
+      }
+    },
+    "vesting": {
+      "events": {
+        "sched_created": { "description": "Vesting schedule created" },
+        "claimed": { "description": "Vested tokens claimed" },
+        "revoked": { "description": "Vesting revoked" }
+      }
+    },
+    "multisig": {
+      "events": {
+        "proposed": { "description": "Multisig proposal created" },
+        "approved": { "description": "Proposal approved by signer" },
+        "executed": { "description": "Proposal executed" },
+        "cancelled": { "description": "Proposal cancelled" },
+        "signer_added": { "description": "Signer added" },
+        "signer_rmvd": { "description": "Signer removed" },
+        "threshold": { "description": "Threshold updated" }
+      }
+    },
+    "treasury": {
+      "events": {
+        "tok_approved": { "description": "Token approved for treasury" },
+        "tok_rejected": { "description": "Token rejected" },
+        "deposited": { "description": "Funds deposited" },
+        "allocated": { "description": "Funds allocated" },
+        "distributed": { "description": "Funds distributed" },
+        "admin_prop": { "description": "Admin change proposed" },
+        "admin_acc": { "description": "Admin change accepted" },
+        "burn_exec": { "description": "Token burn executed" },
+        "auth_added": { "description": "Authorized caller added" },
+        "pricing_coord": { "description": "Pricing coordination detected" },
+        "rg_resumed": { "description": "Rate guard resumed" },
+        "oplog": { "description": "Operation logged" },
+        "deposit_from": { "description": "Deposit from address" },
+        "alloc_exec": { "description": "Allocation executed" },
+        "sched_dist": { "description": "Scheduled distribution" },
+        "distrib_exec": { "description": "Distribution executed" },
+        "buyback_ok": { "description": "Buyback succeeded" },
+        "buyback_fail": { "description": "Buyback failed" }
+      }
+    },
+    "subscript": {
+      "events": {
+        "subscribed": { "description": "User subscribed" },
+        "expired": { "description": "Subscription expired" },
+        "renewed": { "description": "Subscription renewed" },
+        "cancelled": { "description": "Subscription cancelled" },
+        "paused": { "description": "Subscription paused" }
+      }
+    },
+    "streak": {
+      "events": {
+        "broken": { "description": "Streak broken" },
+        "updated": { "description": "Streak updated" },
+        "rewarded": { "description": "Streak reward distributed" }
+      }
+    },
+    "velocity": {
+      "events": {
+        "exceeded": { "description": "Velocity limit exceeded" },
+        "checked": { "description": "Velocity check performed" },
+        "daily_reset": { "description": "Daily velocity counter reset" }
+      }
+    },
+    "upgrade": {
+      "events": {
+        "proposed": { "description": "Upgrade proposed" },
+        "applied": { "description": "Upgrade applied" },
+        "signers_upd": { "description": "Signers list updated" },
+        "admin_upd": { "description": "Admin updated" },
+        "registered": { "description": "Contract registered" },
+        "sub_added": { "description": "Subscriber added" },
+        "sub_removed": { "description": "Subscriber removed" }
+      }
+    },
+    "trs_anlyt": {
+      "events": {
+        "fee_revenue": { "description": "Fee revenue recorded" },
+        "ref_payout": { "description": "Referral payout" },
+        "ins_reserve": { "description": "Insurance reserve" },
+        "metrics": { "description": "Analytics metrics" },
+        "report_gen": { "description": "Report generated" }
+      }
+    },
+    "sub_anlyt": {
+      "events": {
+        "metrics": { "description": "Subscription analytics metrics" },
+        "metrics_upd": { "description": "Metrics updated" }
+      }
+    },
+    "delegation": {
+      "events": {
+        "delegated": { "description": "Voting power delegated" },
+        "undelegated": { "description": "Delegation revoked" },
+        "suspended": { "description": "Delegation suspended" }
+      }
+    },
+    "esc_factory": {
+      "events": {
+        "admin_prop": { "description": "Admin change proposed" },
+        "admin_acc": { "description": "Admin change accepted" },
+        "deployed": { "description": "Escrow deployed" },
+        "impl_upg": { "description": "Implementation upgraded" },
+        "anom_warn": { "description": "Anomaly warning" }
+      }
+    },
+    "endorsmnt": {
+      "events": {
+        "endorsed": { "description": "Skill endorsed" },
+        "removed": { "description": "Endorsement removed" },
+        "re_endorsed": { "description": "Skill re-endorsed" }
+      }
+    },
+    "isa": {
+      "events": {
+        "created": { "description": "ISA created" },
+        "completed": { "description": "ISA completed" },
+        "earning_shared": { "description": "Income share payment" },
+        "payment_rec": { "description": "Payment recorded" },
+        "payment_missed": { "description": "Payment missed" },
+        "defaulted": { "description": "ISA defaulted" }
+      }
+    },
+    "rate_limit": {
+      "events": {
+        "exceeded": { "description": "Rate limit exceeded" },
+        "wl_added": { "description": "Address whitelisted" },
+        "wl_removed": { "description": "Address removed from whitelist" }
+      }
+    }
+  }
+}

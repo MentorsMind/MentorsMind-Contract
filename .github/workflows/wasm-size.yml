@@ -1,0 +1,326 @@
+name: WASM Size Regression Detection
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/**'
+      - '.github/workflows/wasm-size.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasm-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91'
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+
+      - name: Install tools
+        run: |
+          cargo install twiggy || true
+          sudo apt-get update && sudo apt-get install -y binaryen || true
+
+      - name: Build all contracts (release)
+        run: |
+          set -euo pipefail
+          mkdir -p wasm-sizes-new
+
+          for manifest in contracts/*/Cargo.toml; do
+            contract_dir="$(dirname "$manifest")"
+            contract_name="$(basename "$contract_dir")"
+            if [ "$contract_name" = "shared" ]; then
+              echo "Skipping shared library crate (not a deployable contract)"
+              continue
+            fi
+            package_name="$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -n1)"
+            wasm_name="${package_name//-/_}.wasm"
+
+            echo "Building $package_name from $manifest"
+            cargo build --manifest-path "$manifest" --release --target wasm32v1-none 2>&1 | tee "${contract_dir}/build.log"
+
+            wasm_file="target/wasm32v1-none/release/${wasm_name}"
+            if [ -f "$wasm_file" ]; then
+              cp "$wasm_file" "wasm-sizes-new/${contract_name}.wasm"
+            else
+              echo "Expected wasm not found: $wasm_file"
+            fi
+          done
+
+          ls -la wasm-sizes-new
+          compgen -G "wasm-sizes-new/*.wasm" > /dev/null || { echo "No wasm files were produced"; exit 1; }
+
+      - name: Optimize WASM files with wasm-opt
+        run: |
+          for wasm in wasm-sizes-new/*.wasm; do
+            echo "Optimizing $(basename $wasm)..."
+            wasm-opt -Oz -o "${wasm%.wasm}.opt.wasm" "$wasm" || true
+            # Use optimized version if successful, else keep original
+            if [ -f "${wasm%.wasm}.opt.wasm" ]; then
+              mv "${wasm%.wasm}.opt.wasm" "$wasm"
+            fi
+          done
+
+      - name: Generate current sizes JSON
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          from pathlib import Path
+
+          sizes = {}
+          for wasm in sorted(Path("wasm-sizes-new").glob("*.wasm")):
+              size = wasm.stat().st_size
+              contract_name = wasm.stem
+              sizes[contract_name] = {
+                  "size_bytes": size,
+                  "size_kb": round(size / 1024, 2)
+              }
+
+          with open("wasm-sizes-new.json", "w") as f:
+              json.dump(sizes, f, indent=2)
+
+          print(json.dumps(sizes, indent=2))
+          EOF
+
+      - name: Generate twiggy reports
+        run: |
+          set -euo pipefail
+          mkdir -p twiggy-reports
+          shopt -s nullglob
+          wasms=(wasm-sizes-new/*.wasm)
+
+          if [ ${#wasms[@]} -eq 0 ]; then
+            echo "No wasm files found for twiggy"
+            exit 1
+          fi
+
+          for wasm in "${wasms[@]}"; do
+            contract=$(basename "$wasm" .wasm)
+            echo "Analyzing $contract..."
+            twiggy top -n 10 "$wasm" > "twiggy-reports/${contract}.txt" 2>/dev/null || echo "Twiggy analysis skipped for $contract"
+          done
+
+      - name: Compare with baseline
+        id: size-check
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          from pathlib import Path
+
+          # Load new sizes
+          with open("wasm-sizes-new.json") as f:
+              new_sizes = json.load(f)
+
+          # Load baseline sizes (from repo)
+          baseline_file = "wasm-sizes.json"
+          baseline_sizes = {}
+          if os.path.exists(baseline_file):
+              with open(baseline_file) as f:
+                  baseline_sizes = json.load(f)
+
+          regressions = []
+          improvements = []
+          new_contracts = []
+
+          for contract, new_data in new_sizes.items():
+              new_size = new_data["size_bytes"]
+
+              if contract not in baseline_sizes:
+                  new_contracts.append((contract, new_size))
+              else:
+                  old_size = baseline_sizes[contract]["size_bytes"]
+                  delta = new_size - old_size
+                  delta_pct = (delta / old_size * 100) if old_size > 0 else 0
+
+                  # Check for regressions (>5% growth)
+                  if delta > 0 and delta_pct > 5:
+                      regressions.append({
+                          "contract": contract,
+                          "old_size": old_size,
+                          "new_size": new_size,
+                          "delta": delta,
+                          "delta_pct": delta_pct
+                      })
+                  elif delta < 0:
+                      improvements.append({
+                          "contract": contract,
+                          "old_size": old_size,
+                          "new_size": new_size,
+                          "delta": delta,
+                          "delta_pct": delta_pct
+                      })
+
+          # Check for hard limit (64KB)
+          hard_limit_violations = []
+          for contract, data in new_sizes.items():
+              if data["size_bytes"] > 65536:  # 64KB
+                  hard_limit_violations.append({
+                      "contract": contract,
+                      "size": data["size_bytes"],
+                      "size_kb": data["size_kb"]
+                  })
+
+          # Write results
+          results = {
+              "passed": len(regressions) == 0 and len(hard_limit_violations) == 0,
+              "regressions": regressions,
+              "improvements": improvements,
+              "new_contracts": new_contracts,
+              "hard_limit_violations": hard_limit_violations,
+              "total_changed": len(new_sizes)
+          }
+
+          with open("size-check-results.json", "w") as f:
+              json.dump(results, f, indent=2)
+
+          # Output for GitHub
+          print(f"REGRESSIONS={len(regressions)}")
+          print(f"VIOLATIONS={len(hard_limit_violations)}")
+          print(f"IMPROVEMENTS={len(improvements)}")
+          print(f"NEW_CONTRACTS={len(new_contracts)}")
+
+          # Set output
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"regressions={len(regressions)}\n")
+              f.write(f"violations={len(hard_limit_violations)}\n")
+              f.write(f"improvements={len(improvements)}\n")
+
+          exit(0 if results["passed"] else 1)
+          EOF
+
+      - name: Post PR comment with size diff
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultsFile = 'size-check-results.json';
+            if (!fs.existsSync(resultsFile)) {
+              console.log('No results file found');
+              return;
+            }
+
+            const results = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
+            const newSizes = JSON.parse(fs.readFileSync('wasm-sizes-new.json', 'utf8'));
+
+            let comment = `## 📦 WASM Size Analysis\n\n`;
+
+            // Summary
+            const passed = results.passed ? '✅ PASSED' : '❌ FAILED';
+            comment += `**Status:** ${passed}\n\n`;
+
+            // Hard limit violations
+            if (results.hard_limit_violations.length > 0) {
+              comment += `### ❌ Hard Limit Violations (>64KB)\n\n`;
+              comment += `| Contract | Size |\n|----------|------|\n`;
+              for (const v of results.hard_limit_violations) {
+                comment += `| ${v.contract} | ${v.size_kb} KB |\n`;
+              }
+              comment += `\n`;
+            }
+
+            // Regressions
+            if (results.regressions.length > 0) {
+              comment += `### ⚠️ Size Regressions (>5% growth)\n\n`;
+              comment += `| Contract | Old | New | Delta | % |\n`;
+              comment += `|----------|-----|-----|-------|---|\n`;
+              for (const r of results.regressions) {
+                const kb_old = (r.old_size / 1024).toFixed(2);
+                const kb_new = (r.new_size / 1024).toFixed(2);
+                const kb_delta = (r.delta / 1024).toFixed(2);
+                comment += `| ${r.contract} | ${kb_old} KB | ${kb_new} KB | +${kb_delta} KB | +${r.delta_pct.toFixed(1)}% |\n`;
+              }
+              comment += `\n`;
+            }
+
+            // Improvements
+            if (results.improvements.length > 0) {
+              comment += `### ✅ Size Improvements\n\n`;
+              comment += `| Contract | Old | New | Delta |\n`;
+              comment += `|----------|-----|-----|-------|\n`;
+              for (const i of results.improvements) {
+                const kb_old = (i.old_size / 1024).toFixed(2);
+                const kb_new = (i.new_size / 1024).toFixed(2);
+                const kb_delta = (Math.abs(i.delta) / 1024).toFixed(2);
+                comment += `| ${i.contract} | ${kb_old} KB | ${kb_new} KB | -${kb_delta} KB |\n`;
+              }
+              comment += `\n`;
+            }
+
+            // New contracts
+            if (results.new_contracts.length > 0) {
+              comment += `### 🆕 New Contracts\n\n`;
+              comment += `| Contract | Size |\n|----------|------|\n`;
+              for (const [name, size] of results.new_contracts) {
+                const kb = (size / 1024).toFixed(2);
+                comment += `| ${name} | ${kb} KB |\n`;
+              }
+              comment += `\n`;
+            }
+
+            // Summary stats
+            comment += `### 📊 Summary\n\n`;
+            comment += `- Total contracts analyzed: ${results.total_changed}\n`;
+            comment += `- Size regressions: ${results.regressions.length}\n`;
+            comment += `- Hard limit violations: ${results.hard_limit_violations.length}\n`;
+            comment += `- Size improvements: ${results.improvements.length}\n`;
+            comment += `- New contracts: ${results.new_contracts.length}\n`;
+
+            // Post comment
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Save sizes to JSON file
+        if: success()
+        run: |
+          cp wasm-sizes-new.json wasm-sizes.json
+
+      - name: Upload size artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-analysis
+          path: |
+            wasm-sizes-new.json
+            size-check-results.json
+            twiggy-reports/
+          retention-days: 30
+
+      - name: Fail on regressions or violations
+        run: |
+          python3 << 'EOF'
+          import json
+
+          with open('size-check-results.json') as f:
+              results = json.load(f)
+
+          if not results['passed']:
+              print("❌ WASM size check failed!")
+              if results['hard_limit_violations']:
+                  print(f"  - {len(results['hard_limit_violations'])} contract(s) exceed 64KB hard limit")
+              if results['regressions']:
+                  print(f"  - {len(results['regressions'])} contract(s) have >5% size regression")
+              exit(1)
+          else:
+              print("✅ WASM size check passed!")
+          EOF

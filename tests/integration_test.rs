@@ -69,7 +69,7 @@ impl<'a> Fixture<'a> {
         let escrow = EscrowContractClient::new(env, &escrow_id);
         let mut approved = Vec::new(env);
         approved.push_back(token.clone());
-        escrow.initialize(&admin, &treasury, &fee_bps, &approved, &0u64);
+        escrow.initialize(&admin, &treasury, &fee_bps, &approved, &0u64, &None);
 
         // --- Verification (reputation / staking proxy) ---
         let verif_id = env.register_contract(None, VerificationContract);
@@ -245,11 +245,11 @@ fn test_referral_reward_after_first_session() {
         "first session: 5% fee"
     );
 
-    // Admin applies referral discount (0% fee) for subsequent sessions
-    f.escrow.update_fee(&0u32);
-    assert_eq!(f.escrow.get_fee_bps(), 0);
+    // Admin applies referral discount to minimum allowed fee floor.
+    f.escrow.update_fee(&25u32);
+    assert_eq!(f.escrow.get_fee_bps(), 25);
 
-    // Second session — referral: 0% fee, full amount to mentor
+    // Second session — referral: minimum fee floor applies.
     let eid2 = f.create_escrow(10_000);
     let mentor_before = token.balance(&f.mentor);
     let treasury_after_first = token.balance(&f.treasury);
@@ -258,18 +258,18 @@ fn test_referral_reward_after_first_session() {
 
     assert_eq!(
         token.balance(&f.mentor),
-        mentor_before + 10_000,
-        "referral session: no fee"
+        mentor_before + 9_975,
+        "referral session: minimum fee floor"
     );
     assert_eq!(
         token.balance(&f.treasury),
-        treasury_after_first,
-        "treasury must not grow on referral session"
+        treasury_after_first + 25,
+        "treasury grows by the floor fee on referral session"
     );
 
     let e2 = f.escrow.get_escrow(&eid2);
-    assert_eq!(e2.platform_fee, 0);
-    assert_eq!(e2.net_amount, 10_000);
+    assert_eq!(e2.platform_fee, 25);
+    assert_eq!(e2.net_amount, 9_975);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,14 +411,14 @@ fn test_staking_tier_verified_vs_unverified() {
     let gold_escrow = EscrowContractClient::new(&env, &gold_id);
     let mut approved = Vec::new(&env);
     approved.push_back(token.clone());
-    gold_escrow.initialize(&admin, &treasury, &300u32, &approved, &0u64);
+    gold_escrow.initialize(&admin, &treasury, &300u32, &approved, &0u64, &None);
 
     // Standard escrow (500 bps)
     let std_id = env.register_contract(None, EscrowContract);
     let std_escrow = EscrowContractClient::new(&env, &std_id);
     let mut approved2 = Vec::new(&env);
     approved2.push_back(token.clone());
-    std_escrow.initialize(&admin, &treasury, &500u32, &approved2, &0u64);
+    std_escrow.initialize(&admin, &treasury, &500u32, &approved2, &0u64, &None);
 
     let now = env.ledger().timestamp();
     let tok = TokenClient::new(&env, &token);

@@ -1,25 +1,53 @@
 [workspace]
 resolver = "2"
 members = [
-    "escrow",
+    "contracts/admin_rotation_coordinator",
     "contracts/allowance",
+    "contracts/anomaly_detector",
+    "contracts/badges",
     "contracts/bounty",
+    "contracts/bridge_receiver",
+    "contracts/certificates",
+    "contracts/cert_showcase",
+    "contracts/collateral_loan",
+    "contracts/credit_score",
+    "contracts/delegated_staking_proxy",
+    "contracts/delegation",
+    "contracts/dispute_evidence",
+    "contracts/endorsements",
+    "escrow",
+    "contracts/escrow_factory",
+    "contracts/forum",
+    "contracts/governance",
+    "contracts/grants",
+    "contracts/health_dashboard",
+    "contracts/insurance",
     "contracts/interface_registry",
+    "contracts/invariants",
+    "contracts/isa",
+    "contracts/kyc_registry",
+    "contracts/lending_pool",
+    "contracts/mnt-token",
+    "contracts/shared",
     "contracts/verification",
-    "contracts/oracle",
-    "contracts/payment_router",
+    "contracts/session_registry",
     "contracts/referral",
+    "contracts/referral_leaderboard",
+    "contracts/regulatory_reporting",
+    "contracts/rent_fund",
+    "contracts/reputation",
+    "contracts/sanctions",
     "contracts/session_nft",
+    "contracts/session_oracle",
+    "contracts/snapshot",
     "contracts/staking",
+    "contracts/streak_rewards",
+    "contracts/subscription",
     "contracts/subscription_analytics",
     "contracts/timelock",
     "contracts/treasury",
-    "contracts/verification",
-    "contracts/vesting",
-    "contracts/payment_router",
-    "contracts/streak_rewards",
-    "contracts/shared",
-    "contracts/proposal_templates",
+    "contracts/treasury_analytics",
+    "formal_verification",
     "contracts/upgrade_registry",
     "contracts/rate_limiter",
     "contracts/performance_bond",
@@ -31,11 +59,10 @@ members = [
     "contracts/collateral_loan",
     "contracts/delegation",
     "contracts/velocity_limits",
-    "contracts/endorsements",
-    "contracts/prediction_market",
+    "contracts/vesting",
+    "benchmarks",
     "tests",
-
-    "contracts/isa",
+    "tools",
 ]
 
 [workspace.package]
@@ -44,8 +71,20 @@ edition = "2021"
 rust-version = "1.70"
 
 [workspace.dependencies]
-soroban-sdk = "21.0.0"
-soroban-token-sdk = "21.0.0"
+soroban-sdk = "25.3.0"
+soroban-token-sdk = "25.3.0"
+
+# Explicit dependency versions to avoid conflicts and edition2024 issues
+ed25519-dalek = "2.2.0"  # Updated to match what soroban expects
+rand_core = "0.6.4"
+crypto-common = "0.1.6"  # Pin to version that doesn't require edition2024
+base64ct = "1.8.2"       # Pin to version compatible with Rust 1.89
+block-buffer = "0.12.0"  # Pin to older version 
+cpufeatures = "0.2.14"   # Pin to older version
+digest = "0.11.2"        # Pin to older version
+hashbrown = "0.14.5"     # Pin to older version
+indexmap = "2.12.0"      # Pin to older version
+zeroize = "1.8.1"        # Pin to older version
 
 [profile.release]
 opt-level = "z"

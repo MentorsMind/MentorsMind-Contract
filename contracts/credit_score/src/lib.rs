@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec,
+    contract, contractevent, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,21 +68,38 @@ pub struct ScoreBreakdown {
 
 #[contracttype]
 pub enum DataKey {
-    Admin,              // Persistent: critical config
-    EscrowContract,     // Persistent: external dependency
-    StakingContract,    // Persistent: external dependency
-    UserScore(Address), // Persistent: long-term user data
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
+    Admin,                  // Persistent: critical config
+    EscrowContract,         // Persistent: external dependency
+    StakingContract,        // Persistent: external dependency
+    UserScore(Address),     // Persistent: long-term user data
     UserBreakdown(Address), // Persistent: long-term user data
-    LastUpdate(Address), // Temporary: rate limiting, auto-expires
+    LastUpdate(Address),    // Temporary: rate limiting, auto-expires
 }
 
 const MIN_SCORE: u32 = 300;
 const MAX_SCORE: u32 = 850;
 const DAY_SECONDS: u64 = 86_400;
+const DAY_SECONDS_TTL: u32 = 86_400;
 
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
+
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct ScoreUpdatedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    #[topic]
+    user: Address,
+    score: u32,
+}
 
 #[contract]
 pub struct CreditScoreContract;
@@ -146,15 +163,17 @@ impl CreditScoreContract {
         );
         // Extend TTL for temporary storage (1 day)
         env.storage().temporary().extend_ttl(
-            &DataKey::LastUpdate(user),
-            DAY_SECONDS,
-            DAY_SECONDS,
+            &DataKey::LastUpdate(user.clone()),
+            DAY_SECONDS_TTL,
+            DAY_SECONDS_TTL,
         );
 
-        env.events().publish(
-            (symbol_short!("score"), symbol_short!("updated"), user),
-            (score,),
-        );
+        ScoreUpdatedEvent {
+            category: symbol_short!("score"),
+            action: symbol_short!("updated"),
+            user,
+            score,
+        }.publish(env);
     }
 
     pub fn compute_score(env: Env, user: Address) -> u32 {

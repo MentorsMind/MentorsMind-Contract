@@ -25,6 +25,8 @@ pub struct Transaction {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Signer(Address),     // Value: bool
     SignerCount,         // Value: u32

@@ -1,0 +1,257 @@
+name: Soroban Benchmarks
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'escrow/**'
+      - 'contracts/staking/**'
+      - 'contracts/governance/**'
+      - 'contracts/timelock/**'
+      - 'contracts/upgrade_registry/**'
+      - 'contracts/dispute_evidence/**'
+      - 'contracts/shared/**'
+      - 'benchmarks/**'
+      - '.github/workflows/benchmarks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'escrow/**'
+      - 'contracts/staking/**'
+      - 'contracts/governance/**'
+      - 'contracts/timelock/**'
+      - 'contracts/upgrade_registry/**'
+      - 'contracts/dispute_evidence/**'
+      - 'contracts/shared/**'
+      - 'benchmarks/**'
+  # Nightly scheduled run on main to catch drift over time.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: 'Write results as new baseline (overrides baselines.json)'
+        required: false
+        default: 'false'
+      run_optimization_validation:
+        description: 'Run optimization validation tests'
+        required: false
+        default: 'false'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+# Add permissions for GitHub token
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Allow the job to push history commits back to the repo on main/schedule.
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can commit history records back.
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91'
+          targets: wasm32v1-none
+
+      - name: Add wasm32v1-none target
+        run: rustup target add wasm32v1-none
+
+      # Layered caching: registry index, downloaded crates, compiled artifacts.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-reg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-reg-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('benchmarks/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-build-bench-
+
+      # Build WASM binaries first so wasm_bytes metrics are populated.
+      - name: Build WASM binaries (release)
+        run: |
+          cargo build \
+            --target wasm32v1-none \
+            --release \
+            -p mentorminds-escrow \
+            -p mentorminds-staking \
+            -p mentorminds-governance \
+            -p mentorminds-timelock \
+            -p mentorminds-upgrade-registry \
+            -p mentorminds-dispute-evidence
+
+      # Expose run metadata to the benchmark binary via env vars.
+      - name: Set benchmark environment
+        run: |
+          echo "BENCH_DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "GITHUB_SHA=${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "GITHUB_REF_NAME=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      # Run the benchmark binary; exits 1 on >10% regression.
+      - name: Run benchmarks
+        id: bench
+        run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
+
+      # Validate optimization targets are met (15% improvement)
+      - name: Validate optimization targets
+        if: github.event.inputs.run_optimization_validation == 'true'
+        id: validation
+        run: |
+          echo "Running optimization validation..."
+          if [ -f "benchmarks/baselines_before_optimization.json" ]; then
+            echo "validation_completed=true" >> $GITHUB_OUTPUT
+            echo "validation_passed=false" >> $GITHUB_OUTPUT
+            echo "Optimization validation: baselines_before_optimization.json found but validation script not implemented"
+          else
+            echo "No pre-optimization baselines found, skipping validation"
+            echo "validation_completed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # On workflow_dispatch with update_baseline=true, commit the new baseline
+      - name: Update baseline (manual trigger only)
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.update_baseline == 'true'
+        run: |
+          cp benchmarks/results/report.json benchmarks/baselines.json
+          echo "Baseline updated from latest run."
+
+      - name: Commit updated baseline
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.update_baseline == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(bench): update performance baselines'
+          file_pattern: benchmarks/baselines.json
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
+
+      # Always upload reports so they're accessible from the Actions summary.
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report-${{ github.sha }}
+          path: |
+            benchmarks/results/report.json
+            benchmarks/results/report.html
+            benchmarks/results/bench.log
+            optimization_results.txt
+            performance_comparison_report.md
+            gas_optimization_analysis.md
+          retention-days: 90
+
+      # Post (or update) a summary table comment on the PR.
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const reportPath = 'benchmarks/results/report.json';
+            
+            if (!fs.existsSync(reportPath)) {
+              console.log('No report.json found — skipping comment');
+              return;
+            }
+
+            try {
+              const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const passed = '${{ steps.bench.outcome }}' === 'success';
+              const icon = passed ? '✅' : '❌';
+
+              // Build markdown table
+              let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | Storage R/W | WASM Size |\n';
+              table    += '|----------|-------------|-----------------|---------------|-------------|----------|\n';
+
+              let prevContract = '';
+              for (const r of results) {
+                const sep = r.contract !== prevContract ? `**${r.contract}**` : '';
+                prevContract = r.contract;
+                const wasm = r.wasm_bytes > 0
+                  ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
+                  : 'N/A';
+                const storage = `${r.storage_reads || 0}R/${r.storage_writes || 0}W`;
+                table += `| ${sep} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${storage} | ${wasm} |\n`;
+              }
+
+              // Add optimization status if validation was run
+              let optimizationStatus = '';
+              const validationCompleted = '${{ steps.validation.outputs.validation_completed }}' === 'true';
+              const validationPassed = '${{ steps.validation.outputs.validation_passed }}' === 'true';
+              
+              if (validationCompleted) {
+                const validationIcon = validationPassed ? '🚀' : '⚠️';
+                const validationText = validationPassed ? 'Optimization targets exceeded (>15%)' : 'Optimization targets not met';
+                optimizationStatus = `\n\n### ${validationIcon} Gas Optimization Status\n${validationText}`;
+              }
+
+              const body = `## ${icon} Soroban Benchmark Results
+
+              ${table}
+
+              > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+              > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})${optimizationStatus}
+
+              **📊 Coverage:** ${results.length} functions across ${[...new Set(results.map(r => r.contract))].length} contracts`;
+
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+
+              const existing = comments.find(c =>
+                c.user.type === 'Bot' && c.body.includes('Soroban Benchmark Results')
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (error) {
+              console.error('Failed to create PR comment:', error.message);
+              // Don't fail the workflow if comment creation fails
+            }

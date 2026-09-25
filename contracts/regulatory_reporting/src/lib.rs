@@ -7,6 +7,16 @@ const LARGE_TX_THRESHOLD: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReportTrigger {
+    pub contract: Symbol,
+    pub function: Symbol,
+    pub address: Address,
+    pub amount_usd: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TxRecord {
     pub sender: Address,
     pub receiver: Address,
@@ -21,10 +31,18 @@ pub struct TxRecord {
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     EscrowContract,
     /// All records for a user (sender or receiver): Vec<TxRecord>
     UserRecords(Address),
+    /// Large transaction reports counter
+    ReportCount,
+    /// Report storage: ReportCount -> ReportTrigger
+    Report(u32),
+    /// Reviewed flag: report_id -> bool
+    Reviewed(u32),
 }
 
 #[contract]
@@ -41,6 +59,7 @@ impl RegulatoryReporting {
             .storage()
             .persistent()
             .set(&DataKey::EscrowContract, &escrow_contract);
+        env.storage().persistent().set(&DataKey::ReportCount, &0u32);
     }
 
     /// Called only by the escrow contract to record a transaction.
@@ -137,6 +156,77 @@ impl RegulatoryReporting {
             .expect("not initialized");
         admin.require_auth();
         load_records(&env, &user)
+    }
+
+    /// Record a large transaction trigger for compliance reporting.
+    pub fn record_large_tx(env: Env, trigger: ReportTrigger) {
+        // Only callable by authorized contracts (e.g., treasury, lending_pool)
+        // For now, any contract can call - could add whitelist if needed
+        
+        if trigger.amount_usd <= LARGE_TX_THRESHOLD {
+            return; // Below threshold, no report needed
+        }
+
+        let mut count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReportCount)
+            .unwrap_or(0);
+        count += 1;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Report(count), &trigger);
+        env.storage().persistent().set(&DataKey::ReportCount, &count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reviewed(count), &false);
+
+        env.events().publish(
+            (symbol_short!("lg_tx"), count),
+            (trigger.address, trigger.amount_usd),
+        );
+    }
+
+    /// Get pending reports with pagination.
+    pub fn get_pending_reports(env: Env, offset: u32, limit: u32) -> Vec<ReportTrigger> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReportCount)
+            .unwrap_or(0);
+        let mut result = vec![&env];
+
+        let end = (offset + limit).min(total);
+        for i in (offset + 1)..=end {
+            let reviewed: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Reviewed(i))
+                .unwrap_or(false);
+            if !reviewed {
+                if let Some(report) = env.storage().persistent().get::<_, ReportTrigger>(&DataKey::Report(i)) {
+                    result.push_back(report);
+                }
+            }
+        }
+        result
+    }
+
+    /// Mark a report as reviewed (admin only).
+    pub fn mark_reviewed(env: Env, report_id: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reviewed(report_id), &true);
+
+        env.events().publish((symbol_short!("reviewed"), report_id), report_id);
     }
 }
 

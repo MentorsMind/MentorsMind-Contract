@@ -1,0 +1,49 @@
+[package]
+name = "mentorminds-benchmarks"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[dependencies.soroban-sdk]
+workspace = true
+features = ["testutils"]
+
+# Contract crates pulled in with testutils feature so we get generated clients
+[dependencies.mentorminds-escrow]
+path = "../escrow"
+features = ["testutils"]
+
+[dependencies.mentorminds-staking]
+path = "../contracts/staking"
+features = ["testutils"]
+
+[dependencies.mentorminds-governance]
+path = "../contracts/governance"
+features = ["testutils"]
+
+[dependencies.mentorminds-timelock]
+path = "../contracts/timelock"
+features = ["testutils"]
+
+[dependencies.mentorminds-upgrade-registry]
+path = "../contracts/upgrade_registry"
+features = ["testutils"]
+
+[dependencies.mentorminds-dispute-evidence]
+path = "../contracts/dispute_evidence"
+features = ["testutils"]
+
+[dependencies.shared]
+path = "../contracts/shared"
+features = ["testutils"]

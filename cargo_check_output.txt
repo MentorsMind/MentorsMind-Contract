@@ -1,0 +1,1011 @@
+﻿cargo : warning: profiles for the non root package will be ignored, specify 
+profiles at the workspace root:
+At line:1 char:5
++ & { cargo check -p shared -p mentorminds-staking -p mentorminds-treas ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: profil...workspace root: 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+package:   C:\Users\HP\Desktop\MentorsMind-Contract\contracts\grants\Cargo.toml
+workspace: C:\Users\HP\Desktop\MentorsMind-Contract\Cargo.toml
+    Checking shared v0.1.0 
+(C:\Users\HP\Desktop\MentorsMind-Contract\contracts\shared)
+    Checking mentorminds-staking v0.1.0 
+(C:\Users\HP\Desktop\MentorsMind-Contract\contracts\staking)
+    Checking mentorminds-treasury v0.1.0 
+(C:\Users\HP\Desktop\MentorsMind-Contract\contracts\treasury)
+error[E0428]: the name `__SPEC_XDR_TYPE_DEXINTERFACE` is defined multiple times
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+ 64 | #[contracttype]
+    | --------------- previous definition of the value 
+`__SPEC_XDR_TYPE_DEXINTERFACE` here
+...
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ `__SPEC_XDR_TYPE_DEXINTERFACE` redefined here
+    |
+    = note: `__SPEC_XDR_TYPE_DEXINTERFACE` must be defined only once in the 
+value namespace of this module
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0428]: the name `DexInterface` is defined multiple times
+   --> contracts\treasury\src\lib.rs:129:1
+    |
+ 66 | pub struct DexInterface {
+    | ----------------------- previous definition of the type `DexInterface` 
+here
+...
+129 | pub struct DexInterface {
+    | ^^^^^^^^^^^^^^^^^^^^^^^ `DexInterface` redefined here
+    |
+    = note: `DexInterface` must be defined only once in the type namespace of 
+this module
+
+error: the `#[test]` attribute may only be used on a free function
+    --> contracts\treasury\src\lib.rs:1693:5
+     |
+1693 |     #[test]
+     |     ^^^^^^^ the `#[test]` macro causes a function to be run as a test 
+and has no effect on non-functions
+     |
+help: replace with conditional compilation to make the item only exist when 
+tests are being run
+     |
+1693 -     #[test]
+1693 +     #[cfg(test)]
+     |
+
+error: contract function name is too long: 34, max is 32
+    --> contracts\treasury\src\lib.rs:1073:12
+     |
+1073 |     pub fn set_require_scheduled_distribution(
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: contract function name is too long: 34, max is 32
+   --> contracts\staking\src\lib.rs:745:12
+    |
+745 |     pub fn set_next_scheduled_distribution_at(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0425]: cannot find value `MockMNT` in this scope
+    --> contracts\treasury\src\lib.rs:1701:52
+     |
+1701 |         let mnt_addr = env.register_contract(None, MockMNT);
+     |                                                    ^^^^^^^ not found in 
+this scope
+
+error[E0425]: cannot find value `MockDEX` in this scope
+    --> contracts\treasury\src\lib.rs:1702:52
+     |
+1702 |         let dex_addr = env.register_contract(None, MockDEX);
+     |                                                    ^^^^^^^ not found in 
+this scope
+
+error[E0425]: cannot find value `MockOracleCircuitBreaker` in this scope
+    --> contracts\treasury\src\lib.rs:1703:55
+     |
+1703 |         let oracle_addr = env.register_contract(None, 
+MockOracleCircuitBreaker);
+     |                                                       
+^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+warning: unused imports: `BASIS_POINTS`, `MIN_STAKING_DURATION_SECS`, 
+`REWARD_LOCKUP_SECS`, and `SuspiciousPatternFlag`
+ --> contracts\treasury\src\lib.rs:6:5
+  |
+6 |     MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, BASIS_POINTS, 
+SuspiciousPatternFlag,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^  
+^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `AtomicBatch`, `BASIS_POINTS`, `BatchOp`, 
+`EARLY_UNSTAKE_PENALTY_MAX_BPS`, `EARLY_UNSTAKE_PENALTY_MIN_BPS`, 
+`MAX_SCALING_DURATION_SECS`, `REWARD_MULTIPLIER_MAX_BPS`, 
+`SUSPICIOUS_CYCLE_THRESHOLD_SECS`, `StakingSnapshot`, and 
+`validate_caller_is_authorized`
+  --> contracts\staking\src\lib.rs:5:64
+   |
+ 5 |     compute_checksum, push_snapshot_index, require_not_paused, 
+AtomicBatch, BatchOp,
+   |                                                                
+^^^^^^^^^^^  ^^^^^^^
+...
+ 8 |     validate_amount_limits, validate_caller_is_authorized,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 9 |     StakingSnapshot, RewardLockup, PenaltyCalculation, 
+SuspiciousPatternFlag, StakingActionRecord,
+   |     ^^^^^^^^^^^^^^^
+...
+12 |     MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, 
+MAX_SCALING_DURATION_SECS,
+   |                                                    
+^^^^^^^^^^^^^^^^^^^^^^^^^
+13 |     REWARD_MULTIPLIER_MIN_BPS, REWARD_MULTIPLIER_MAX_BPS,
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^
+14 |     EARLY_UNSTAKE_PENALTY_MIN_BPS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+15 |     BASIS_POINTS, PATTERN_DETECTION_WINDOW, 
+SUSPICIOUS_CYCLE_THRESHOLD_SECS,
+   |     ^^^^^^^^^^^^                            
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0119]: conflicting implementations of trait `Clone` for type 
+`DexInterface`
+   --> contracts\treasury\src\lib.rs:128:10
+    |
+ 65 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |          ----- first implementation here
+...
+128 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |          ^^^^^ conflicting implementation for `DexInterface`
+
+error[E0119]: conflicting implementations of trait `Debug` for type 
+`DexInterface`
+   --> contracts\treasury\src\lib.rs:128:17
+    |
+ 65 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                 ----- first implementation here
+...
+128 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                 ^^^^^ conflicting implementation for `DexInterface`
+
+error[E0119]: conflicting implementations of trait `core::cmp::Eq` for type 
+`DexInterface`
+   --> contracts\treasury\src\lib.rs:128:24
+    |
+ 65 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                        -- first implementation here
+...
+128 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                        ^^ conflicting implementation for `DexInterface`
+
+error[E0119]: conflicting implementations of trait `StructuralPartialEq` for 
+type `DexInterface`
+   --> contracts\treasury\src\lib.rs:128:28
+    |
+ 65 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                            --------- first implementation here
+...
+128 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                            ^^^^^^^^^ conflicting implementation for 
+`DexInterface`
+
+error[E0119]: conflicting implementations of trait `PartialEq` for type 
+`DexInterface`
+   --> contracts\treasury\src\lib.rs:128:28
+    |
+ 65 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                            --------- first implementation here
+...
+128 | #[derive(Clone, Debug, Eq, PartialEq)]
+    |                            ^^^^^^^^^ conflicting implementation for 
+`DexInterface`
+
+error[E0119]: conflicting implementations of trait `TryFromVal<Env, 
+soroban_sdk::Val>` for type `DexInterface`
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+ 64 | #[contracttype]
+    | --------------- first implementation here
+...
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ conflicting implementation for `DexInterface`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `TryFromVal<Env, 
+DexInterface>` for type `soroban_sdk::Val`
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+ 64 | #[contracttype]
+    | --------------- first implementation here
+...
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ conflicting implementation for `soroban_sdk::Val`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `TryFromVal<Env, 
+&DexInterface>` for type `soroban_sdk::Val`
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+ 64 | #[contracttype]
+    | --------------- first implementation here
+...
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ conflicting implementation for `soroban_sdk::Val`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0592]: duplicate definitions with name `spec_xdr`
+   --> contracts\treasury\src\lib.rs:64:1
+    |
+ 64 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ duplicate definitions for `spec_xdr`
+...
+127 | #[contracttype]
+    | --------------- other definition for `spec_xdr`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0592]: duplicate definitions with name `validate`
+   --> contracts\treasury\src\lib.rs:71:5
+    |
+ 71 |     pub fn validate(&self, env: &Env) {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ duplicate definitions for 
+`validate`
+...
+134 |     pub fn validate(&self, env: &Env) {
+    |     --------------------------------- other definition for `validate`
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\treasury\src\lib.rs:64:1
+    |
+ 64 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `DexInterface`
+   --> contracts\treasury\src\lib.rs:64:1
+    |
+ 64 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `DexInterface`
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `DexInterface`
+   --> contracts\treasury\src\lib.rs:64:1
+    |
+ 64 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `DexInterface`
+   --> contracts\treasury\src\lib.rs:127:1
+    |
+127 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contracttype` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no function or associated item named `generate` found for struct 
+`soroban_sdk::Address` in the current scope
+   --> contracts\treasury\src\lib.rs:338:59
+    |
+338 |             .set(&DataKey::RegulatoryReporting, 
+&Address::generate(&env));
+    |                                                           ^^^^^^^^ 
+function or associated item not found in `soroban_sdk::Address`
+    |
+note: if you're trying to build a new `soroban_sdk::Address` consider using 
+one of the following associated functions:
+      soroban_sdk::Address::from_str
+      soroban_sdk::Address::from_string
+      soroban_sdk::Address::from_string_bytes
+   --> C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroban
+-sdk-25.3.2\src\address.rs:273:5
+    |
+273 |     pub fn from_str(env: &Env, strkey: &str) -> Address {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+285 |     pub fn from_string(strkey: &String) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+307 |     pub fn from_string_bytes(strkey: &Bytes) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:375:22
+    |
+375 |         env.events().publish(
+    |                      ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:402:22
+    |
+402 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:473:22
+    |
+473 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:487:22
+    |
+487 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:586:22
+    |
+586 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:626:26
+    |
+626 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:634:26
+    |
+634 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\staking\src\lib.rs:331:22
+    |
+331 |         env.events().publish(
+    |                      ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:690:22
+    |
+690 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\staking\src\lib.rs:433:22
+    |
+433 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:803:26
+    |
+803 |             env.events().publish(
+    |                          ^^^^^^^
+
+error[E0026]: variant `Transfer` does not have fields named `token`, `from`, 
+`to`, `amount`
+   --> contracts\treasury\src\lib.rs:835:17
+    |
+835 |                 token, from, to, amount, ..
+    |                 ^^^^^  ^^^^  ^^  ^^^^^^ variant `Transfer` does not have 
+these fields
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:882:22
+    |
+882 |         env.events().publish(
+    |                      ^^^^^^^
+
+error[E0599]: no variant or associated item named `InvalidState` found for 
+enum `Error` in the current scope
+   --> contracts\treasury\src\lib.rs:920:31
+    |
+100 | pub enum Error {
+    | -------------- variant or associated item `InvalidState` not found for 
+this enum
+...
+920 |             return Err(Error::InvalidState);
+    |                               ^^^^^^^^^^^^ variant or associated item 
+not found in `Error`
+
+error[E0599]: no method named `into_val` found for tuple 
+`(soroban_sdk::Address, u32, i128)` in the current scope
+   --> contracts\staking\src\lib.rs:549:52
+    |
+549 |                     (mentor.clone(), 2u32, amount).into_val(&env), // 
+2u32 = LargeTransfer
+    |                                                    ^^^^^^^^
+    |
+   ::: C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroban
+-sdk-25.3.2\src\env.rs:90:8
+    |
+ 90 |     fn into_val(&self, e: &E) -> T;
+    |        -------- the method is available for `(soroban_sdk::Address, u32, 
+i128)` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: there is a method `into` with a similar name, but with different 
+arguments
+   --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\convert
+\mod.rs:455:4
+help: trait `IntoVal` which provides `into_val` is implemented but not in 
+scope; perhaps you want to import it
+    |
+  3 + use soroban_sdk::IntoVal;
+    |
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\staking\src\lib.rs:554:34
+    |
+554 |                     env.events().publish(
+    |                                  ^^^^^^^
+
+error[E0599]: no variant or associated item named `DuplicateEntry` found for 
+enum `Error` in the current scope
+   --> contracts\treasury\src\lib.rs:925:31
+    |
+100 | pub enum Error {
+    | -------------- variant or associated item `DuplicateEntry` not found for 
+this enum
+...
+925 |             return Err(Error::DuplicateEntry);
+    |                               ^^^^^^^^^^^^^^ variant or associated item 
+not found in `Error`
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\staking\src\lib.rs:672:26
+    |
+672 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\treasury\src\lib.rs:991:26
+    |
+991 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\staking\src\lib.rs:858:26
+    |
+858 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+   --> contracts\staking\src\lib.rs:957:26
+    |
+957 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:1152:22
+     |
+1152 |         env.events().publish(
+     |                      ^^^^^^^
+
+error[E0599]: no variant or associated item named `InvalidState` found for 
+enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1037:31
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `InvalidState` not found for 
+this enum
+...
+1037 |             return Err(Error::InvalidState);
+     |                               ^^^^^^^^^^^^ variant or associated item 
+not found in `Error`
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1062:22
+     |
+1062 |         env.events().publish(
+     |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:1601:26
+     |
+1601 |             env.events().publish(
+     |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:1610:22
+     |
+1610 |         env.events().publish(
+     |                      ^^^^^^^
+
+error[E0599]: no variant or associated item named `InvalidState` found for 
+enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1166:35
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `InvalidState` not found for 
+this enum
+...
+1166 |                 return Err(Error::InvalidState);
+     |                                   ^^^^^^^^^^^^ variant or associated 
+item not found in `Error`
+
+error[E0599]: no method named `into_val` found for tuple 
+`(soroban_sdk::Address,)` in the current scope
+    --> contracts\staking\src\lib.rs:1901:31
+     |
+1901 |             (mentor.clone(),).into_val(env),
+     |                               ^^^^^^^^
+     |
+    ::: C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroba
+n-sdk-25.3.2\src\env.rs:90:8
+     |
+  90 |     fn into_val(&self, e: &E) -> T;
+     |        -------- the method is available for `(soroban_sdk::Address,)` 
+here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: there is a method `into` with a similar name, but with different 
+arguments
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\conver
+t\mod.rs:455:4
+help: trait `IntoVal` which provides `into_val` is implemented but not in 
+scope; perhaps you want to import it
+     |
+   3 + use soroban_sdk::IntoVal;
+     |
+
+error[E0599]: no variant or associated item named `InvalidState` found for 
+enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1195:58
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `InvalidState` not found for 
+this enum
+...
+1195 |             let scheduled = maybe_scheduled.ok_or(Error::InvalidState)?;
+     |                                                          ^^^^^^^^^^^^ 
+variant or associated item not found in `Error`
+
+error[E0599]: no method named `into_val` found for tuple 
+`(soroban_sdk::Address,)` in the current scope
+    --> contracts\staking\src\lib.rs:1906:31
+     |
+1906 |             (mentor.clone(),).into_val(env),
+     |                               ^^^^^^^^
+     |
+    ::: C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroba
+n-sdk-25.3.2\src\env.rs:90:8
+     |
+  90 |     fn into_val(&self, e: &E) -> T;
+     |        -------- the method is available for `(soroban_sdk::Address,)` 
+here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: there is a method `into` with a similar name, but with different 
+arguments
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\conver
+t\mod.rs:455:4
+help: trait `IntoVal` which provides `into_val` is implemented but not in 
+scope; perhaps you want to import it
+     |
+   3 + use soroban_sdk::IntoVal;
+     |
+
+error[E0599]: no variant or associated item named `InvalidState` found for 
+enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1197:35
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `InvalidState` not found for 
+this enum
+...
+1197 |                 return Err(Error::InvalidState);
+     |                                   ^^^^^^^^^^^^ variant or associated 
+item not found in `Error`
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:2074:38
+     |
+2074 |                         env.events().publish(
+     |                                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:2174:22
+     |
+2174 |         env.events().publish(
+     |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:2308:22
+     |
+2308 |         env.events().publish(
+     |                      ^^^^^^^
+
+error[E0599]: no variant or associated item named `InvalidState` found for 
+enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1204:35
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `InvalidState` not found for 
+this enum
+...
+1204 |                 return Err(Error::InvalidState);
+     |                                   ^^^^^^^^^^^^ variant or associated 
+item not found in `Error`
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:2468:22
+     |
+2468 |         env.events().publish(
+     |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:2523:22
+     |
+2523 |         env.events().publish(
+     |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\staking\src\lib.rs:2593:22
+     |
+2593 |         env.events().publish(
+     |                      ^^^^^^^
+
+error[E0689]: can't call method `checked_add` on ambiguous numeric type 
+`{integer}`
+    --> contracts\treasury\src\lib.rs:1244:14
+     |
+1244 |             .checked_add(1)
+     |              ^^^^^^^^^^^
+
+error[E0599]: no variant or associated item named `Overflow` found for enum 
+`Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1245:27
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `Overflow` not found for this 
+enum
+...
+1245 |             .ok_or(Error::Overflow)?;
+     |                           ^^^^^^^^ variant or associated item not found 
+in `Error`
+
+error[E0026]: variant `Transfer` does not have fields named `token`, `from`, 
+`to`, `amount`
+    --> contracts\treasury\src\lib.rs:1296:17
+     |
+1296 |                 token, from, to, amount, ..
+     |                 ^^^^^  ^^^^  ^^  ^^^^^^ variant `Transfer` does not 
+have these fields
+
+error[E0026]: variant `Invoke` does not have fields named `contract`, 
+`function`
+    --> contracts\treasury\src\lib.rs:1302:17
+     |
+1302 |                 contract, function, ..
+     |                 ^^^^^^^^  ^^^^^^^^ variant `Invoke` does not have these 
+fields
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1361:22
+     |
+1361 |         env.events().publish(
+     |                      ^^^^^^^
+
+error[E0034]: multiple applicable items in scope
+    --> contracts\treasury\src\lib.rs:1418:19
+     |
+1418 |         dex_iface.validate(&env);
+     |                   ^^^^^^^^ multiple `validate` found
+     |
+note: candidate #1 is defined in an impl for the type `DexInterface`
+    --> contracts\treasury\src\lib.rs:71:5
+     |
+  71 |     pub fn validate(&self, env: &Env) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `DexInterface`
+    --> contracts\treasury\src\lib.rs:134:5
+     |
+ 134 |     pub fn validate(&self, env: &Env) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1426:26
+     |
+1426 |             env.events().publish(
+     |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1441:26
+     |
+1441 |             env.events().publish(
+     |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1464:30
+     |
+1464 |                 env.events().publish(
+     |                              ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1479:30
+     |
+1479 |                 env.events().publish(
+     |                              ^^^^^^^
+
+error[E0599]: no variant or associated item named `OracleCircuitBreaker` found 
+for enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1486:35
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `OracleCircuitBreaker` not 
+found for this enum
+...
+1486 |                 return Err(Error::OracleCircuitBreaker);
+     |                                   ^^^^^^^^^^^^^^^^^^^^ variant or 
+associated item not found in `Error`
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1497:26
+     |
+1497 |             env.events().publish(
+     |                          ^^^^^^^
+
+error[E0308]: mismatched types
+    --> contracts\treasury\src\lib.rs:1521:52
+     |
+1521 |           let mnt_received_result: Result<i128, _> = 
+env.try_invoke_contract(
+     |  __________________________________---------------___^
+     | |                                  |
+     | |                                  expected due to this
+1522 | |             &dex_contract,
+1523 | |             &swap_fn,
+...    |
+1531 | |                 .into_val(&env),
+1532 | |         );
+     | |_________^ expected `Result<i128, _>`, found `Result<Result<_, _>, 
+Result<_, ...>>`
+     |
+     = note: expected enum `core::result::Result<i128, _>`
+                found enum `core::result::Result<core::result::Result<_, _>, 
+core::result::Result<_, InvokeError>>`
+help: use the `?` operator to extract the 
+`core::result::Result<core::result::Result<_, _>, core::result::Result<_, 
+InvokeError>>` value, propagating a `Result::Err` value to the caller
+     |
+1532 |         )?;
+     |          +
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1543:30
+     |
+1543 |                 env.events().publish(
+     |                              ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1561:26
+     |
+1561 |             env.events().publish(
+     |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1587:26
+     |
+1587 |             env.events().publish(
+     |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use 
+the #[contractevent] macro on a contract event type
+    --> contracts\treasury\src\lib.rs:1641:22
+     |
+1641 |         env.events().publish(
+     |                      ^^^^^^^
+
+error[E0599]: no method named `mock_all_auths` found for struct `Env` in the 
+current scope
+    --> contracts\treasury\src\lib.rs:1696:13
+     |
+1696 |         env.mock_all_auths();
+     |             ^^^^^^^^^^^^^^ method not found in `Env`
+
+error[E0599]: no method named `set_timestamp` found for struct `Ledger` in the 
+current scope
+    --> contracts\treasury\src\lib.rs:1697:22
+     |
+1697 |         env.ledger().set_timestamp(1_000);
+     |                      ^^^^^^^^^^^^^
+     |
+help: there is a method `timestamp` with a similar name, but with different 
+arguments
+    --> C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroba
+n-sdk-25.3.2\src\ledger.rs:87:5
+     |
+  87 |     pub fn timestamp(&self) -> u64 {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0425]: cannot find function `setup_test` in this scope
+    --> contracts\treasury\src\lib.rs:1698:42
+     |
+1698 |         let (admin, _, _, contract_id) = setup_test(&env);
+     |                                          ^^^^^^^^^^ not found in this 
+scope
+
+error[E0599]: no method named `register_stellar_asset_contract` found for 
+struct `Env` in the current scope
+    --> contracts\treasury\src\lib.rs:1700:28
+     |
+1700 |         let xlm_addr = 
+env.register_stellar_asset_contract(admin.clone());
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `create_asset_contract` with a similar name
+     |
+1700 -         let xlm_addr = 
+env.register_stellar_asset_contract(admin.clone());
+1700 +         let xlm_addr = env.create_asset_contract(admin.clone());
+     |
+
+error[E0282]: type annotations needed
+    --> contracts\treasury\src\lib.rs:1700:60
+     |
+1700 |         let xlm_addr = 
+env.register_stellar_asset_contract(admin.clone());
+     |                                                            ^^^^^ cannot 
+infer type
+
+error[E0599]: no method named `register_contract` found for struct `Env` in 
+the current scope
+    --> contracts\treasury\src\lib.rs:1701:28
+     |
+1701 |         let mnt_addr = env.register_contract(None, MockMNT);
+     |                            ^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `create_contract` with a similar name, but with 
+different arguments
+    --> C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroba
+n-env-common-25.2.2\src\env.rs:344:9
+     |
+ 344 |         fn $fn_id(&self, $($arg:$type),*) -> Result<$ret, Self::Error>;
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 405 | call_macro_with_all_host_functions! { generate_env_trait }
+     | ---------------------------------------------------------- in this 
+macro invocation
+     = note: this error originates in the macro `host_function_helper` which 
+comes from the expansion of the macro `call_macro_with_all_host_functions` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `register_contract` found for struct `Env` in 
+the current scope
+    --> contracts\treasury\src\lib.rs:1702:28
+     |
+1702 |         let dex_addr = env.register_contract(None, MockDEX);
+     |                            ^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `create_contract` with a similar name, but with 
+different arguments
+    --> C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroba
+n-env-common-25.2.2\src\env.rs:344:9
+     |
+ 344 |         fn $fn_id(&self, $($arg:$type),*) -> Result<$ret, Self::Error>;
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 405 | call_macro_with_all_host_functions! { generate_env_trait }
+     | ---------------------------------------------------------- in this 
+macro invocation
+     = note: this error originates in the macro `host_function_helper` which 
+comes from the expansion of the macro `call_macro_with_all_host_functions` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `register_contract` found for struct `Env` in 
+the current scope
+    --> contracts\treasury\src\lib.rs:1703:31
+     |
+1703 |         let oracle_addr = env.register_contract(None, 
+MockOracleCircuitBreaker);
+     |                               ^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `create_contract` with a similar name, but with 
+different arguments
+    --> C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\soroba
+n-env-common-25.2.2\src\env.rs:344:9
+     |
+ 344 |         fn $fn_id(&self, $($arg:$type),*) -> Result<$ret, Self::Error>;
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 405 | call_macro_with_all_host_functions! { generate_env_trait }
+     | ---------------------------------------------------------- in this 
+macro invocation
+     = note: this error originates in the macro `host_function_helper` which 
+comes from the expansion of the macro `call_macro_with_all_host_functions` (in 
+Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0425]: cannot find function `default_dex_iface` in this scope
+    --> contracts\treasury\src\lib.rs:1718:14
+     |
+1718 |             &default_dex_iface(&env),
+     |              ^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `OracleCircuitBreaker` found 
+for enum `Error` in the current scope
+    --> contracts\treasury\src\lib.rs:1722:42
+     |
+ 100 | pub enum Error {
+     | -------------- variant or associated item `OracleCircuitBreaker` not 
+found for this enum
+...
+1722 |         assert_eq!(result, Err(Ok(Error::OracleCircuitBreaker)));
+     |                                          ^^^^^^^^^^^^^^^^^^^^ variant 
+or associated item not found in `Error`
+
+warning: unused variable: `balance_before`
+    --> contracts\staking\src\lib.rs:1752:13
+     |
+1752 |         let balance_before = token_client.balance(&contract_addr);
+     |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with 
+an underscore: `_balance_before`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by 
+default
+
+warning: variable does not need to be mutable
+    --> contracts\staking\src\lib.rs:1967:13
+     |
+1967 |         let mut next_claim: u64 = env
+     |             ----^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> contracts\staking\src\lib.rs:1979:13
+     |
+1979 |         let mut settled_until: u64 = env
+     |             ----^^^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `mentorminds-staking` (lib) generated 19 warnings
+error: could not compile `mentorminds-staking` (lib) due to 4 previous errors; 
+19 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+Some errors have detailed explanations: E0026, E0034, E0119, E0282, E0308, 
+E0425, E0428, E0592, E0599...
+For more information about an error, try `rustc --explain E0026`.
+warning: `mentorminds-treasury` (lib) generated 23 warnings
+error: could not compile `mentorminds-treasury` (lib) due to 45 previous 
+errors; 23 warnings emitted

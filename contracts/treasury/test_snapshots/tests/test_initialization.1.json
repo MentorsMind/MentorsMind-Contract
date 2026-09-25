@@ -96,7 +96,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "History"
+                  "symbol": "AllocationCount"
                 }
               ]
             },
@@ -113,13 +113,13 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "History"
+                      "symbol": "AllocationCount"
                     }
                   ]
                 },
                 "durability": "persistent",
                 "val": {
-                  "vec": []
+                  "u32": 0
                 }
               }
             },
@@ -245,7 +245,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "History"
+                  "symbol": "AllocationCount"
                 }
               ]
             },
@@ -262,13 +262,13 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "History"
+                      "symbol": "AllocationCount"
                     }
                   ]
                 },
                 "durability": "persistent",
                 "val": {
-                  "vec": []
+                  "u32": 0
                 }
               }
             },

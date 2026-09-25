@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { decodeEvent } from "../events";
+import { decodeEvent } from "../events.js";
 
 test("decode governance proposal created", () => {
   const parsed = decodeEvent({

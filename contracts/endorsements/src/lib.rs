@@ -1,18 +1,32 @@
 #![no_std]
 
+use shared::health_reporter::{report_metric, MetricCategory};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contractevent, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
+
+const DECAY_HALF_LIFE_SECS: u64 = 6 * 30 * 24 * 3600; // 6 months in seconds
+const FULL_WEIGHT: i128 = 1000; // scaling factor for weight
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     SessionRegistry,
     Endorsement(Address, Address, Symbol),
     Endorsers(Address, Symbol),
     EndorsementCount(Address, Symbol),
     EndorsedSkills(Address),
+    /// Address of the health dashboard for metric reporting.
+    HealthDashboard,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EndorsementRecord {
+    pub endorsed_at: u64,
 }
 
 #[contracttype]
@@ -45,6 +59,18 @@ pub trait SessionRegistryTrait {
     fn get_session(env: Env, session_id: Symbol) -> SessionRecord;
 }
 
+#[contractevent]
+#[derive(Clone)]
+struct EndorsementChangedEvent {
+    #[topic]
+    action: Symbol,
+    #[topic]
+    endorsee: Address,
+    #[topic]
+    skill: Symbol,
+    endorser: Address,
+}
+
 #[contract]
 pub struct EndorsementsContract;
 
@@ -74,6 +100,19 @@ impl EndorsementsContract {
             .set(&DataKey::SessionRegistry, &session_registry);
     }
 
+    /// Set the health dashboard address for metric reporting. Admin only.
+    pub fn set_health_dashboard(env: Env, health_dashboard: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::HealthDashboard, &health_dashboard);
+    }
+
     pub fn endorse(env: Env, endorser: Address, endorsee: Address, skill: Symbol) {
         endorser.require_auth();
 
@@ -91,7 +130,10 @@ impl EndorsementsContract {
             panic!("endorsement already exists");
         }
 
-        env.storage().persistent().set(&endorsement_key, &true);
+        let record = EndorsementRecord {
+            endorsed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&endorsement_key, &record);
 
         let endorsers_key = DataKey::Endorsers(endorsee.clone(), skill.clone());
         let mut endorsers: Vec<Address> = env
@@ -118,8 +160,27 @@ impl EndorsementsContract {
             env.storage().persistent().set(&skills_key, &skills);
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "endorsed"), endorsee, skill), endorser);
+        EndorsementChangedEvent {
+            action: Symbol::new(&env, "endorsed"),
+            endorsee,
+            skill,
+            endorser,
+        }.publish(env);
+
+        // Report health metric for endorsement creation
+        if let Some(dashboard) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "endorsement_created"),
+                MetricCategory::Availability,
+                new_count as i128,
+            );
+        }
     }
 
     pub fn remove_endorsement(env: Env, endorser: Address, endorsee: Address, skill: Symbol) {
@@ -220,6 +281,88 @@ impl EndorsementsContract {
             }
         }
         out
+    }
+
+    pub fn re_endorse(env: Env, endorser: Address, endorsee: Address, skill: Symbol) {
+        endorser.require_auth();
+
+        let endorsement_key =
+            DataKey::Endorsement(endorser.clone(), endorsee.clone(), skill.clone());
+        let mut record: EndorsementRecord = env
+            .storage()
+            .persistent()
+            .get(&endorsement_key)
+            .expect("endorsement not found");
+
+        record.endorsed_at = env.ledger().timestamp();
+        env.storage().persistent().set(&endorsement_key, &record);
+
+        env.events().publish(
+            (Symbol::new(&env, "re_endorsed"), endorsee, skill),
+            endorser,
+        );
+    }
+
+    pub fn get_endorsement_weight(
+        env: Env,
+        endorser: Address,
+        endorsee: Address,
+        skill: Symbol,
+    ) -> i128 {
+        let endorsement_key =
+            DataKey::Endorsement(endorser, endorsee, skill);
+        let record: EndorsementRecord = match env
+            .storage()
+            .persistent()
+            .get(&endorsement_key)
+        {
+            Some(r) => r,
+            None => return 0,
+        };
+
+        let now = env.ledger().timestamp();
+        if now <= record.endorsed_at {
+            return FULL_WEIGHT;
+        }
+
+        let elapsed = now - record.endorsed_at;
+        let half_lives = elapsed / DECAY_HALF_LIFE_SECS;
+
+        if half_lives == 0 {
+            FULL_WEIGHT
+        } else {
+            FULL_WEIGHT >> (half_lives.min(63) as u32)
+        }
+    }
+
+    pub fn get_effective_endorsement_score(env: Env, endorsee: Address) -> i128 {
+        let skills: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EndorsedSkills(endorsee.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let mut total_weight: i128 = 0;
+
+        for skill in skills.iter() {
+            let endorsers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Endorsers(endorsee.clone(), skill.clone()))
+                .unwrap_or(Vec::new(&env));
+
+            for endorser in endorsers.iter() {
+                let weight = Self::get_endorsement_weight(
+                    env.clone(),
+                    endorser,
+                    endorsee.clone(),
+                    skill.clone(),
+                );
+                total_weight += weight;
+            }
+        }
+
+        total_weight
     }
 
     fn has_completed_shared_session(env: &Env, a: &Address, b: &Address) -> bool {
