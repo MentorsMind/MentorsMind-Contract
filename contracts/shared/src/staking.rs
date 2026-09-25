@@ -372,3 +372,51 @@ pub fn apply_bps_multiplier(amount: i128, bps: u32) -> i128 {
     }
     ((amount as u128) * (bps as u128) / (BASIS_POINTS as u128)) as i128
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_reward_multiplier_min_duration() {
+        assert_eq!(
+            compute_reward_multiplier_bps(MIN_STAKING_DURATION_SECS),
+            REWARD_MULTIPLIER_MIN_BPS
+        );
+    }
+
+    #[test]
+    fn test_compute_reward_multiplier_max_duration() {
+        assert_eq!(
+            compute_reward_multiplier_bps(MAX_SCALING_DURATION_SECS),
+            REWARD_MULTIPLIER_MAX_BPS
+        );
+    }
+
+    #[test]
+    fn test_compute_reward_multiplier_midpoint() {
+        let midpoint = MIN_STAKING_DURATION_SECS
+            + (MAX_SCALING_DURATION_SECS - MIN_STAKING_DURATION_SECS) / 2;
+        // Midpoint linear interpolation: 10,000 + (30,000 - 10,000) / 2 = 20,000 bps
+        assert_eq!(compute_reward_multiplier_bps(midpoint), 20_000);
+    }
+
+    #[test]
+    fn test_compute_reward_multiplier_very_long_stakes() {
+        assert_eq!(
+            compute_reward_multiplier_bps(MAX_SCALING_DURATION_SECS * 10),
+            REWARD_MULTIPLIER_MAX_BPS
+        );
+        assert_eq!(
+            compute_reward_multiplier_bps(u64::MAX),
+            REWARD_MULTIPLIER_MAX_BPS
+        );
+    }
+
+    #[test]
+    fn test_compute_reward_multiplier_below_min() {
+        assert_eq!(compute_reward_multiplier_bps(0), 0);
+        assert_eq!(compute_reward_multiplier_bps(MIN_STAKING_DURATION_SECS - 1), 0);
+    }
+}
+

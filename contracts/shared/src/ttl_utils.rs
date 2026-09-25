@@ -458,14 +458,14 @@ mod tests {
         let op_id = symbol_short!("esc_101");
         let sample_key = symbol_short!("data_key");
 
-        assert!(!DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
+        assert!(!DataDependencyTracker::is_dependency_active(&env, op_id.clone(), &sample_key));
 
         // Register dependency
-        DataDependencyTracker::register_dependency(&env, op_id, &sample_key);
-        assert!(DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
+        DataDependencyTracker::register_dependency(&env, op_id.clone(), &sample_key);
+        assert!(DataDependencyTracker::is_dependency_active(&env, op_id.clone(), &sample_key));
 
         // Clear dependency
-        DataDependencyTracker::clear_dependency(&env, op_id, &sample_key);
+        DataDependencyTracker::clear_dependency(&env, op_id.clone(), &sample_key);
         assert!(!DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
     }
 
@@ -478,10 +478,10 @@ mod tests {
         sample_payload.push_back(42);
         sample_payload.push_back(99);
 
-        assert!(!TTLRecoveryManager::has_backup(&env, backup_id, &key_hash));
+        assert!(!TTLRecoveryManager::has_backup(&env, backup_id.clone(), &key_hash));
 
-        TTLRecoveryManager::backup_data(&env, backup_id, key_hash.clone(), sample_payload.clone());
-        assert!(TTLRecoveryManager::has_backup(&env, backup_id, &key_hash));
+        TTLRecoveryManager::backup_data(&env, backup_id.clone(), key_hash.clone(), sample_payload.clone());
+        assert!(TTLRecoveryManager::has_backup(&env, backup_id.clone(), &key_hash));
 
         let restored = TTLRecoveryManager::restore_data(&env, backup_id, &key_hash);
         assert_eq!(restored, Some(sample_payload));

@@ -515,3 +515,52 @@ fn test_execute_with_recovery_rolls_back_failed_kyc_update() {
     assert_eq!(restored_provider_hash, original_provider_hash);
 }
 
+#[test]
+fn test_get_kyc_record_unauthorized_returns_access_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let unauthorized_caller = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let provider_hash = BytesN::from_array(&env, &[1; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &5000, &provider_hash);
+
+    let purpose = Symbol::new(&env, "session_delivery");
+    // No consent granted by user for this purpose
+
+    let result = client.try_get_kyc_record(&user, &unauthorized_caller, &purpose);
+    assert_eq!(result, Err(Ok(Error::AccessDenied)));
+}
+
+#[test]
+fn test_get_kyc_record_authorized_returns_expected_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let authorized_caller = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let provider_hash = BytesN::from_array(&env, &[7; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &5000, &provider_hash);
+
+    let purpose = Symbol::new(&env, "session_delivery");
+    // User grants consent to purpose covering minimal session fields (identity)
+    client.manage_data_privacy(&user, &purpose, &shared::ALL_FIELDS, &3600);
+
+    let record = client.get_kyc_record(&user, &authorized_caller, &purpose);
+    assert_eq!(record.level, KycLevel::Enhanced);
+    assert_eq!(record.expiry, 5000);
+    assert_eq!(record.kyc_provider_hash, provider_hash);
+}
+
