@@ -87,6 +87,7 @@ const SCHEDULING_BUFFER_SECS: u64 = 900;
 /// Rolling window used to compute a mentor's booking-request rate for
 /// load-attack validation (#scalability-protection).
 const LOAD_MONITORING_WINDOW_SECS: u64 = 300;
+const METADATA_MONITORING_WINDOW_SECS: u64 = 60;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -135,6 +136,8 @@ pub enum DataKey {
     MentorScheduleSlot(Address, u64),
     SessionOracle,
     SessionMetadata(Symbol),
+    PreviousMetadata(Symbol),
+    MetadataUpdateTimestamps(Symbol),
     CompletionProof(Symbol),
     /// Scheduled-at timestamps for one mentor/learner pair, used for
     /// coordination-ring detection (#community-protection).
@@ -1883,12 +1886,79 @@ impl SessionRegistry {
         env: Env,
         session_id: Symbol,
         tags: soroban_sdk::Vec<soroban_sdk::String>,
-    ) {
-        let key = DataKey::SessionMetadata(session_id);
+    ) -> bool {
+        let key = DataKey::SessionMetadata(session_id.clone());
+        let metadata_hash: BytesN<32> = env.crypto().sha256(&tags.to_xdr(&env)).into();
+        let previous_tags: Option<soroban_sdk::Vec<soroban_sdk::String>> = env
+            .storage()
+            .persistent()
+            .get(&key);
+        let previous_hash: BytesN<32> = previous_tags
+            .map(|stored_tags| env.crypto().sha256(&stored_tags.to_xdr(&env)).into())
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage().persistent().set(
+            &DataKey::PreviousMetadata(session_id.clone()),
+            &previous_hash,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::PreviousMetadata(session_id.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        let timestamps_key = DataKey::MetadataUpdateTimestamps(session_id.clone());
+        let mut timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&timestamps_key)
+            .unwrap_or(Vec::new(&env));
+        let now = env.ledger().timestamp();
+        timestamps.push_back(now);
+        while timestamps.len() > MONITORING_LOG_CAP {
+            timestamps.remove(0);
+        }
+        let window_start = now.saturating_sub(METADATA_MONITORING_WINDOW_SECS);
+        let mut recent_updates = 0u32;
+        for timestamp in timestamps.iter() {
+            if timestamp >= window_start {
+                recent_updates = recent_updates.saturating_add(1);
+            }
+        }
+
+        let monitoring = monitor_metadata_manipulation(
+            recent_updates,
+            if previous_hash != metadata_hash { 1 } else { 0 },
+        );
+        env.storage().persistent().set(
+            &DataKey::SessionMetadataMonitoring(session_id.clone()),
+            &monitoring,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::SessionMetadataMonitoring(session_id.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&timestamps_key, &timestamps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&timestamps_key, TTL_THRESHOLD, TTL_BUMP);
+
+        if monitoring.misinformation_detected {
+            env.events().publish(
+                (symbol_short!("metamon"), Symbol::new(&env, "alert"), session_id.clone()),
+                monitoring.manipulation_level,
+            );
+            return false;
+        }
+
         env.storage().persistent().set(&key, &tags);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        true
     }
 
     pub fn get_session_metadata(
@@ -3256,6 +3326,33 @@ mod tests {
 
     fn dummy_token(env: &Env) -> Address {
         Address::generate(env)
+    }
+
+    #[test]
+    fn test_rapid_metadata_updates_are_blocked_and_recorded() {
+        let (env, client, _backend) = setup();
+        let session_id = Symbol::new(&env, "meta1");
+
+        let mut first_tags = Vec::new(&env);
+        first_tags.push_back(soroban_sdk::String::from_str(&env, "first"));
+        let mut second_tags = Vec::new(&env);
+        second_tags.push_back(soroban_sdk::String::from_str(&env, "second"));
+        let mut third_tags = Vec::new(&env);
+        third_tags.push_back(soroban_sdk::String::from_str(&env, "third"));
+
+        assert!(client.update_session_metadata(&session_id, &first_tags));
+        assert!(client.update_session_metadata(&session_id, &second_tags));
+        assert!(!client.update_session_metadata(&session_id, &third_tags));
+
+        assert_eq!(client.get_session_metadata(&session_id), second_tags);
+        let monitoring: MetadataMonitoringRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionMetadataMonitoring(session_id.clone()))
+            .expect("metadata monitoring record missing");
+        assert!(monitoring.misinformation_detected);
+        assert_eq!(monitoring.manipulation_level, 50);
+        assert_eq!(monitoring.update_frequency_score, 30);
     }
 
     #[test]
