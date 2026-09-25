@@ -479,6 +479,15 @@ mod tests {
             op_id,
             &sample_key
         ));
+        assert!(!DataDependencyTracker::is_dependency_active(&env, op_id.clone(), &sample_key));
+
+        // Register dependency
+        DataDependencyTracker::register_dependency(&env, op_id.clone(), &sample_key);
+        assert!(DataDependencyTracker::is_dependency_active(&env, op_id.clone(), &sample_key));
+
+        // Clear dependency
+        DataDependencyTracker::clear_dependency(&env, op_id.clone(), &sample_key);
+        assert!(!DataDependencyTracker::is_dependency_active(&env, op_id, &sample_key));
     }
 
     #[test]
@@ -502,6 +511,9 @@ mod tests {
             key_hash.clone(),
             sample_payload.clone(),
         );
+        assert!(!TTLRecoveryManager::has_backup(&env, backup_id.clone(), &key_hash));
+
+        TTLRecoveryManager::backup_data(&env, backup_id.clone(), key_hash.clone(), sample_payload.clone());
         assert!(TTLRecoveryManager::has_backup(&env, backup_id.clone(), &key_hash));
 
         let restored = TTLRecoveryManager::restore_data(&env, backup_id, &key_hash);

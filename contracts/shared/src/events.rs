@@ -60,6 +60,10 @@ pub fn emit<D: IntoVal<Env, Val>>(
 ) {
     env.events()
         .publish((contract, EVENT_SCHEMA_VERSION, event_type), data);
+    env.events().publish(
+        (contract, EVENT_SCHEMA_VERSION, event_type),
+        data,
+    );
 }
 
 // ---------------------------------------------------------------------------

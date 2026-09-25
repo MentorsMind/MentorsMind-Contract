@@ -13,11 +13,19 @@ use shared::{
     trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 /// Default grace period: 7 days in seconds
 const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    IdentityMismatch = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -711,6 +719,35 @@ impl VerificationContract {
 
     // ── Cross-platform identity validation (#904) ──────────────────────────
 
+    /// Submit a credential for cross-platform identity verification.
+    pub fn submit_verification(
+        env: Env,
+        user: Address,
+        platform: Symbol,
+        credential_hash: BytesN<32>,
+        identity: CrossPlatformIdentity,
+    ) -> Result<(), Error> {
+        user.require_auth();
+        let identity_matches = identity.user == user
+            && identity.platform_id == platform
+            && identity.verified
+            && is_identity_match(identity.correlation_score)
+            && Self::authenticate_credentials(env.clone(), user.clone(), credential_hash);
+        if !identity_matches {
+            return Err(Error::IdentityMismatch);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::CrossPlatformVerification(user.clone(), platform.clone()),
+            &identity,
+        );
+        env.storage().persistent().set(
+            &DataKey::BridgedIdentity(user, platform),
+            &identity.platform_id,
+        );
+        Ok(())
+    }
+
     /// Validate a mentor's identity across platforms by checking verification
     /// status and cross-platform correlation.
     pub fn validate_cross_platform_identity(
@@ -801,13 +838,23 @@ impl VerificationContract {
     ) -> bool {
         user.require_auth();
         let consistency = shared::check_identity_consistency(&user, &external_id, 8500);
-        if consistency.is_consistent {
+        let identity = CrossPlatformIdentity {
+            user: user.clone(),
+            platform_id: platform.clone(),
+            correlation_score: consistency.confidence_bps,
+            verified: consistency.is_consistent && is_identity_match(consistency.confidence_bps),
+        };
+        if identity.verified {
+            env.storage().persistent().set(
+                &DataKey::CrossPlatformVerification(user.clone(), platform.clone()),
+                &identity,
+            );
             env.storage().persistent().set(
                 &DataKey::BridgedIdentity(user, platform),
                 &external_id,
             );
         }
-        consistency.is_consistent
+        identity.verified
     }
 }
 
@@ -1147,6 +1194,30 @@ mod test {
         // No cross-platform record exists, so authenticity check fails.
         let result = client.confirm_authenticity(&f.mentor, &platform);
         assert!(!result);
+    }
+
+    #[test]
+    fn test_submit_verification_rejects_mismatched_identity() {
+        let f = TestFixture::setup();
+        let platform = Symbol::new(&f.env, "GITHUB");
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[7u8; 32]);
+        f.client().verify_mentor(&f.mentor, &credential_hash, &5000u64);
+
+        let identity = CrossPlatformIdentity {
+            user: f.mentor.clone(),
+            platform_id: platform.clone(),
+            correlation_score: 6_999,
+            verified: false,
+        };
+        let result = VerificationContract::submit_verification(
+            f.env.clone(),
+            f.mentor.clone(),
+            platform,
+            credential_hash,
+            identity,
+        );
+
+        assert_eq!(result, Err(Error::IdentityMismatch));
     }
 
     #[test]
