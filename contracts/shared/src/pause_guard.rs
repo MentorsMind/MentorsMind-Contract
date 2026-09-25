@@ -47,7 +47,6 @@ pub fn require_not_paused(env: &Env, guardian_address: &Address) {
 pub const PAUSE_GUARDIAN: Symbol = symbol_short!("PAUSE_GDN");
 pub const PAUSE_FLAG: Symbol = symbol_short!("PAUSED");
 
-/// Emergency pause state shared by value-moving contracts.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PauseState {
@@ -70,6 +69,12 @@ pub fn pause_state(env: &Env) -> PauseState {
     }
 }
 
+pub fn pause_guard_is_paused(env: &Env) -> bool {
+    pause_state(env).is_paused()
+}
+
+pub fn require_not_paused_locally(env: &Env) {
+    if pause_guard_is_paused(env) {
 /// Check local instance pause flag.
 pub fn is_paused_local(env: &Env) -> bool {
     pause_state(env).is_paused()
@@ -109,6 +114,31 @@ pub fn unpause(env: &Env) {
     set_paused(env, false);
 }
 
+pub fn set_paused(env: &Env, paused: bool) {
+    env.storage().instance().set(&PAUSE_FLAG, &paused);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractPaused;
+
+impl ContractPaused {
+    pub fn msg() -> &'static str {
+        "Contract is paused"
+    }
+}
+
+pub fn is_paused(env: &Env, guardian_address: &Address) -> bool {
+    env.invoke_contract(
+        guardian_address,
+        &Symbol::new(env, "is_paused"),
+        soroban_sdk::Vec::<soroban_sdk::Val>::new(env),
+    )
+}
+
+pub fn require_not_paused(env: &Env, guardian_address: &Address) {
+    if is_paused(env, guardian_address) {
+        panic!("{}", ContractPaused::msg());
+    }
 /// Writes the raw flag without an authorisation check.
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&PAUSE_FLAG, &paused);

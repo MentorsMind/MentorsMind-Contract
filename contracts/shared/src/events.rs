@@ -35,7 +35,7 @@
 /// 4. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
 #[allow(dead_code)]
 
-use soroban_sdk::{contractevent, contracttype, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.
@@ -58,6 +58,8 @@ pub fn emit<D: IntoVal<Env, Val>>(
     event_type: Symbol,
     data: D,
 ) {
+    env.events()
+        .publish((contract, EVENT_SCHEMA_VERSION, event_type), data);
     env.events().publish(
         (contract, EVENT_SCHEMA_VERSION, event_type),
         data,

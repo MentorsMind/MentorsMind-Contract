@@ -370,7 +370,46 @@ pub fn apply_bps_multiplier(amount: i128, bps: u32) -> i128 {
     if bps == 0 || amount <= 0 {
         return 0;
     }
-    ((amount as u128) * (bps as u128) / (BASIS_POINTS as u128)) as i128
+
+    let divisor = BASIS_POINTS as i128;
+    let multiplier = bps as i128;
+    let quotient = amount / divisor;
+    let remainder = amount % divisor;
+
+    quotient
+        .saturating_mul(multiplier)
+        .saturating_add(remainder.saturating_mul(multiplier) / divisor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_multiplier_with_integer_truncation() {
+        assert_eq!(apply_bps_multiplier(0, BASIS_POINTS), 0);
+        assert_eq!(apply_bps_multiplier(10_000, 0), 0);
+        assert_eq!(apply_bps_multiplier(10_000, BASIS_POINTS), 10_000);
+        assert_eq!(apply_bps_multiplier(10_000, 30_000), 30_000);
+        assert_eq!(apply_bps_multiplier(1, 1), 0);
+    }
+
+    #[test]
+    fn preserves_nonpositive_amount_behavior() {
+        assert_eq!(apply_bps_multiplier(-10_000, BASIS_POINTS), 0);
+    }
+
+    #[test]
+    fn handles_boundary_amounts_without_intermediate_overflow() {
+        assert_eq!(apply_bps_multiplier(i128::MAX, 5_000), i128::MAX / 2);
+        assert_eq!(apply_bps_multiplier(i128::MAX, BASIS_POINTS), i128::MAX);
+    }
+
+    #[test]
+    fn saturates_unrepresentable_positive_results() {
+        assert_eq!(apply_bps_multiplier(i128::MAX, 20_000), i128::MAX);
+        assert_eq!(apply_bps_multiplier(i128::MAX, u32::MAX), i128::MAX);
+    }
 }
 
 #[cfg(test)]

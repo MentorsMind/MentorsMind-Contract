@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::interoperability::mocks::{MockLendingPool, MockLendingPoolClient};
-    use mentorminds_credit_score::{CreditScoreContract, CreditScoreContractClient};
+    use crate::interoperability::mocks::{MockCreditScore, MockToken, MockTokenClient};
+    use mentorminds_lending_pool::{Error as LendingPoolError, LendingPool, LendingPoolClient};
     use soroban_sdk::{
+        symbol_short,
         testutils::{Address as _, Ledger},
         Address, Env,
     };
@@ -11,28 +12,54 @@ mod tests {
     fn test_lending_pool_credit_score_check() {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().set_timestamp(86400 * 2);
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = 100;
+            ledger.timestamp = 2 * 86_400;
+        });
 
         let admin = Address::generate(&env);
-        let user = Address::generate(&env);
+        let lender = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let deposit_amount = 1_000_000i128;
+        let borrow_amount = 100_000i128;
 
-        // 0. Register dependencies
-        let escrow_id = env.register_contract(None, mentorminds_escrow::EscrowContract);
-        let staking_id = env.register_contract(None, crate::interoperability::mocks::MockStaking);
+        let score_id = env.register_contract(None, MockCreditScore);
+        let token_id = env.register_contract(None, MockToken);
+        let token = MockTokenClient::new(&env, &token_id);
+        token.mint(&lender, &deposit_amount);
+        let borrower_balance = 200_000i128;
+        token.mint(&borrower, &borrowor_balance);
 
-        // 1. Deploy CreditScore
-        let score_id = env.register_contract(None, CreditScoreContract);
-        let score_client = CreditScoreContractClient::new(&env, &score_id);
-        score_client.initialize(&admin, &escrow_id, &staking_id);
+        let pool_id = env.register_contract(None, LendingPool);
+        let pool = LendingPoolClient::new(&env, &pool_id);
+        let rbac_id = Address::generate(&env);
+        pool.initialize(&admin, &token_id, &score_id, &rbac_id);
+        assert_eq!(pool.get_min_credit_score(), 600);
+        pool.deposit(&lender, &deposit_amount);
 
-        // 2. Deploy LendingPool (Mock)
-        let lending_id = env.register_contract(None, MockLendingPool);
-        let _lending_client = MockLendingPoolClient::new(&env, &lending_id);
+        pool.borrow(&borrower, &borrow_amount, &symbol_short!("LOAN"));
+        assert_eq!(token.balance(&borrower), borrower_balance + borrow_amount);
+        let loan = pool.get_loan(&borrower);
+        assert_eq!(loan.borrower, borrower);
+        assert_eq!(loan.amount, borrow_amount);
+        assert!(!loan.repaid);
 
-        // 3. Register user
-        score_client.refresh_score(&user);
+        let total_owed = loan.amount + loan.fee;
+        pool.repay(&borrower, &total_owed);
+        assert_eq!(token.balance(&borrower), borrower_balance - loan.fee);
+        assert!(pool.get_loan(&borrower).repaid);
+        assert_eq!(pool.total_liquidity(), deposit_amount + loan.fee);
 
-        // 4. Verification that integration exists
-        let _score = score_client.get_score(&user);
+        let same_ledger = pool.try_withdraw(&lender, &deposit_amount);
+        assert_eq!(same_ledger, Err(Ok(LendingPoolError::SameBlockDepositWithdraw)));
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 1;
+            ledger.timestamp += 2 * 86_400;
+        });
+        let withdrawn = pool.withdraw(&lender, &deposit_amount);
+        assert_eq!(withdrawn, deposit_amount);
+        assert_eq!(token.balance(&lender), deposit_amount);
+        assert_eq!(pool.total_liquidity(), loan.fee);
     }
 }
