@@ -58,8 +58,8 @@ pub struct EscrowFactoryTest {
 impl EscrowFactoryTest {
     pub fn setup() -> Self {
         let env = Env::default();
-        env.mock_all_auths();
         let admin = Address::generate(&env);
+        env.mock_auths(&[admin.clone()]);
         let implementation = Address::generate(&env);
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
@@ -131,6 +131,26 @@ fn test_deploy_escrow() {
     assert_eq!(escrow_info.session_id, session_id);
     assert_eq!(escrow_info.mentor, test.mentor);
     assert_eq!(escrow_info.learner, test.learner);
+}
+
+#[test]
+fn test_deploy_escrow_rejects_non_admin_caller() {
+    let test = EscrowFactoryTest::setup();
+    let attacker = Address::generate(&test.env);
+    test.env.mock_auths(&[attacker]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        test.factory_client().deploy_escrow(
+            &test.mentor,
+            &test.learner,
+            &1000i128,
+            &test.token,
+            &symbol_short!("ATTACK"),
+        );
+    }));
+
+    assert!(result.is_err(), "non-admin caller must be rejected");
+    assert_eq!(test.factory_client().get_escrow_count(), 0);
 }
 
 #[test]
