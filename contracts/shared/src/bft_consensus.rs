@@ -385,7 +385,6 @@ pub fn is_valid_proposer(
 // ---------------------------------------------------------------------------
 
 /// Full consensus state for the protocol.
-#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusState {
     /// Current epoch

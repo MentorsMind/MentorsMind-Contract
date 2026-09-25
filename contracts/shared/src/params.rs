@@ -16,7 +16,7 @@
 /// `get_all_params` returns the full `(Symbol, i128)` snapshot for
 /// off-chain dashboards.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, IntoVal, Symbol, Val, Vec};
 
 // ---------------------------------------------------------------------------
 // Storage keys for the protocol_params namespace
@@ -51,7 +51,7 @@ pub fn key_min_bond() -> Symbol { symbol_short!("MIN_BOND") }
 
 /// Minimum credit score required to borrow from the lending pool.
 /// Default: 600.
-pub fn key_min_credit_score() -> Symbol { symbol_short!("MIN_CREDIT") }
+pub fn key_min_credit_score() -> Symbol { symbol_short!("MIN_SCORE") }
 
 /// Lending pool interest rate in basis points.
 /// Default: 200 (= 2%).
@@ -172,14 +172,12 @@ pub fn set_param(env: &Env, caller: &Address, key: &Symbol, value: i128) {
 
     // Cross-contract call: rbac.has_role(GOVERNANCE_ADMIN, caller).
     // Returns bool; panics on any error so the tx is rejected cleanly.
+    let role: Val = governance_admin_role(env).into_val(env);
+    let caller_val: Val = caller.clone().into_val(env);
     let has_role: bool = env.invoke_contract(
         &rbac,
         &Symbol::new(env, "has_role"),
-        soroban_sdk::vec![
-            env,
-            governance_admin_role(env).into(),
-            caller.clone().into(),
-        ],
+        soroban_sdk::vec![env, role, caller_val],
     );
     if !has_role {
         panic!("unauthorized: caller does not hold GOVERNANCE_ADMIN role");

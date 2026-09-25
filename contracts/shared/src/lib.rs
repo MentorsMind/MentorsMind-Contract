@@ -1,7 +1,5 @@
 #![no_std]
 
-pub mod pagination;
-pub mod pause_guard;
 pub mod privacy;
 use soroban_sdk::contracterror;
 
@@ -27,6 +25,7 @@ pub mod key_management;
 pub mod learner_protection;
 pub mod outcome_authenticity;
 pub mod pagination;
+pub mod params;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod safe_math;
@@ -87,18 +86,18 @@ pub mod usage_rights_management;
 
 pub use pagination::{Pagination, MAX_PAGE_SIZE};
 pub use pause_guard::{
-    is_paused, pause, pause_guardian, pause_state, require_not_paused, require_pause_guardian,
-    set_pause_guardian, set_paused, unpause, PauseState,
+    is_paused, is_paused_local, pause, pause_guardian, pause_state, require_not_paused,
+    require_not_paused_local, require_pause_guardian, set_pause_guardian, set_paused, unpause,
+    PauseState,
 };
-pub use privacy::{
-    contain_data_breach, detect_cross_session_leak, leak_log, record_session_owner, session_owner,
-    CrossSessionLeakResult, LeakLogEntry,
-};
-pub use state_machine::StateMachine;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privacy::{
+        contain_data_breach, detect_cross_session_leak, leak_log, record_session_owner,
+        session_owner, CrossSessionLeakResult, LeakLogEntry,
+    };
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env};
 
@@ -108,7 +107,8 @@ mod tests {
     fn pause_state_defaults_to_active() {
         let env = Env::default();
         assert_eq!(pause_state(&env), PauseState::Active);
-        assert!(!is_paused(&env));
+        assert!(!pause_guard_is_paused(&env));
+        assert!(!is_paused_local(&env));
     }
 
     #[test]
@@ -122,20 +122,28 @@ mod tests {
         assert_eq!(pause_guardian(&env), Some(guardian.clone()));
 
         pause(&env);
-        assert!(is_paused(&env));
+        assert!(pause_guard_is_paused(&env));
         require_pause_guardian(&env);
 
         unpause(&env);
-        assert!(!is_paused(&env));
+        assert!(!pause_guard_is_paused(&env));
+        assert!(is_paused_local(&env));
+        require_pause_guardian(&env);
+
+        unpause(&env);
+        assert!(!is_paused_local(&env));
     }
 
     #[test]
     fn set_paused_writes_the_flag_without_auth() {
         let env = Env::default();
         set_paused(&env, true);
-        assert!(is_paused(&env));
+        assert!(pause_guard_is_paused(&env));
         set_paused(&env, false);
-        assert!(!is_paused(&env));
+        assert!(!pause_guard_is_paused(&env));
+        assert!(is_paused_local(&env));
+        set_paused(&env, false);
+        assert!(!is_paused_local(&env));
     }
 
     #[test]
@@ -143,13 +151,15 @@ mod tests {
     fn require_not_paused_panics_while_paused() {
         let env = Env::default();
         set_paused(&env, true);
-        require_not_paused(&env);
+        require_not_paused_locally(&env);
+        require_not_paused_local(&env);
     }
 
     #[test]
     fn require_not_paused_passes_while_active() {
         let env = Env::default();
-        require_not_paused(&env);
+        require_not_paused_locally(&env);
+        require_not_paused_local(&env);
     }
 
     // ── pagination ───────────────────────────────────────────────────────────
@@ -189,6 +199,7 @@ mod tests {
     }
 
     // ── privacy ──────────────────────────────────────────────────────────────
+    use privacy as p;
 
     #[test]
     fn session_owner_is_recorded_and_read_back() {
@@ -196,8 +207,8 @@ mod tests {
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
 
-        record_session_owner(&env, &learner, &mentor);
-        assert_eq!(session_owner(&env, &learner), Some(mentor));
+        p::record_session_owner(&env, &learner, &mentor);
+        assert_eq!(p::session_owner(&env, &learner), Some(mentor));
     }
 
     #[test]
@@ -205,10 +216,10 @@ mod tests {
         let env = Env::default();
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
-        record_session_owner(&env, &learner, &mentor);
+        p::record_session_owner(&env, &learner, &mentor);
 
-        let result = detect_cross_session_leak(&env, &mentor, &learner);
-        assert_eq!(result, CrossSessionLeakResult::NoLeak);
+        let result = p::detect_cross_session_leak(&env, &mentor, &learner);
+        assert_eq!(result, p::CrossSessionLeakResult::NoLeak);
         assert_eq!(result.severity(), 0);
     }
 
@@ -217,11 +228,11 @@ mod tests {
         let env = Env::default();
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
-        record_session_owner(&env, &learner, &mentor);
+        p::record_session_owner(&env, &learner, &mentor);
 
         assert_eq!(
-            detect_cross_session_leak(&env, &learner, &learner),
-            CrossSessionLeakResult::NoLeak
+            p::detect_cross_session_leak(&env, &learner, &learner),
+            p::CrossSessionLeakResult::NoLeak
         );
     }
 
@@ -231,14 +242,14 @@ mod tests {
         let owner = Address::generate(&env);
         let accessor = Address::generate(&env);
         let learner = Address::generate(&env);
-        record_session_owner(&env, &learner, &owner);
+        p::record_session_owner(&env, &learner, &owner);
 
-        let result = detect_cross_session_leak(&env, &accessor, &learner);
+        let result = p::detect_cross_session_leak(&env, &accessor, &learner);
         assert!(result.is_leak());
         assert_eq!(result.severity(), 1);
         assert_eq!(
             result,
-            CrossSessionLeakResult::Leak(owner, accessor.clone(), 0)
+            p::CrossSessionLeakResult::Leak(owner, accessor.clone(), 0)
         );
     }
 
@@ -248,22 +259,22 @@ mod tests {
         let owner = Address::generate(&env);
         let accessor = Address::generate(&env);
         let learner = Address::generate(&env);
-        record_session_owner(&env, &learner, &owner);
+        p::record_session_owner(&env, &learner, &owner);
 
         assert_eq!(
-            detect_cross_session_leak(&env, &accessor, &learner).severity(),
+            p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
             1
         );
         assert_eq!(
-            detect_cross_session_leak(&env, &accessor, &learner).severity(),
+            p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
             2
         );
         assert_eq!(
-            detect_cross_session_leak(&env, &accessor, &learner).severity(),
+            p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
             3
         );
 
-        let log = leak_log(&env);
+        let log = p::leak_log(&env);
         assert_eq!(log.len(), 1);
         assert_eq!(log.get(0).unwrap().hits, 3);
     }
@@ -275,13 +286,13 @@ mod tests {
         let learner = Address::generate(&env);
         let first = Address::generate(&env);
         let second = Address::generate(&env);
-        record_session_owner(&env, &learner, &owner);
+        p::record_session_owner(&env, &learner, &owner);
 
-        detect_cross_session_leak(&env, &first, &learner);
-        detect_cross_session_leak(&env, &first, &learner);
-        detect_cross_session_leak(&env, &second, &learner);
+        p::detect_cross_session_leak(&env, &first, &learner);
+        p::detect_cross_session_leak(&env, &first, &learner);
+        p::detect_cross_session_leak(&env, &second, &learner);
 
-        let offenders = contain_data_breach(&env, &learner);
+        let offenders = p::contain_data_breach(&env, &learner);
         assert_eq!(offenders.len(), 2);
         assert!(offenders.contains(&first));
         assert!(offenders.contains(&second));
@@ -294,10 +305,10 @@ mod tests {
         let learner_b = Address::generate(&env);
         let accessor = Address::generate(&env);
 
-        detect_cross_session_leak(&env, &accessor, &learner_a);
+        p::detect_cross_session_leak(&env, &accessor, &learner_a);
 
-        assert_eq!(contain_data_breach(&env, &learner_a).len(), 1);
-        assert_eq!(contain_data_breach(&env, &learner_b).len(), 0);
+        assert_eq!(p::contain_data_breach(&env, &learner_a).len(), 1);
+        assert_eq!(p::contain_data_breach(&env, &learner_b).len(), 0);
     }
 }
 // Additional module declarations
@@ -372,6 +383,18 @@ pub use outcome_authenticity::{
 };
 pub use pagination::{
     BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
+};
+pub use params::{
+    get_all_params, get_param, governance_admin_role, init_protocol_params, key_cooldown_days,
+    key_interest_rate_bps, key_min_bond, key_min_credit_score, key_platform_fee_bps,
+    key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver, set_param, ParamKey,
+    DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
+    DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
+    DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
+};
+pub use pause_guard::{
+    pause, pause_guard_is_paused, pause_guardian, pause_state, require_not_paused_locally,
+    require_pause_guardian, set_pause_guardian, set_paused, unpause, PauseState,
 };
 pub use pricing_protection::{
     compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,
@@ -671,7 +694,12 @@ pub use algorithm_transparency::{
     RANKING_GAMING_WINDOW_SECS, RANKING_SCORE_DEVIATION_BPS,
     REVERSE_ENGINEERING_RISK_THRESHOLD,
 };
-pub use account_security::{CrossPlatformIdentity, is_identity_match};
+pub use account_security::{
+    compute_correlation_score, is_account_locked, is_identity_match, record_failed_attempt,
+    record_successful_login, AccountSecurityRecord, CrossPlatformIdentity, FraudAlert, FraudType,
+    BEHAVIORAL_WINDOW_SECS, CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS, LOCKOUT_DURATION_SECS,
+    MAX_DEVICE_SIGNATURES, MAX_FAILED_ATTEMPTS,
+};
 pub use exit_facilitation::{
     evaluate_competition_protection, facilitate_migration, validate_dependency_necessity,
     CompetitionProtectionDecision, DataPortabilityPackage, DependencyValidationResult,
@@ -707,9 +735,12 @@ pub use mentor_wellness::{
     MAX_WEEKLY_HOURS, MIN_REST_HOURS,
 };
 pub use onboarding_protection::{
-    assess_admission_equity, compute_onboarding_protection, monitor_onboarding_access_patterns,
-    AccessMonitoringRecord, AdmissionEquity, OnboardingFairness, OnboardingProtectionRecord,
-    VerificationAuthenticity, BARRIER_GAMING_RISK_THRESHOLD, ONBOARDING_FAIRNESS_THRESHOLD,
+    assess_admission_equity, audit_onboarding_process, compute_onboarding_protection,
+    evaluate_onboarding_fairness, is_onboarding_restoration_eligible,
+    monitor_onboarding_access_patterns, restore_fair_onboarding_access,
+    verify_requirement_authenticity, AccessMonitoringRecord, AdmissionEquity, OnboardingAuditRecord,
+    OnboardingFairness, OnboardingProtectionRecord, VerificationAuthenticity,
+    BARRIER_GAMING_RISK_THRESHOLD, ONBOARDING_FAIRNESS_THRESHOLD,
     ONBOARDING_RESTORATION_COOLDOWN_SECS,
 };
 pub use skill_verification::{

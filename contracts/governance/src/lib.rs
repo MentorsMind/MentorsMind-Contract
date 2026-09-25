@@ -31,9 +31,13 @@ use shared::{
     // #124 — Arbitrator dispute independence protection
     ensure_dispute_independence, DisputeIndependenceFlag,
 };
+use shared::governance_voting::{
+    detect_vote_manipulation, validate_minimum_holding_period, ManipulationFlag,
+};
+use shared::StakeRecord;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
-    BytesN, Env, IntoVal, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
+    Address, Bytes, BytesN, Env, IntoVal, Symbol, Vec,
 };
 
 // Instance storage: frequently read config
@@ -220,9 +224,11 @@ pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Proposal(u32),
-    /// Per-address count of currently active (not executed/failed/cancelled)
-    /// proposals. Used to limit active proposals per address.
-    ActiveProposalCount(Address),
+    /// Total count of currently active (not executed/failed/cancelled)
+    /// proposals. Used to enforce the global active proposal cap.
+    ActiveProposalCount,
+    /// Per-address count of currently active proposals.
+    PerAddressActiveProposalCount(Address),
     /// Per-proposal escrow deposit amount (in token smallest units)
     ProposalDeposit(u32),
     Vote(u32, Address),
@@ -291,6 +297,9 @@ pub enum DataKey {
     // ── #867 Transaction intent ────────────────────────────────────────────
     /// Whether a voter's account has been flagged for suspicious activity.
     GovVoterFlag(Address),
+    /// Staking contract queried for the proposer's `staked_at` timestamp
+    /// when enforcing the minimum holding period on `create_proposal`.
+    StakingContract,
 }
 
 #[contracttype]
@@ -511,6 +520,20 @@ impl GovernanceContract {
             .set(&TEMPLATES, &templates_contract);
     }
 
+    /// Set the staking contract whose `get_stake` record supplies the
+    /// proposer's `staked_at` timestamp. Once set, `create_proposal` rejects
+    /// proposers who have not held their stake for `MIN_HOLDING_PERIOD_SECS`.
+    pub fn set_staking_contract(env: Env, admin: Address, staking_contract: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingContract, &staking_contract);
+    }
+
+    pub fn get_staking_contract(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::StakingContract)
+    }
+
     /// Set the MultisigAdmin contract address used for cancel escalation
     /// after an admin exceeds 3 cancellations in 30 days.
     pub fn set_multisig_admin(env: Env, admin: Address, multisig_admin: Address) {
@@ -580,6 +603,33 @@ impl GovernanceContract {
             }
         }
 
+        // Flash-loan protection: the proposer must have held their stake for
+        // at least MIN_HOLDING_PERIOD_SECS before they can create a proposal.
+        Self::require_holding_period(&env, &proposer);
+
+        // === Anti-griefing: enforce active proposal limits before side effects ===
+        let max_active: u32 = env
+            .storage()
+            .instance()
+            .get(&MAX_ACTIVE_PROPOSALS_SYM)
+            .unwrap_or(3u32);
+        let total_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0u32);
+        if total_active >= max_active {
+            panic_with_error!(&env, Error::TooManyActiveProposals);
+        }
+        let current_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerAddressActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if current_active >= max_active {
+            panic_with_error!(&env, Error::TooManyActiveProposals);
+        }
+
         // === OPTIMIZATION: Batch storage reads to reduce redundant operations ===
         let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
@@ -646,21 +696,6 @@ impl GovernanceContract {
             timelock_op_id: BytesN::from_array(&env, &[0; 32]),
         };
 
-        // === Anti-griefing: enforce per-address active proposal limits ===
-        let max_active: u32 = env
-            .storage()
-            .instance()
-            .get(&MAX_ACTIVE_PROPOSALS_SYM)
-            .unwrap_or(3u32);
-        let current_active: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ActiveProposalCount(proposer.clone()))
-            .unwrap_or(0u32);
-        if current_active >= max_active {
-            panic!("exceeds max active proposals per address");
-        }
-
         // Check proposer balance at snapshot time against min_proposer_balance
         let min_bal: i128 = env
             .storage()
@@ -687,7 +722,13 @@ impl GovernanceContract {
         // Track active proposals per proposer
         env.storage()
             .persistent()
-            .set(&DataKey::ActiveProposalCount(proposer.clone()), &(current_active + 1u32));
+            .set(
+                &DataKey::PerAddressActiveProposalCount(proposer.clone()),
+                &(current_active + 1u32),
+            );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveProposalCount, &(total_active + 1u32));
 
         // If configured, record deposit amount per-proposal (escrow bookkeeping)
         let deposit: i128 = env
@@ -855,6 +896,17 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
+        // Advisory manipulation detection: the vote above is already recorded,
+        // this only raises an on-chain alert for off-chain review.
+        if let Some(flag) =
+            Self::detect_late_vote_manipulation(&env, &proposal, &voter, &window, weight, weighted)
+        {
+            env.events().publish(
+                (Symbol::new(&env, "VoteManipulationAlert"), proposal_id),
+                flag,
+            );
+        }
+
         emit_governance_event(
             &env,
             evt_gov_vote_cast(&env),
@@ -968,18 +1020,7 @@ impl GovernanceContract {
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
             // Cleanup: decrement active proposals and release any escrow bookkeeping
-            let proposer = proposal.proposer.clone();
-            let mut active: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ActiveProposalCount(proposer.clone()))
-                .unwrap_or(0u32);
-            if active > 0 {
-                active = active - 1;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
-            }
+            Self::decrement_active_proposal_count(&env, &proposal.proposer);
             env.storage()
                 .persistent()
                 .remove(&DataKey::ProposalDeposit(proposal_id));
@@ -1051,18 +1092,7 @@ impl GovernanceContract {
                 .set(&DataKey::Proposal(proposal_id), &proposal);
 
             // Cleanup after execution: decrement active proposals and clear escrow record
-            let proposer = proposal.proposer.clone();
-            let mut active: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ActiveProposalCount(proposer.clone()))
-                .unwrap_or(0u32);
-            if active > 0 {
-                active = active - 1;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
-            }
+            Self::decrement_active_proposal_count(&env, &proposal.proposer);
             env.storage()
                 .persistent()
                 .remove(&DataKey::ProposalDeposit(proposal_id));
@@ -1094,18 +1124,7 @@ impl GovernanceContract {
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
         // Cleanup after execution: decrement active proposals and clear escrow record
-        let proposer = proposal.proposer.clone();
-        let mut active: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ActiveProposalCount(proposer.clone()))
-            .unwrap_or(0u32);
-        if active > 0 {
-            active = active - 1;
-            env.storage()
-                .persistent()
-                .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
-        }
+        Self::decrement_active_proposal_count(&env, &proposal.proposer);
         env.storage()
             .persistent()
             .remove(&DataKey::ProposalDeposit(proposal_id));
@@ -1264,19 +1283,8 @@ impl GovernanceContract {
                 .remove(&DataKey::ProposalDeposit(proposal_id));
         }
 
-        // Decrement active proposal count for proposer
-        let proposer = proposal.proposer.clone();
-        let mut active: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ActiveProposalCount(proposer.clone()))
-            .unwrap_or(0u32);
-        if active > 0 {
-            active = active - 1;
-            env.storage()
-                .persistent()
-                .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
-        }
+        // Decrement active proposal counts.
+        Self::decrement_active_proposal_count(&env, &proposal.proposer);
 
         // Update cooldown timestamp for (admin, action_type)
         env.storage()
@@ -1613,6 +1621,13 @@ impl GovernanceContract {
             .expect("proposal not found")
     }
 
+    pub fn get_active_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0u32)
+    }
+
     pub fn get_vote(env: Env, id: u32, voter: Address) -> bool {
         env.storage()
             .persistent()
@@ -1663,6 +1678,89 @@ impl GovernanceContract {
         if &stored != admin {
             panic!("unauthorized");
         }
+    }
+
+    fn decrement_active_proposal_count(env: &Env, proposer: &Address) {
+        let total_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0u32);
+        if total_active > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActiveProposalCount, &(total_active - 1u32));
+        }
+
+        let proposer_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerAddressActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if proposer_active > 0 {
+            env.storage().persistent().set(
+                &DataKey::PerAddressActiveProposalCount(proposer.clone()),
+                &(proposer_active - 1u32),
+            );
+        }
+    }
+
+    /// Enforce `MIN_HOLDING_PERIOD_SECS` for `proposer` using the `staked_at`
+    /// timestamp from the configured staking contract. A proposer with no
+    /// stake record is treated as having just staked. No-op until a staking
+    /// contract is configured via `set_staking_contract`.
+    fn require_holding_period(env: &Env, proposer: &Address) {
+        let staking_contract: Option<Address> =
+            env.storage().persistent().get(&DataKey::StakingContract);
+        let staking_contract = match staking_contract {
+            Some(addr) => addr,
+            None => return,
+        };
+
+        let now = env.ledger().timestamp();
+        let staked_at = match env.try_invoke_contract::<StakeRecord, soroban_sdk::Error>(
+            &staking_contract,
+            &Symbol::new(env, "get_stake"),
+            (proposer.clone(),).into_val(env),
+        ) {
+            Ok(Ok(record)) => record.staked_at,
+            _ => now,
+        };
+
+        if validate_minimum_holding_period(staked_at, now).is_err() {
+            panic_with_error!(env, Error::HoldingPeriodNotMet);
+        }
+    }
+
+    /// Flag votes cast in the late window (after `EARLY_WINDOW_END_BPS` and
+    /// `MID_WINDOW_END_BPS`, i.e. the `LATE_WEIGHT_BPS` window) whose cast
+    /// time is close to the voting deadline — the last-minute swap pattern.
+    ///
+    /// `detect_vote_manipulation` flags an action that happens shortly before
+    /// a reference time, so the vote's cast time is passed as the action time
+    /// and the proposal's `voting_ends_at` as the reference.
+    fn detect_late_vote_manipulation(
+        env: &Env,
+        proposal: &Proposal,
+        voter: &Address,
+        window: &VotingWindow,
+        weight: i128,
+        weighted: i128,
+    ) -> Option<ManipulationFlag> {
+        if window.weight_bps != LATE_WEIGHT_BPS {
+            return None;
+        }
+
+        let cast_at = env.ledger().timestamp();
+        detect_vote_manipulation(env, cast_at, proposal.voting_ends_at, weight, voter).map(
+            |mut flag| {
+                flag.proposal_id = proposal.id;
+                flag.reason = symbol_short!("late_vote");
+                flag.detected_at = cast_at;
+                flag.vote_weight = weighted;
+                flag
+            },
+        )
     }
 
     fn require_active_proposal(env: &Env, proposal: &Proposal) {
@@ -4124,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "exceeds max active proposals per address")]
+    #[should_panic]
     fn test_spam_fourth_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -4168,6 +4266,70 @@ mod tests {
         let title = Bytes::from_slice(&env, b"p4");
         let description_hash = BytesN::from_array(&env, &[9u8; 32]);
         gov.create_proposal(&voter, &title, &description_hash, &ProposalAction::UpdateFee(999));
+    }
+
+    #[test]
+    fn test_active_proposal_cap_and_finalization_release_slots() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+            &Some(0i128),
+            &Some(0i128),
+            &Some(1u32),
+        );
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &600i128);
+
+        let first = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"first"),
+            &BytesN::from_array(&env, &[30u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(gov.get_active_proposal_count(), 1);
+
+        gov.vote(&voter, &first, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&first);
+        assert_eq!(gov.get_active_proposal_count(), 0);
+
+        let second = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"second"),
+            &BytesN::from_array(&env, &[31u8; 32]),
+            &ProposalAction::UpdateFee(301),
+        );
+        assert_eq!(gov.get_active_proposal_count(), 1);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&second);
+        assert_eq!(gov.get_active_proposal_count(), 0);
+
+        gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"third"),
+            &BytesN::from_array(&env, &[32u8; 32]),
+            &ProposalAction::UpdateFee(302),
+        );
+        assert_eq!(gov.get_active_proposal_count(), 1);
     }
 
     #[test]
@@ -4274,5 +4436,212 @@ mod tests {
             estimate.base_instructions,
             actual
         );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // #1102 — vote manipulation detection / #1104 — minimum holding period
+    // ═════════════════════════════════════════════════════════════════════
+
+    use shared::governance_voting::MIN_HOLDING_PERIOD_SECS;
+
+    #[contract]
+    pub struct MockStakingHolding;
+
+    #[contractimpl]
+    impl MockStakingHolding {
+        pub fn set_staked_at(env: Env, mentor: Address, staked_at: u64) {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("STK_AT"), mentor), &staked_at);
+        }
+
+        pub fn get_stake(env: Env, mentor: Address) -> StakeRecord {
+            let staked_at: u64 = env
+                .storage()
+                .persistent()
+                .get(&(symbol_short!("STK_AT"), mentor.clone()))
+                .expect("no stake");
+            StakeRecord {
+                mentor,
+                amount: 200,
+                staked_at,
+                unlock_at: 0,
+                unlock_cooldown_until: None,
+                tier: 0,
+            }
+        }
+    }
+
+    const MANIPULATION_TEST_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
+    fn setup_manipulation_gov(
+        env: &Env,
+    ) -> (
+        GovernanceContractClient<'static>,
+        MockMntTokenClient<'static>,
+        Address,
+    ) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000_000);
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(env, &gov_id);
+        let token = MockMntTokenClient::new(env, &token_id);
+        MockSnapshotClient::new(env, &snapshot_id).set_token(&token_id);
+
+        let admin = Address::generate(env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(MANIPULATION_TEST_PERIOD_SECS),
+            &Some(1_000u32),
+            &None,
+            &None,
+            &None,
+        );
+        token.set_total_supply(&1_000i128);
+        (gov, token, admin)
+    }
+
+    fn manipulation_alerts(env: &Env) -> std::vec::Vec<ManipulationFlag> {
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
+        use soroban_sdk::TryFromVal;
+        let topic =
+            ScVal::try_from_val(env, &Symbol::new(env, "VoteManipulationAlert").to_val()).unwrap();
+        env.events()
+            .all()
+            .events()
+            .iter()
+            .filter_map(|e| match &e.body {
+                ContractEventBody::V0(v) if v.topics.first() == Some(&topic) => {
+                    let data = soroban_sdk::Val::try_from_val(env, &v.data).unwrap();
+                    Some(ManipulationFlag::try_from_val(env, &data).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_vote_in_last_block_emits_manipulation_alert() {
+        let env = Env::default();
+        let (gov, token, _admin) = setup_manipulation_gov(&env);
+        let voter = Address::generate(&env);
+        token.set_balance(&voter, &200i128);
+
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Late swap"),
+            &BytesN::from_array(&env, &[40u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        let proposal = gov.get_proposal(&proposal_id);
+
+        // Last ledger (~5s) before the voting period closes.
+        env.ledger().set_timestamp(proposal.voting_ends_at - 5);
+        gov.vote(&voter, &proposal_id, &true);
+
+        let alerts = manipulation_alerts(&env);
+        assert_eq!(alerts.len(), 1, "late vote must raise one alert");
+        let flag = &alerts[0];
+        assert_eq!(flag.proposal_id, proposal_id);
+        assert_eq!(flag.voter, voter);
+        assert_eq!(flag.reason, symbol_short!("late_vote"));
+        assert_eq!(flag.detected_at, proposal.voting_ends_at - 5);
+        assert_eq!(flag.stake_snapshot, 200);
+        // Late-window votes carry the LATE_WEIGHT_BPS multiplier.
+        assert_eq!(flag.vote_weight, 200 * LATE_WEIGHT_BPS as i128 / 10_000);
+
+        // Detection is advisory: the vote is still recorded.
+        assert!(gov.get_vote(&proposal_id, &voter));
+        assert_eq!(gov.get_proposal(&proposal_id).votes_for, 200);
+    }
+
+    #[test]
+    fn test_early_vote_emits_no_manipulation_alert() {
+        let env = Env::default();
+        let (gov, token, _admin) = setup_manipulation_gov(&env);
+        let voter = Address::generate(&env);
+        token.set_balance(&voter, &200i128);
+
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Early vote"),
+            &BytesN::from_array(&env, &[41u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60);
+        gov.vote(&voter, &proposal_id, &true);
+
+        assert!(manipulation_alerts(&env).is_empty());
+        assert!(gov.get_vote(&proposal_id, &voter));
+    }
+
+    #[test]
+    fn test_new_staker_cannot_create_proposal() {
+        let env = Env::default();
+        let (gov, token, admin) = setup_manipulation_gov(&env);
+        let staking_id = env.register_contract(None, MockStakingHolding);
+        gov.set_staking_contract(&admin, &staking_id);
+
+        let proposer = Address::generate(&env);
+        token.set_balance(&proposer, &200i128);
+        // Staked in this very ledger (flash-loan pattern).
+        MockStakingHoldingClient::new(&env, &staking_id)
+            .set_staked_at(&proposer, &env.ledger().timestamp());
+
+        let res = gov.try_create_proposal(
+            &proposer,
+            &Bytes::from_slice(&env, b"Flash proposal"),
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(res, Err(Ok(Error::HoldingPeriodNotMet)));
+    }
+
+    #[test]
+    fn test_proposer_without_stake_cannot_create_proposal() {
+        let env = Env::default();
+        let (gov, _token, admin) = setup_manipulation_gov(&env);
+        let staking_id = env.register_contract(None, MockStakingHolding);
+        gov.set_staking_contract(&admin, &staking_id);
+
+        let res = gov.try_create_proposal(
+            &Address::generate(&env),
+            &Bytes::from_slice(&env, b"No stake"),
+            &BytesN::from_array(&env, &[43u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(res, Err(Ok(Error::HoldingPeriodNotMet)));
+    }
+
+    #[test]
+    fn test_staker_past_holding_period_can_create_proposal() {
+        let env = Env::default();
+        let (gov, token, admin) = setup_manipulation_gov(&env);
+        let staking_id = env.register_contract(None, MockStakingHolding);
+        gov.set_staking_contract(&admin, &staking_id);
+        assert_eq!(gov.get_staking_contract(), Some(staking_id.clone()));
+
+        let proposer = Address::generate(&env);
+        token.set_balance(&proposer, &200i128);
+        MockStakingHoldingClient::new(&env, &staking_id).set_staked_at(
+            &proposer,
+            &(env.ledger().timestamp() - MIN_HOLDING_PERIOD_SECS),
+        );
+
+        let proposal_id = gov.create_proposal(
+            &proposer,
+            &Bytes::from_slice(&env, b"Seasoned proposal"),
+            &BytesN::from_array(&env, &[44u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(gov.get_proposal(&proposal_id).proposer, proposer);
     }
 }

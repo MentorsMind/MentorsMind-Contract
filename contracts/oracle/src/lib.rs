@@ -25,8 +25,9 @@ use soroban_sdk::{
     BytesN, Env, Symbol, Vec,
 };
 use shared::mev_protection::{
-    detect_atomic_arbitrage, enforce_protocol_isolation, record_mev_monitoring,
-    MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
+    compute_mev_redistribution, detect_atomic_arbitrage, enforce_protocol_isolation,
+    record_mev_monitoring, MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
+    MEV_ARBITRAGE_RISK_THRESHOLD,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,8 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const FEEDERS: Symbol = symbol_short!("FEEDERS");
 const RBAC: Symbol = symbol_short!("RBAC");
 const MEV_INTERACTION: Symbol = symbol_short!("MEV_INT");
+const MEV_MONITORING: Symbol = symbol_short!("MEV_MON");
+const MEV_MONITORING_TTL_LEDGERS: u32 = 1_024;
 
 /// Minimum number of active (non-stale) feeders required to compute TWAP.
 const MIN_FEEDERS: u32 = 3;
@@ -350,6 +353,7 @@ impl OracleContract {
             points.remove(0);
         }
         env.storage().persistent().set(&key, &points);
+        Self::_update_twap(&env, &asset, &points);
 
         // #869 — Record successful participation for accountability.
         record_epoch_participation_safe(&env, &feeder);
@@ -441,19 +445,71 @@ impl OracleContract {
             panic!("no prices after outlier rejection");
         }
 
-        let twap = Self::median(inliers);
+        (Self::median(inliers), last_updated)
+    }
 
-        // Update TWAP state for circuit-breaker use.
-        let twap_key = (symbol_short!("TWAP"), asset);
-        env.storage().persistent().set(
-            &twap_key,
-            &TwapState {
-                twap,
-                last_updated,
-            },
-        );
+    /// Return the current TWAP and monitor callers whose reads show a
+    /// suspicious spot-price deviation.
+    pub fn get_twap(env: Env, asset: Symbol) -> i128 {
+        let twap_key = (symbol_short!("TWAP"), asset.clone());
+        let twap_state: TwapState = env
+            .storage()
+            .persistent()
+            .get(&twap_key)
+            .expect("no TWAP available - need at least 2 price submissions");
 
-        (twap, last_updated)
+        let (spot, _) = Self::get_price(env.clone(), asset.clone());
+        let deviation = if spot > twap_state.twap {
+            spot - twap_state.twap
+        } else {
+            twap_state.twap - spot
+        };
+        let deviation_bps = deviation
+            .checked_mul(10_000)
+            .unwrap_or(i128::MAX)
+            .checked_div(twap_state.twap.max(1))
+            .unwrap_or(i128::MAX);
+
+        let caller = env.invoker();
+        let interactions = Self::_track_mev_interaction(&env, &caller);
+        let mev_flag = detect_atomic_arbitrage(&env, &caller, interactions);
+        if mev_flag.risk_score >= MEV_ARBITRAGE_RISK_THRESHOLD {
+            let extraction = compute_mev_redistribution(&env, deviation_bps, &mev_flag);
+            let record = record_mev_monitoring(
+                &env,
+                symbol_short!("oracle"),
+                caller.clone(),
+                &mev_flag,
+                &extraction,
+            );
+            let record_key = (
+                MEV_MONITORING,
+                asset,
+                caller,
+                env.ledger().sequence(),
+                interactions,
+            );
+            env.storage().temporary().set(&record_key, &record);
+            env.storage().temporary().extend_ttl(
+                &record_key,
+                1,
+                MEV_MONITORING_TTL_LEDGERS,
+            );
+        }
+
+        twap_state.twap
+    }
+
+    /// Return a caller's temporary MEV monitoring record for a ledger read.
+    pub fn get_mev_monitoring(
+        env: Env,
+        asset: Symbol,
+        caller: Address,
+        ledger: u32,
+        interaction: u32,
+    ) -> Option<MevMonitoringRecord> {
+        let key = (MEV_MONITORING, asset, caller, ledger, interaction);
+        env.storage().temporary().get(&key)
     }
 
     // -----------------------------------------------------------------------
@@ -755,6 +811,49 @@ impl OracleContract {
         count
     }
 
+    fn _update_twap(env: &Env, asset: &Symbol, points: &Vec<PricePoint>) {
+        let n = points.len();
+        if n < 2 {
+            return;
+        }
+
+        let start = if n > TWAP_WINDOW { n - TWAP_WINDOW } else { 0 };
+        let mut cumulative: i128 = 0;
+        let mut total_elapsed: u64 = 0;
+        let mut index = start;
+        while index + 1 < n {
+            let current = points.get(index).unwrap();
+            let next = points.get(index + 1).unwrap();
+            if next.timestamp > current.timestamp {
+                let elapsed = next.timestamp - current.timestamp;
+                cumulative = cumulative
+                    .checked_add(
+                        current
+                            .price
+                            .checked_mul(elapsed as i128)
+                            .unwrap_or(i128::MAX),
+                    )
+                    .unwrap_or(i128::MAX);
+                total_elapsed = total_elapsed.saturating_add(elapsed);
+            }
+            index += 1;
+        }
+
+        if total_elapsed == 0 {
+            return;
+        }
+
+        let last_updated = points.get(n - 1).unwrap().timestamp;
+        let key = (symbol_short!("TWAP"), asset.clone());
+        env.storage().persistent().set(
+            &key,
+            &TwapState {
+                twap: cumulative / total_elapsed as i128,
+                last_updated,
+            },
+        );
+    }
+
     /// Count the number of distinct feeder addresses in a set of price points.
     fn count_distinct_feeders(env: &Env, points: &Vec<PricePoint>) -> u32 {
         let mut seen: Vec<Address> = Vec::new(env);
@@ -831,6 +930,10 @@ impl OracleContract {
         // After threshold, record missed epoch and potentially slash.
         if new_trips >= FEEDER_SLASH_THRESHOLD {
             let flagged = record_missed_epoch_safe(env, feeder);
+            if new_trips == FEEDER_SLASH_THRESHOLD {
+                let evidence_hash = BytesN::from_array(env, &[0u8; 32]);
+                apply_slash(env, feeder, ViolationType::MissedEpoch, evidence_hash);
+            }
             if flagged {
                 OracleFeederFlaggedEvent {
                     category: symbol_short!("oracle"),
@@ -875,7 +978,10 @@ fn record_missed_epoch_safe(env: &Env, validator: &Address) -> bool {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::Env;
 
@@ -1089,6 +1195,80 @@ mod tests {
         // Feeder accountability record should reflect ejection.
         let rec = client.get_feeder_accountability(&feeder).unwrap();
         assert!(rec.ejected);
+    }
+
+    #[test]
+    fn test_record_missed_epoch_increments_feeder_counter() {
+        let env = Env::default();
+        let feeder = Address::generate(&env);
+        register_validator(&env, &feeder);
+
+        assert!(!record_missed_epoch(&env, &feeder));
+
+        let record = get_validator_record(&env, &feeder).unwrap();
+        assert_eq!(record.epochs_missed, 1);
+        assert_eq!(record.consecutive_missed, 1);
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_applies_feeder_slash() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 3);
+        let asset = symbol_short!("XLM");
+
+        submit(&env, &client, &feeders.get(0).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(1).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(2).unwrap(), asset.clone(), 100, 999);
+        client.get_price(&asset);
+
+        let feeder = feeders.get(0).unwrap();
+        for _ in 0..FEEDER_SLASH_THRESHOLD {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                client.submit_price(&feeder, &asset, &200, &999);
+            }));
+            assert!(result.is_err());
+        }
+
+        let record = client.get_feeder_accountability(&feeder).unwrap();
+        assert_eq!(record.epochs_missed, 1);
+        assert_eq!(
+            record.total_slashed_bps,
+            shared::validator_accountability::SLASH_MINOR_BPS
+        );
+        assert_eq!(record.total_violations, 1);
+    }
+
+    #[test]
+    fn test_consensus_attack_flags_deviating_feeder() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 3);
+        let asset = symbol_short!("XLM");
+
+        submit(&env, &client, &feeders.get(0).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(1).unwrap(), asset.clone(), 100, 999);
+        submit(&env, &client, &feeders.get(2).unwrap(), asset.clone(), 100, 999);
+        client.get_price(&asset);
+
+        let feeder = feeders.get(0).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            client.submit_price(&feeder, &asset, &200, &999);
+        }));
+        assert!(result.is_err());
+
+        let evidence = BytesN::from_array(&env, &[0xCDu8; 32]);
+        let anomaly_score = client.detect_oracle_consensus_attack(
+            &admin,
+            &feeder,
+            &symbol_short!("price_deviation"),
+            &evidence,
+        );
+
+        assert_eq!(anomaly_score, 10_000 / feeders.len() as u32);
+        assert!(client.get_feeder_accountability(&feeder).unwrap().ejected);
     }
 
     // -----------------------------------------------------------------------
