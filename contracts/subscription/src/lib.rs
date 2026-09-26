@@ -5,6 +5,7 @@ use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_sub_expiry_grace,
     DEFAULT_SUB_EXPIRY_GRACE,
+    Pagination, MAX_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -676,6 +677,33 @@ impl SubscriptionContract {
             .persistent()
             .get(&DataKey::Plan(plan_id))
             .expect("plan not found")
+    }
+
+    /// Get the total count of subscriptions.
+    pub fn get_subscription_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SubCounter)
+            .unwrap_or(0)
+    }
+
+    /// Get a paginated page of subscriptions.
+    pub fn get_subscriptions_page(env: Env, offset: u32, limit: u32) -> Vec<SubscriptionRecord> {
+        let count = env.storage()
+            .persistent()
+            .get(&DataKey::SubCounter)
+            .unwrap_or(0);
+
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut page = Vec::new(&env);
+
+        for i in start..end {
+            if let Some(record) = env.storage().persistent().get(&DataKey::Sub(i)) {
+                page.push_back(record);
+            }
+        }
+
+        page
     }
 
     // -----------------------------------------------------------------------
@@ -1657,5 +1685,35 @@ mod test {
         assert_eq!(token.balance(&mentor), 600);
         assert_eq!(token.balance(&learner), 400);
         assert_eq!(token.balance(&escrow), 0);
+    }
+
+    #[test]
+    fn test_get_subscriptions_page() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+        token_admin.mint(&learner, &1000);
+
+        // Create a plan and subscribe 3 times
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+
+        let sub_id_0 = client.subscribe(&learner, &plan_id);
+        let sub_id_1 = client.subscribe(&learner, &plan_id);
+        let sub_id_2 = client.subscribe(&learner, &plan_id);
+
+        // Verify count
+        let count = client.get_subscription_count();
+        assert_eq!(count, 3);
+
+        // Get first page with limit 2
+        let page = client.get_subscriptions_page(&0u32, &2u32);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().plan_id, plan_id);
+        assert_eq!(page.get(1).unwrap().plan_id, plan_id);
+
+        // Get second page with offset 2
+        let page = client.get_subscriptions_page(&2u32, &2u32);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().plan_id, plan_id);
     }
 }

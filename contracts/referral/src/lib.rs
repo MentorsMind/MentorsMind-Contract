@@ -64,6 +64,8 @@ pub enum DataKey {
     LifetimeClaimed(Address),
     GlobalMinted,
     PendingAdmin,
+    /// Stores pending rewards deferred for manual review due to suspicious pattern.
+    SuspiciousClaim(Address),
 }
 
 const REWARD_MENTOR: i128 = 50 * 10_000_000; // 50 MNT (7 decimals)
@@ -325,6 +327,39 @@ impl ReferralContract {
         );
     }
 
+    /// Check if a referrer exhibits a suspicious referral pattern.
+    /// Flags rapid registration cycles (e.g., many referrals in recent epochs).
+    fn is_suspicious_referral_pattern(env: &Env, referrer: &Address) -> bool {
+        let current_epoch = Self::current_epoch(env);
+        let threshold = 5u32; // Flag if > 5 referrals in current epoch or previous epoch
+
+        // Check current epoch
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochReferralCount(current_epoch, referrer.clone()))
+            .unwrap_or(0);
+
+        if current_count > threshold {
+            return true;
+        }
+
+        // Check previous epoch for rapid cycles
+        if current_epoch > 0 {
+            let prev_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::EpochReferralCount(current_epoch - 1, referrer.clone()))
+                .unwrap_or(0);
+
+            if prev_count > threshold {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn claim_reward(env: Env, referrer: Address) {
         // Check pause guardian before any state mutation
         if let Some(guardian) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PauseGuardian) {
@@ -341,6 +376,34 @@ impl ReferralContract {
             .unwrap_or(0);
         if pending <= 0 {
             panic!("No rewards to claim");
+        }
+
+        // Detect suspicious referral patterns before processing the claim
+        if Self::is_suspicious_referral_pattern(&env, &referrer) {
+            // Store claim for manual review instead of processing
+            let suspicious_pending: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SuspiciousClaim(referrer.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::SuspiciousClaim(referrer.clone()),
+                &(suspicious_pending + pending),
+            );
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "Referral"),
+                    Symbol::new(&env, "SuspiciousPatternDetected"),
+                    referrer.clone(),
+                ),
+                (pending,),
+            );
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingReward(referrer.clone()), &0i128);
+            return;
         }
 
         let config: ReferralConfig = env
@@ -1254,6 +1317,36 @@ mod test {
             ref_client.get_pending_rewards(&referrer),
             REWARD_MENTOR,
             "Pending reward must remain after reverted reentrant claim"
+        );
+    }
+
+    #[test]
+    fn test_rapid_referral_registrations_triggers_suspicious_flag() {
+        let f = Fixture::new();
+        let env = f.env;
+        let ref_client = f.client();
+
+        let referrer = Address::generate(&env);
+
+        // Create 6 referrals in the current epoch (threshold is 5)
+        for i in 0..6 {
+            let referee = Address::generate(&env);
+            ref_client.register_referral(&referrer, &referee, &true);
+            ref_client.fulfill_referral(&referee);
+        }
+
+        // Verify there is a pending reward
+        let pending = ref_client.get_pending_rewards(&referrer);
+        assert!(pending > 0, "Should have pending rewards after registrations");
+
+        // Attempt to claim - should be flagged as suspicious
+        ref_client.claim_reward(&referrer);
+
+        // The pending reward should be moved to suspicious claim instead of minted
+        assert_eq!(
+            ref_client.get_pending_rewards(&referrer),
+            0,
+            "Pending reward should be cleared"
         );
     }
 }
