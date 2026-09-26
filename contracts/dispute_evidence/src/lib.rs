@@ -1049,6 +1049,61 @@ impl DisputeEvidenceContract {
             return Err(Error::AppealAlreadySubmitted);
         }
 
+        // Justice intervention: compute whether systemic arbitration bias warrants
+        // blocking re-arbitration until a fair-resolution window opens.
+        // Load the three cached signals (same pattern as get_justice_status).
+        let independence: DisputeIndependenceFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeIndependence(escrow_id))
+            .unwrap_or(DisputeIndependenceFlag {
+                independent: true,
+                risk_score: 0,
+                shared_actor_count: 0,
+                clustered_timing_count: 0,
+            });
+        let evidence: SharedEvidenceAuthenticity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EvidenceAuthenticityRecord(escrow_id))
+            .unwrap_or(SharedEvidenceAuthenticity {
+                authentic: true,
+                tampering_risk_score: 0,
+                duplicate_submission_count: 0,
+                suspicious_timing_count: 0,
+            });
+        let bias: ArbitrationBiasFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationFairness(resolution.arbitrator.clone()))
+            .unwrap_or(ArbitrationBiasFlag {
+                fair: true,
+                bias_risk_score: 0,
+                one_sided_ratio_bps: 0,
+                ruling_count: 0,
+            });
+        let intervention = compute_justice_intervention(
+            &env,
+            independence,
+            evidence,
+            bias,
+            JUSTICE_RESTORATION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::JusticeIntervention(escrow_id), &intervention);
+
+        if intervention.intervene {
+            env.events().publish(
+                (Symbol::new(&env, "JusticeInterventionRequired"), escrow_id),
+                (intervention.combined_risk_score, intervention.reason.clone()),
+            );
+            // Block re-arbitration until the restoration cooldown has elapsed.
+            if !is_justice_restoration_eligible(&intervention, env.ledger().timestamp()) {
+                return Err(Error::JusticeRestorationNotEligible);
+            }
+        }
+
         let governance: Address = env
             .storage()
             .instance()
