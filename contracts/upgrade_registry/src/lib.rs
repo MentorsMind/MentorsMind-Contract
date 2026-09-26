@@ -1884,6 +1884,55 @@ mod test {
     }
 
     #[test]
+    fn test_schedule_upgrade_version_not_monotonic_downgrade() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.register_upgrade(&contract_name, &0, &2, &hash);
+
+        // version 2 → 1 must be rejected
+        let result = client.try_schedule_upgrade(&hash, &contract_name, &1, &hash, &signers);
+        assert_eq!(result, Err(Ok(Error::VersionNotMonotonic)));
+    }
+
+    #[test]
+    fn test_schedule_upgrade_version_not_monotonic_same() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.register_upgrade(&contract_name, &0, &2, &hash);
+
+        // version 2 → 2 must also be rejected
+        let result = client.try_schedule_upgrade(&hash, &contract_name, &2, &hash, &signers);
+        assert_eq!(result, Err(Ok(Error::VersionNotMonotonic)));
+    }
+
+    #[test]
+    fn test_schedule_upgrade_succeeds_with_higher_version() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.register_upgrade(&contract_name, &0, &2, &hash);
+
+        // version 2 → 3 must succeed and create a pending upgrade
+        client.schedule_upgrade(&hash, &contract_name, &3, &hash, &signers);
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(pending.new_version, 3);
+    }
+
+    #[test]
     fn test_execute_without_schedule_fails() {
         let (env, admin, _contract_id, client) = setup();
         let signers = soroban_sdk::vec![&env, admin.clone()];
