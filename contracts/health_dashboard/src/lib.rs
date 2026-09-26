@@ -3,6 +3,7 @@
 use shared::health_reporter::{
     AlertSeverity, HealthMetric, HealthThresholds, MetricCategory, SystemHealth,
 };
+use shared::pagination::{OperationBudget, Pagination, MAX_PAGE_SIZE};
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Env, IntoVal, Map, Symbol, Vec,
 };
@@ -14,64 +15,117 @@ use soroban_sdk::{
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    /// Escrow funds are locked pending session completion.
     Active,
+    /// Funds have been released to the mentor upon successful completion.
     Released,
+    /// A dispute has been opened by a party, freezing escrow movement.
     Disputed,
+    /// Escrow funds have been refunded back to the learner.
     Refunded,
+    /// The dispute has been arbitrated and settled.
     Resolved,
 }
 
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Escrow {
+    /// Unique numeric identifier for the escrow instance.
     pub id: u64,
+    /// Address of the mentor delivering the session.
     pub mentor: Address,
+    /// Address of the learner paying for the session.
     pub learner: Address,
+    /// Total escrow principal amount, in token smallest units.
     pub amount: i128,
+    /// Associated mentoring session identifier symbol.
     pub session_id: Symbol,
+    /// Current lifecycle state of the escrow.
     pub status: EscrowStatus,
+    /// Timestamp (seconds) when the escrow was initialized.
     pub created_at: u64,
+    /// Contract address of the payment token (e.g. USDC or MNT).
     pub token_address: Address,
+    /// Fee collected by the platform protocol, in token smallest units.
     pub platform_fee: i128,
+    /// Net token amount payable to the mentor, in token smallest units.
     pub net_amount: i128,
+    /// Expected completion timestamp (seconds) of the mentoring session.
     pub session_end_time: u64,
+    /// Grace period in seconds after session_end_time before auto-release triggers.
     pub auto_release_delay: u64,
+    /// Reason code symbol provided if a dispute is filed.
     pub dispute_reason: Symbol,
+    /// Timestamp (seconds) when the dispute was resolved, or 0 if unresolved.
     pub resolved_at: u64,
+    /// USD equivalent valuation of the escrow, in token smallest units.
     pub usd_amount: i128,
+    /// Quoted token amount converted from reference currency.
     pub quoted_token_amount: i128,
+    /// Source asset address for cross-currency routed escrows.
     pub send_asset: Address,
+    /// Destination asset address received by the mentor.
     pub dest_asset: Address,
+    /// Total scheduled sessions included in this escrow agreement.
     pub total_sessions: u32,
+    /// Number of scheduled sessions verified as completed so far.
     pub sessions_completed: u32,
 }
 
-/// Threshold (bps of a mentor's disputes / total sessions) above which
-/// [`HealthDashboardContract::record_dispute_opened`] emits a
-/// `MentorDisputeRateAlert` event. 2000 bps = 20%.
+/// Dispute rate alert threshold in basis points (2000 bps = 20.00%).
+///
+/// ### Definition
+/// Encodes the ratio of total disputes opened against a mentor relative to their
+/// total recorded mentoring sessions (`disputes * 10_000 / sessions`).
+///
+/// ### Business Significance
+/// A mentor whose dispute rate exceeds 20% indicates significant friction, service
+/// delivery issues, or potential malicious behavior. When breached, the platform
+/// automatically emits a `MentorDisputeRateAlert` event to alert community moderators,
+/// triage arbitration queues, and prompt administrative review or staking slash evaluation.
+///
+/// ### Governance Process
+/// Modifying this threshold requires a standard DAO governance parameter change
+/// proposal submitted through the governance timelock. Adjustments should be justified
+/// by network-wide dispute trends, statistical analysis of false positives, and mentor
+/// onboarding volumes to ensure appropriate alert sensitivity.
 pub const DISPUTE_RATE_ALERT_BPS: u32 = 2000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeStats {
+    /// Total count of disputes opened across all historical sessions.
     pub total_opened: u32,
+    /// Number of disputes resolved in favor of the mentor.
     pub total_resolved_mentor_favor: u32,
+    /// Number of disputes resolved in favor of the learner.
     pub total_resolved_learner_favor: u32,
+    /// Number of arbitrated disputes appealed to community governance.
     pub total_appealed: u32,
+    /// Average duration from dispute opening to resolution, in seconds.
     pub avg_resolution_time_secs: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlatformStats {
+    /// Total value locked across all active escrows, in token smallest units.
     pub total_value_locked: i128,
+    /// Number of currently active, non-finalized escrows.
     pub active_escrows: u32,
+    /// Aggregate count of all mentoring sessions created on the platform.
     pub total_sessions: u32,
+    /// Network-wide aggregate dispute rate, in basis points (1 bps = 0.01%).
     pub dispute_rate_bps: u32,
+    /// Total registered mentors active on the platform.
     pub total_mentors: u32,
+    /// Total registered learners active on the platform.
     pub total_learners: u32,
+    /// Total MNT tokens currently staked in the staking contract, in smallest units.
     pub mnt_staked: i128,
+    /// Mapping of platform contract identifiers to their active version numbers.
     pub contract_versions: Map<Symbol, u32>,
+    /// List of learner addresses flagged for security review or excessive disputes.
     pub flagged_learners: Vec<Address>,
 }
 
@@ -79,8 +133,11 @@ pub struct PlatformStats {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceEntry {
+    /// Identifier symbol of the protocol interface.
     pub interface_id: Symbol,
+    /// Deployed contract address implementing the interface.
     pub contract: Address,
+    /// Semantic version number of the contract implementation.
     pub version: u32,
 }
 
@@ -89,38 +146,56 @@ pub struct InterfaceEntry {
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
+    /// Global configuration containing addresses of dependent protocol contracts.
     Config,
-    /// `(ledger_sequence, cached stats)` — invalidated when ledger advances.
-    Cache,
+    /// `(ledger_sequence, cached stats)` for a given `(offset, limit)` page
+    /// of escrows — invalidated when ledger advances.
+    Cache(u32, u32),
     /// Platform-wide dispute aggregate ([`DisputeStats`]).
     DisputeStats,
     /// Number of disputes ever opened against a given mentor, used by
     /// [`HealthDashboardContract::get_mentor_dispute_rate`].
     MentorDisputeCount(Address),
-    /// Health metric storage keys
+    /// Health metric storage keys partitioned by page number.
     MetricPage(u32),
+    /// Total number of stored metric pages.
     PageCount,
+    /// Pointer to the latest active metric page index.
     CurrentPage,
+    /// Maximum number of metrics stored per page.
     PageSize,
+    /// Configured health thresholds for automated evaluation.
     Thresholds,
+    /// Most recent evaluated system health status snapshot.
     LastHealth,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
+    /// Admin address authorized to execute privileged dashboard maintenance.
     pub admin: Address,
+    /// Contract address of the escrow factory / manager.
     pub escrow: Address,
+    /// Contract address managing session scheduling and lifecycle events.
     pub session_registry: Address,
+    /// Contract address handling MNT staking and reward distribution.
     pub staking: Address,
+    /// Contract address of the native MNT utility and governance token.
     pub mnt_token: Address,
+    /// Contract address computing and storing participant reputation metrics.
     pub reputation: Address,
+    /// Contract address tracking interface implementations and versions.
     pub interface_registry: Address,
+    /// Contract address managing protocol treasury reserves and allocations.
     pub treasury: Address,
+    /// Contract address maintaining the insurance fund pool.
     pub insurance: Address,
+    /// Contract address providing liquidity lending and borrowing facilities.
     pub lending_pool: Address,
+    /// Contract address of the USDC stablecoin settlement token.
     pub usdc_token: Address,
-    /// Address of this health dashboard contract (for self-referencing)
+    /// Address of this health dashboard contract (for self-referencing).
     pub health_dashboard: Address,
 }
 
@@ -132,26 +207,42 @@ pub struct Config {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAllocationView {
+    /// Identifier number for the pending allocation request.
     pub id: u32,
+    /// Token address of the asset scheduled for allocation.
     pub token: Address,
+    /// Beneficiary address designated to receive the allocated funds.
     pub recipient: Address,
+    /// Allocation amount, in token smallest units.
     pub amount: i128,
+    /// Total number of governance/guardian approvals gathered for the allocation.
     pub approvals_count: u32,
+    /// Flag indicating whether the allocation transaction has been executed.
     pub executed: bool,
+    /// Timestamp (seconds) when the allocation request was created.
     pub created_at: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SolvencyReport {
+    /// Available liquid reserves in the protocol treasury, in token smallest units.
     pub treasury_balance: i128,
+    /// Total committed but unexecuted treasury allocations, in token smallest units.
     pub pending_allocations: i128,
+    /// Liquid capital balance held in the insurance pool, in token smallest units.
     pub insurance_pool_balance: i128,
+    /// Total outstanding unpaid insurance claims, in token smallest units.
     pub outstanding_claims: i128,
+    /// Total principal staked by users across all staking tiers, in token smallest units.
     pub staking_total: i128,
+    /// Total accrued but unclaimed staking rewards owed to stakers, in token smallest units.
     pub pending_rewards: i128,
+    /// Total liquidity provided across all active lending pools, in token smallest units.
     pub lending_total_liquidity: i128,
+    /// Total borrowed principal currently outstanding across all active loans, in token smallest units.
     pub outstanding_loans: i128,
+    /// Overall protocol solvency verdict: `true` if aggregate reserves exceed obligations.
     pub is_solvent: bool,
 }
 
@@ -202,24 +293,29 @@ impl HealthDashboardContract {
         );
     }
 
-    /// Returns platform-wide metrics, using a one-ledger cache to limit
-    /// cross-contract work within the same ledger.
-    pub fn get_platform_stats(env: Env) -> PlatformStats {
+    /// Returns platform metrics aggregated over one page of escrows
+    /// (`offset` is 0-based; `limit` is clamped to `MAX_PAGE_SIZE`), using a
+    /// one-ledger cache per page to limit cross-contract work within the
+    /// same ledger. Escrow-derived fields (TVL, active escrows, disputes,
+    /// mentors, learners, flagged learners) cover only that page; callers
+    /// page through `offset` to cover every escrow.
+    pub fn get_platform_stats(env: Env, offset: u32, limit: u32) -> PlatformStats {
         let ledger = env.ledger().sequence();
+        let cache_key = DataKey::Cache(offset, limit);
         if let Some((cached_ledger, stats)) = env
             .storage()
             .persistent()
-            .get::<_, (u32, PlatformStats)>(&DataKey::Cache)
+            .get::<_, (u32, PlatformStats)>(&cache_key)
         {
             if cached_ledger == ledger {
                 return stats;
             }
         }
 
-        let stats = Self::compute_platform_stats(&env);
+        let stats = Self::compute_platform_stats(&env, offset, limit);
         env.storage()
             .persistent()
-            .set(&DataKey::Cache, &(ledger, stats.clone()));
+            .set(&cache_key, &(ledger, stats.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "stats_refreshed"),),
@@ -353,7 +449,11 @@ impl HealthDashboardContract {
     /// Aggregate solvency view across treasury, insurance, staking, and
     /// lending pool. Emits a `SolvencyAlert` event if the protocol is
     /// detected as insolvent (is_solvent == false).
-    pub fn get_protocol_solvency(env: Env) -> SolvencyReport {
+    ///
+    /// `pending_allocations` sums one page of the treasury's pending
+    /// allocations (`offset` is 0-based; `limit` is clamped to
+    /// `MAX_PAGE_SIZE`); callers page through `offset` to cover them all.
+    pub fn get_protocol_solvency(env: Env, offset: u32, limit: u32) -> SolvencyReport {
         let cfg: Config = env
             .storage()
             .persistent()
@@ -378,7 +478,12 @@ impl HealthDashboardContract {
             )
             .unwrap_or(Ok(0))
             .unwrap_or(0);
-        for i in 0..pending_count {
+        let (start, end) = Pagination::new(offset, limit).bounds(pending_count);
+        let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+        for i in start..end {
+            if budget.consume().is_err() {
+                break;
+            }
             if let Ok(Ok(Some(pending))) = env
                 .try_invoke_contract::<Option<PendingAllocationView>, soroban_sdk::Error>(
                     &cfg.treasury,
@@ -467,7 +572,8 @@ impl HealthDashboardContract {
         // Outstanding loans = bad_debt + (initial liquidity - current liquidity)
         let initial_liquidity_proxy: i128 = treasury_balance.saturating_add(insurance_pool_balance);
         let outstanding_loans: i128 = bad_debt
-            .saturating_add(initial_liquidity_proxy.saturating_sub(lending_total_liquidity));
+            .saturating_add(initial_liquidity_proxy.saturating_sub(lending_total_liquidity))
+            .max(0);
 
         // ── Solvency check ───────────────────────────────────────────────
         // treasury must cover pending allocations
@@ -576,7 +682,11 @@ impl HealthDashboardContract {
 
     /// Determine if the system is healthy based on configurable thresholds.
     /// Checks: error rate, TVL, critical alert count, and warning alert count.
-    pub fn is_system_healthy(env: Env) -> SystemHealth {
+    ///
+    /// Evaluates metric pages `[offset, offset + limit)` (see
+    /// `get_metric_page_count`), with `limit` clamped to `MAX_PAGE_SIZE` and
+    /// at most `MAX_PAGE_SIZE` metrics inspected per call.
+    pub fn is_system_healthy(env: Env, offset: u32, limit: u32) -> SystemHealth {
         let thresholds: HealthThresholds = env
             .storage()
             .persistent()
@@ -602,7 +712,9 @@ impl HealthDashboardContract {
         let mut error_count: u32 = 0;
         let mut active_sources: Map<Address, bool> = Map::new(&env);
 
-        for page_idx in 0..page_count {
+        let (start, end) = Pagination::new(offset, limit).bounds(page_count);
+        let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+        'pages: for page_idx in start..end {
             let metrics: Vec<HealthMetric> = env
                 .storage()
                 .persistent()
@@ -610,6 +722,9 @@ impl HealthDashboardContract {
                 .unwrap_or_else(|| Vec::new(&env));
 
             for metric in metrics.iter() {
+                if budget.consume().is_err() {
+                    break 'pages;
+                }
                 total_metrics += 1;
 
                 if metric.recorded_at > last_updated {
@@ -696,7 +811,7 @@ impl HealthDashboardContract {
 }
 
 impl HealthDashboardContract {
-    fn compute_platform_stats(env: &Env) -> PlatformStats {
+    fn compute_platform_stats(env: &Env, offset: u32, limit: u32) -> PlatformStats {
         let cfg: Config = env
             .storage()
             .persistent()
@@ -718,7 +833,15 @@ impl HealthDashboardContract {
         let mut mentor_vec: Vec<Address> = Vec::new(env);
         let mut learner_vec: Vec<Address> = Vec::new(env);
 
-        for id in 1u64..=escrow_count {
+        // Escrow ids are 1-based; page over them 0-based.
+        let total = u32::try_from(escrow_count).unwrap_or(u32::MAX);
+        let (start, end) = Pagination::new(offset, limit).bounds(total);
+        let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+        for idx in start..end {
+            if budget.consume().is_err() {
+                break;
+            }
+            let id = idx as u64 + 1;
             let e: Escrow = env.invoke_contract(
                 &cfg.escrow,
                 &Symbol::new(env, "get_escrow"),
@@ -1131,7 +1254,7 @@ mod test {
 
         let escrow_id = env.register_contract(None, MockEscrow);
         let session_reg = env.register_contract(None, MockSessionRegistry);
-        let staking = Address::generate(&env);
+        let staking = env.register_contract(None, MockStakingForSolvency);
         let mnt = env.register_contract(None, MockMntToken);
         MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
 
@@ -1164,7 +1287,7 @@ mod test {
     fn test_stats_aggregation() {
         let (env, dashboard, _mnt) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let s = client.get_platform_stats();
+        let s = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
 
         assert_eq!(s.total_value_locked, 1000);
         assert_eq!(s.active_escrows, 1);
@@ -1190,8 +1313,8 @@ mod test {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
 
-        let s1 = client.get_platform_stats();
-        let s2 = client.get_platform_stats();
+        let s1 = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
+        let s2 = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
         assert_eq!(s1.total_sessions, s2.total_sessions);
         assert_eq!(s1.mnt_staked, s2.mnt_staked);
     }
@@ -1200,13 +1323,13 @@ mod test {
     fn test_cache_invalidates_next_ledger() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let _ = client.get_platform_stats();
+        let _ = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
 
         env.ledger().with_mut(|li| {
             li.sequence_number += 1;
         });
 
-        let _ = client.get_platform_stats();
+        let _ = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1217,7 +1340,7 @@ mod test {
     fn test_get_protocol_solvency_returns_all_fields() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         // All fields must be non-negative (overflow-protected)
         assert!(report.treasury_balance >= 0);
@@ -1243,7 +1366,7 @@ mod test {
 
         let escrow_id = env.register_contract(None, MockEscrow);
         let session_reg = env.register_contract(None, MockSessionRegistry);
-        let staking = Address::generate(&env);
+        let staking = env.register_contract(None, MockStakingForSolvency);
         let mnt = env.register_contract(None, MockMntToken);
         MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
 
@@ -1271,7 +1394,7 @@ mod test {
         );
 
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         assert!(!report.is_solvent, "insolvent when treasury < pending");
         assert_eq!(report.treasury_balance, 500);
@@ -1286,7 +1409,7 @@ mod test {
 
         let escrow_id = env.register_contract(None, MockEscrow);
         let session_reg = env.register_contract(None, MockSessionRegistry);
-        let staking = Address::generate(&env);
+        let staking = env.register_contract(None, MockStakingForSolvency);
         let mnt = env.register_contract(None, MockMntToken);
         MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
 
@@ -1314,7 +1437,7 @@ mod test {
         );
 
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
         assert!(!report.is_solvent);
 
         // Check that SolvencyAlert event was emitted
@@ -1329,7 +1452,7 @@ mod test {
     fn test_solvency_all_fields_non_negative_during_normal_ops() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         // Verify all numeric fields are >= 0 (overflow protection)
         assert!(report.treasury_balance >= 0);
@@ -1346,7 +1469,7 @@ mod test {
     fn test_solvency_exact_values_match_mocks() {
         let (env, dashboard, _) = setup();
         let client = HealthDashboardContractClient::new(&env, &dashboard);
-        let report = client.get_protocol_solvency();
+        let report = client.get_protocol_solvency(&0, &MAX_PAGE_SIZE);
 
         assert_eq!(report.treasury_balance, 100_000);
         assert_eq!(report.pending_allocations, 10_000);
@@ -1580,5 +1703,150 @@ mod test {
         client.record_appeal(&1);
         client.record_appeal(&2);
         assert_eq!(client.get_dispute_stats().total_appealed, 2);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Pagination (#1103)
+    // ═════════════════════════════════════════════════════════════════════
+
+    const MANY_ESCROWS: u64 = MAX_PAGE_SIZE as u64 + 5;
+
+    /// Escrow mock with more escrows than fit in one page. Every escrow is
+    /// Active with amount 10 and a distinct mentor/learner.
+    #[contract]
+    pub struct MockEscrowMany;
+
+    #[contractimpl]
+    impl MockEscrowMany {
+        pub fn get_escrow_count(_env: Env) -> u64 {
+            MANY_ESCROWS
+        }
+
+        pub fn get_escrow(env: Env, id: u64) -> Escrow {
+            let t = Address::generate(&env);
+            Escrow {
+                id,
+                mentor: Address::generate(&env),
+                learner: Address::generate(&env),
+                amount: 10,
+                session_id: symbol_short!("s"),
+                status: EscrowStatus::Active,
+                created_at: 0,
+                token_address: t.clone(),
+                platform_fee: 0,
+                net_amount: 0,
+                session_end_time: 0,
+                auto_release_delay: 0,
+                dispute_reason: symbol_short!("none"),
+                resolved_at: 0,
+                usd_amount: 0,
+                quoted_token_amount: 0,
+                send_asset: t.clone(),
+                dest_asset: t,
+                total_sessions: 1,
+                sessions_completed: 0,
+            }
+        }
+    }
+
+    /// Treasury mock with more pending allocations than fit in one page,
+    /// each worth 1.
+    #[contract]
+    pub struct MockTreasuryMany;
+
+    #[contractimpl]
+    impl MockTreasuryMany {
+        pub fn get_balance(_env: Env, _token: Address) -> i128 {
+            1_000_000
+        }
+        pub fn pending_allocation_count(_env: Env) -> u32 {
+            MAX_PAGE_SIZE + 5
+        }
+        pub fn get_pending_allocation(env: Env, id: u32) -> Option<PendingAllocationView> {
+            Some(PendingAllocationView {
+                id,
+                token: Address::generate(&env),
+                recipient: Address::generate(&env),
+                amount: 1,
+                approvals_count: 1,
+                executed: false,
+                created_at: 0,
+            })
+        }
+    }
+
+    fn setup_many() -> (Env, HealthDashboardContractClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+
+        let mnt = env.register_contract(None, MockMntToken);
+        let dashboard = env.register_contract(None, HealthDashboardContract);
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        client.initialize(
+            &Address::generate(&env),
+            &env.register_contract(None, MockEscrowMany),
+            &env.register_contract(None, MockSessionRegistry),
+            &env.register_contract(None, MockStakingForSolvency),
+            &mnt,
+            &env.register_contract(None, MockReputation),
+            &env.register_contract(None, MockInterfaceRegistry),
+            &env.register_contract(None, MockTreasuryMany),
+            &env.register_contract(None, MockInsurance),
+            &env.register_contract(None, MockLendingPool),
+            &env.register_contract(None, MockMntToken),
+        );
+        (env, client)
+    }
+
+    #[test]
+    fn test_platform_stats_limit_clamped_to_max_page_size() {
+        let (_env, client) = setup_many();
+        let s = client.get_platform_stats(&0, &u32::MAX);
+        assert_eq!(s.active_escrows, MAX_PAGE_SIZE);
+        assert_eq!(s.total_value_locked, 10 * MAX_PAGE_SIZE as i128);
+        assert_eq!(s.total_mentors, MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_platform_stats_pages_cover_all_escrows() {
+        let (_env, client) = setup_many();
+        let first = client.get_platform_stats(&0, &MAX_PAGE_SIZE);
+        let second = client.get_platform_stats(&MAX_PAGE_SIZE, &MAX_PAGE_SIZE);
+        assert_eq!(first.active_escrows, MAX_PAGE_SIZE);
+        assert_eq!(second.active_escrows, 5);
+        assert_eq!(
+            (first.active_escrows + second.active_escrows) as u64,
+            MANY_ESCROWS
+        );
+
+        let partial = client.get_platform_stats(&3, &4);
+        assert_eq!(partial.active_escrows, 4);
+
+        let past_end = client.get_platform_stats(&(MANY_ESCROWS as u32), &10);
+        assert_eq!(past_end.active_escrows, 0);
+        assert_eq!(past_end.total_value_locked, 0);
+    }
+
+    #[test]
+    fn test_platform_stats_cache_is_per_page() {
+        let (_env, client) = setup_many();
+        let a = client.get_platform_stats(&0, &2);
+        let b = client.get_platform_stats(&0, &3);
+        assert_eq!(a.active_escrows, 2);
+        assert_eq!(b.active_escrows, 3);
+    }
+
+    #[test]
+    fn test_solvency_pending_allocations_paginated() {
+        let (_env, client) = setup_many();
+        let first = client.get_protocol_solvency(&0, &u32::MAX);
+        assert_eq!(first.pending_allocations, MAX_PAGE_SIZE as i128);
+
+        let second = client.get_protocol_solvency(&MAX_PAGE_SIZE, &MAX_PAGE_SIZE);
+        assert_eq!(second.pending_allocations, 5);
+
+        let past_end = client.get_protocol_solvency(&(MAX_PAGE_SIZE + 5), &10);
+        assert_eq!(past_end.pending_allocations, 0);
     }
 }

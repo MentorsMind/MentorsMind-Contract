@@ -1,343 +1,166 @@
 # Contributing to MentorMinds Contracts
 
-Thank you for your interest in contributing to MentorMinds! This guide will help you set up a local development environment and understand our contribution process.
+Thank you for contributing to the MentorMinds Soroban contract suite. This
+guide covers local setup, the development workflow, adding contracts, and
+opening a pull request.
 
-## 🚀 Quick Start
+## Prerequisites
 
-### Prerequisites
+Install the following tools before starting:
 
-- **Docker** and **Docker Compose** installed
-- **Node.js** 18+ 
-- **Rust** 1.70+ with `wasm32-unknown-unknown` target
-- **Soroban CLI** (latest version)
+- Rust 1.70 or newer, with `rustup`.
+- The Soroban CLI, installed with `cargo install --locked soroban-cli`.
+- Docker and Docker Compose, for the local Stellar environment.
+- Node.js 18 or newer and pnpm, for the repository helper scripts.
+
+Install the Rust target used by the contract build and confirm the tools are
+available:
 
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup target add wasm32-unknown-unknown
-
-# Install Soroban CLI
-cargo install --locked soroban-cli
+rustup target add wasm32v1-none
+rustc --version
+soroban --version
+docker --version
+pnpm --version
 ```
 
-### Local Development Setup
+## Development Setup
 
-1. **Clone and setup the repository:**
+Clone the repository and install JavaScript dependencies:
+
 ```bash
 git clone https://github.com/MentorsMind/MentorsMind-Contract.git
 cd MentorsMind-Contract
+pnpm install
 ```
 
-2. **Start the local development environment:**
-```bash
-npm run local:start
-```
-
-This command will:
-- Start a local Stellar node using Docker
-- Create and fund 5 test accounts (admin, mentor1, mentor2, learner1, learner2)
-- Build and deploy all smart contracts
-- Save configuration to `deployed/local.json`
-
-3. **Seed sample data (optional):**
-```bash
-npm run local:seed
-```
-
-This creates sample escrows, sessions, reviews, and a dispute scenario for testing.
-
-4. **Check the status:**
-```bash
-npm run local:status
-```
-
-## 🛠️ Development Workflow
-
-### Available Scripts
+Start the local Stellar environment when you need to exercise deployed
+contracts:
 
 ```bash
-# Local environment management
-npm run local:start    # Start local Stellar node and deploy contracts
-npm run local:stop     # Stop the local Stellar node
-npm run local:reset    # Reset the entire environment (stop, clean, start)
-npm run local:seed     # Create sample data for testing
-npm run local:status   # Check environment status
-npm run local:logs     # View Stellar container logs
-
-# Contract development
-npm run build          # Build all contracts
-npm run build:escrow   # Build only escrow contract
-npm run optimize       # Optimize WASM files
-npm run test          # Run all tests
-npm run clean         # Clean build artifacts
+pnpm run local:start
+pnpm run local:status
 ```
 
-### Service Endpoints
-
-When the local environment is running, these services are available:
-
-- **Horizon API**: http://localhost:8000
-- **Stellar RPC**: http://localhost:8001  
-- **Friendbot** (funding): http://localhost:8002
-- **Soroban RPC**: http://localhost:8003
-
-### Test Accounts
-
-The setup creates these pre-funded accounts:
-
-| Account | Role | Identity Name |
-|---------|------|---------------|
-| admin | Platform administration | `local_admin` |
-| mentor1 | Web Development mentor | `local_mentor1` |
-| mentor2 | Smart Contract mentor | `local_mentor2` |
-| learner1 | Test learner | `local_learner1` |
-| learner2 | Test learner | `local_learner2` |
-
-Account details are saved in `deployed/accounts.json`.
-
-## 📁 Project Structure
-
-```
-mentorminds-contracts/
-├── contracts/              # Smart contracts
-│   ├── verification/      # Mentor verification contract
-│   ├── oracle/           # Price oracle contract
-│   ├── timelock/         # Timelock contract
-│   └── treasury/         # Treasury contract
-├── escrow/               # Main escrow contract
-├── scripts/              # Deployment and utility scripts
-│   ├── setup-local.sh    # Local environment setup
-│   ├── seed-local.sh     # Sample data creation
-│   └── deploy.sh         # Production deployment
-├── deployed/             # Generated configuration files
-│   ├── local.json       # Local contract addresses
-│   ├── accounts.json     # Test account details
-│   └── seed_*.json       # Sample data files
-├── tests/               # Integration tests
-├── docker-compose.yml   # Local Stellar configuration
-└── package.json         # NPM scripts and metadata
-```
-
-## 🔧 Contract Development
-
-### Building Contracts
+The setup script starts the Docker services, creates local test accounts, and
+writes generated deployment data under `deployed/`. Seed data is optional:
 
 ```bash
-# Build all contracts
-npm run build
-
-# Build specific contract
-npm run build:escrow
-
-# Optimize WASM for deployment
-npm run optimize
+pnpm run local:seed
 ```
 
-### Testing
+Stop or reset the environment with:
 
 ```bash
-# Run unit tests
-npm run test
-
-# Run tests for specific contract
-cd escrow && cargo test
+pnpm run local:stop
+pnpm run local:reset
 ```
 
-### Local Deployment
+## Build and Test
 
-The local setup script automatically handles deployment, but you can manually deploy:
+Build the workspace contracts for Soroban:
 
 ```bash
-# Deploy escrow contract
-soroban contract deploy \
-  --wasm escrow/target/wasm32-unknown-unknown/release/mentorminds_escrow.wasm \
-  --source local_admin \
-  --network standalone
-
-# Initialize contract
-soroban contract invoke \
-  --id <CONTRACT_ID> \
-  --source local_admin \
-  --network standalone \
-  -- initialize \
-  --admin <ADMIN_ADDRESS> \
-  --platform_fee 5
+cargo build --target wasm32v1-none
 ```
 
-## 🌐 Network Configuration
-
-### Local Network
-
-The local setup uses a standalone network with these settings:
-
-- **Network Name**: `standalone`
-- **Network Passphrase**: `Standalone Network ; February 2017`
-- **Friendbot**: Available for instant funding
-
-### Adding Other Networks
+For optimized release WASM, use the benchmark build or the existing package
+script where applicable. Run the complete Rust test suite from the workspace
+root:
 
 ```bash
-# Add testnet
-soroban config network add testnet \
-  --rpc-url https://soroban-testnet.stellar.org:443 \
-  --network-passphrase "Test SDF Network ; September 2015"
-
-# Add mainnet
-soroban config network add mainnet \
-  --rpc-url https://mainnet.stellar.org:443 \
-  --network-passphrase "Public Global Stellar Network ; September 2015"
+cargo test --workspace
 ```
 
-## 🧪 Testing with Sample Data
-
-After running `npm run local:seed`, you'll have:
-
-- **3 escrows** with different states (completed, disputed)
-- **2 verified mentors** with different skill sets
-- **2 completed sessions** with reviews
-- **1 active dispute** for testing
-- **Oracle price feeds** for XLM and metrics
-
-### Useful Testing Commands
+Before opening a PR, also format and lint Rust changes:
 
 ```bash
-# Check escrow details
-soroban contract invoke \
-  --id $(jq -r '.contracts.escrow.contract_id' deployed/local.json) \
-  --network standalone \
-  -- get_escrow \
-  --escrow_id <ESCROW_ID>
-
-# View mentor reviews
-soroban contract invoke \
-  --id $(jq -r '.contracts.verification.contract_id' deployed/local.json) \
-  --network standalone \
-  -- get_mentor_reviews \
-  --mentor <MENTOR_ADDRESS>
-
-# Check oracle prices
-soroban contract invoke \
-  --id $(jq -r '.contracts.oracle.contract_id' deployed/local.json) \
-  --network standalone \
-  -- get_all_prices
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-## 🧪 Testing Guidelines
+The test strategy and test locations are described in
+[`docs/TESTING.md`](docs/TESTING.md).
 
-- Keep contract tests close to the behavior they exercise. Unit tests belong next to the contract crate, while cross-contract and end-to-end checks belong in `tests/`.
-- Cover both the happy path and at least one failure case for every new control-flow branch.
-- Prefer deterministic fixtures and explicit ledger timestamps so test output stays stable across runs.
-- When a change affects storage layout, authorization, or upgrade behavior, add a regression test before merging.
-- Use coverage reports as a signal, not a target; the real goal is to keep critical security and state-transition paths exercised.
+## Running Benchmarks
 
-## 📝 Commenting Guidelines
-
-- Add inline comments only where the intent is not obvious from the code alone: state transitions, pricing math, authorization shortcuts, or storage TTL handling.
-- Explain the assumption being made, not the line of code itself.
-- Keep TODO and FIXME notes concrete, time-bound, and easy to search for during follow-up work.
-- Remove comments once the implementation becomes self-explanatory or the assumption no longer applies.
-
-## 🔍 Debugging
-
-### Common Issues
-
-1. **Docker port conflicts**: Ensure ports 8000-8003 are available
-2. **Soroban CLI version**: Use the latest version matching contract dependencies
-3. **Account funding**: Use friendbot for local accounts, Stellar Laboratory for testnet
-4. **Contract storage**: Reset environment with `npm run local:reset` if needed
-
-### Viewing Logs
+Benchmarks measure CPU instructions, memory, storage operations, and WASM size
+for selected contract entry points. From the repository root:
 
 ```bash
-# View Stellar container logs
-npm run local:logs
-
-# View specific service logs
-docker-compose logs stellar
+cargo build --target wasm32v1-none --release \
+  -p mentorminds-escrow \
+  -p mentorminds-staking \
+  -p mentorminds-governance \
+  -p mentorminds-timelock \
+  -p mentorminds-upgrade-registry \
+  -p mentorminds-dispute-evidence
+cargo run -p mentorminds-benchmarks
 ```
 
-### Environment Reset
+Reports are written to `benchmarks/results/`. Read
+[`benchmarks/README.md`](benchmarks/README.md) before updating a baseline;
+baseline changes should be intentional and explained in the PR.
 
-```bash
-# Complete reset
-npm run local:reset
+## Adding a New Contract
 
-# Manual cleanup
-npm run local:stop
-docker volume rm mentorminds-contract_stellar_data
-rm -rf deployed/*.json
-```
+New contracts should follow the existing workspace structure and security
+patterns. The minimum required components are:
 
-## 📝 Code Style
+- [ ] Add a crate under `contracts/<contract_name>/` with a `Cargo.toml` and
+      `src/lib.rs`.
+- [ ] Add the crate to the workspace members in the root `Cargo.toml`.
+- [ ] Define typed storage keys with a `DataKey` enum and include a
+      `DataKey::NamespaceRoot` entry. Follow the
+      [DataKey::NamespaceRoot guide (Issue #53)](https://github.com/MentorsMind/MentorsMind-Contract/issues/53)
+      and the [storage pattern documentation](docs/storage-guide.md).
+- [ ] Define a `#[contracterror]` error enum for all expected contract
+      failures.
+- [ ] Add an `initialize` entrypoint with an initialization guard so it cannot
+      be run twice.
+- [ ] Choose the correct Soroban storage tier and bump TTLs for persistent or
+      instance data according to the [storage pattern documentation](docs/storage-guide.md).
+- [ ] Emit events for state-changing operations. Document the event topics and
+      payloads in [`docs/events.md`](docs/events.md) (Issue #21).
+- [ ] Add unit and integration tests for successful and failing paths.
+- [ ] Add a benchmark suite entry when the contract has measurable critical
+      entry points, following [`benchmarks/README.md`](benchmarks/README.md).
 
-### Rust Contracts
+Keep storage keys append-only where possible. Changes to storage layout,
+authorization, events, or public interfaces need regression tests and a clear
+upgrade or migration explanation.
 
-- Use `cargo fmt` for formatting
-- Use `cargo clippy` for linting
-- Follow Soroban best practices
-- Include comprehensive error messages
-- Add inline documentation for public functions
+## Contribution Workflow
 
-### Shell Scripts
+1. Create a focused branch from the default branch:
 
-- Use `shellcheck` for validation
-- Follow POSIX compatibility
-- Include error handling with `set -e`
-- Use descriptive variable names
-- Add colored output for better UX
+   ```bash
+   git checkout -b feature/short-description
+   ```
 
-## 🤝 Contribution Process
+2. Make the smallest coherent change and add or update tests and docs.
+3. Run the build, test, formatting, lint, and relevant benchmark commands.
+4. Review the diff, generated files, and benchmark output before committing.
+5. Push the branch to your fork and open a pull request against the default
+   branch.
 
-1. **Fork** the repository
-2. **Create** a feature branch: `git checkout -b feature/amazing-feature`
-3. **Setup** local environment: `npm run local:start`
-4. **Make** your changes
-5. **Test** thoroughly: `npm run test && npm run local:seed`
-6. **Commit** your changes with descriptive messages
-7. **Push** to your fork: `git push origin feature/amazing-feature`
-8. **Create** a Pull Request
+## Pull Request Checklist
 
-### Pull Request Guidelines
+Use this checklist in the PR description:
 
-- Include tests for new features
-- Update documentation as needed
-- Ensure all existing tests pass
-- Describe the problem and solution clearly
-- Link relevant issues in the description
+- [ ] The PR explains the problem, the implementation, and any security or
+      storage implications.
+- [ ] Tests were added or updated for the changed behavior.
+- [ ] `cargo build --target wasm32v1-none` passes.
+- [ ] `cargo test --workspace` passes.
+- [ ] `cargo fmt --all -- --check` and the relevant Clippy checks pass.
+- [ ] Benchmarks were run when contract performance or a benchmarked entry
+      point changed; any baseline update is justified.
+- [ ] Documentation and event schemas were updated where needed.
+- [ ] No generated deployment artifacts, secrets, or unrelated formatting
+      changes are included.
+- [ ] Related issues are linked, including the relevant security or storage
+      issue when applicable.
 
-## 🐛 Bug Reports
-
-When reporting bugs, include:
-
-- Environment details (OS, Docker version, etc.)
-- Steps to reproduce
-- Expected vs actual behavior
-- Relevant logs and error messages
-- Contract addresses (if applicable)
-
-## 💡 Feature Requests
-
-Feature requests should:
-
-- Describe the use case clearly
-- Explain why it's valuable
-- Consider implementation complexity
-- Suggest API design if applicable
-
-## 📚 Resources
-
-- [Soroban Documentation](https://soroban.stellar.org/docs)
-- [Stellar Laboratory](https://laboratory.stellar.org/)
-- [Soroban Examples](https://github.com/stellar/soroban-examples)
-- [Stellar Discord](https://discord.gg/stellardev)
-
-## 🆘 Getting Help
-
-- Create an issue on GitHub
-- Join the Stellar Discord
-- Check existing documentation
-- Review similar contracts in the ecosystem
-
----
-
-Thank you for contributing to MentorMinds! Your contributions help make decentralized mentoring more accessible and secure. 🌟
+For questions or larger design changes, open an issue before implementation so
+the contract interface and storage implications can be discussed early.

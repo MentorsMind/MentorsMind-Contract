@@ -1,6 +1,75 @@
 #![no_std]
 #![allow(deprecated)]
 #![allow(dead_code, unused_assignments)]
+
+//! # Escrow Contract
+//!
+//! A platform-agnostic escrow service that holds funds between mentors and learners
+//! during paid sessions. Supports standard and milestone-based escrows with dispute
+//! resolution, automatic release, and emergency recovery mechanisms.
+//!
+//! ## Core Workflows
+//!
+//! ### Standard Escrow
+//! 1. Learner calls `create_escrow` to fund the entire session payment upfront
+//! 2. Upon successful session completion, learner calls `release_funds`
+//!    - Alternative: mentor waits for auto-release after `session_end_time + auto_release_delay`
+//! 3. If dispute: either party calls `dispute` → admin calls `resolve_dispute` to split funds
+//! 4. If session cancelled: admin calls `refund` to return full amount to learner
+//!
+//! ### Milestone-Based Escrow
+//! 1. Learner calls `create_milestone_escrow` with multiple deliverable milestones
+//! 2. As each milestone completes: learner calls `complete_milestone` (or mentor waits for auto-release)
+//! 3. If milestone quality issue: learner calls `dispute_milestone` → admin resolves
+//! 4. Upon completion of all milestones, remaining escrowed amount is released
+//!
+//! ### Stuck Escrow Recovery
+//! If `try_auto_release` fails repeatedly (e.g., token transfer temporarily unavailable),
+//! the escrow enters a "stuck" state with exponential backoff:
+//! - Anyone can call `report_stuck_escrow` to flag it after grace period
+//! - `emergency_release` (4-of-7 multisig vote) forcibly releases the funds
+//! - `manual_recovery_release` allows conditional manual intervention
+//!
+//! ## Key Invariants
+//!
+//! - **Fund Conservation**: All escrowed amounts are either released, refunded, or in storage
+//! - **Mutual Exclusivity**: Escrow is in exactly one state (Active, Released, Disputed, etc.)
+//! - **Non-Reentrancy**: Core operations use reentrancy guards to prevent attack vectors
+//! - **Fee Immutability**: Platform fees deducted on release are never refunded mid-session
+//! - **Audit Trail**: Emergency actions create immutable records for compliance
+//!
+//! ## Configuration
+//!
+//! - **Fee**: Configured at initialization; capped at 10% (1000 bps)
+//! - **Auto-Release Delay**: Configurable per deployment; default 7 days
+//! - **Treasury**: Collects platform fees; updatable by admin
+//! - **Approved Tokens**: Whitelist of allowed payment tokens (e.g., USDC, eUSDC)
+//! - **Staking Tiers**: Mentor tier tiers can reduce fees for higher-volume mentors
+//!
+//! ## Fee Structure
+//!
+//! Platform fee is calculated as: `(escrow_amount * fee_bps) / 10_000`
+//! - Applied only on `release_funds`, not on refunds or dispute splits
+//! - Can be dynamic (based on MNT token price) or fixed
+//! - Mentor tier discounts (if fee schedule configured) reduce the effective fee
+//!
+//! ## External Integration
+//!
+//! - **Frontend**: Calls `create_escrow` (learner) and `release_funds` (learner/mentor)
+//! - **Off-Chain Services**: Listen to escrow events to index state and trigger notifications
+//! - **Other Contracts**: Cross-contract calls validated via `set_interface_registry`
+//! - **Governance**: Can propose emergency rollbacks via `propose_emergency_rollback`
+//!
+//! ## Errors & Edge Cases
+//!
+//! Panics (reverts) occur on:
+//! - Unapproved tokens (prevents accidental asset loss)
+//! - Invalid state transitions (released escrow cannot be released again)
+//! - Authorization failures (only proper parties can act)
+//! - Token transfer failures (insufficient balance or token error)
+//!
+//! Most operations emit events for off-chain indexing and user notifications.
+
 use shared::events::{
     emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_emergency_release,
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
@@ -22,17 +91,25 @@ use shared::{
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address, Bytes, Env,
-    Symbol, Vec, IntoVal, BytesN,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    xdr::ToXdr, Address, Bytes, Env, Symbol, Vec, IntoVal, BytesN,
 };
 use shared::{
     AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS,
 };
 use shared::{
     validate_evidence_sufficiency, detect_payment_timing_manipulation, check_multisig_threshold,
+    detect_platform_bypass, verify_session_authenticity, REQUIRED_INTERACTION_MINUTES,
     EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval,
     EmergencyFundLock, PaymentAuditEntry,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    SessionAuthFailed = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,6 +499,8 @@ pub enum DataKey {
     /// Whether an escrow's funds are currently isolated due to a detected
     /// payment-manipulation attack.
     IsolatedEscrow(u64),
+    /// Number of low-fee sessions released for a mentor/learner pair.
+    LowFeeSessionCount(Address, Address),
     /// Payment audit trail for a given escrow.
     PaymentAudit(u64),
 }
@@ -558,6 +637,29 @@ impl EscrowContract {
     ///   auto-release to the mentor. Pass `0` to use the default (72 hours).
     /// - Approved tokens must satisfy SEP-41 (XLM, USDC, PYUSD, …).
     ///
+    /// Initialize the escrow contract with core configuration parameters.
+    ///
+    /// This function sets up the escrow contract with the admin, token, treasury, and fee settings.
+    /// Must be called exactly once before any escrow operations. Subsequent calls will panic.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `admin`: The admin address that can perform privileged operations
+    /// - `token`: The token contract address (e.g., USDC)
+    /// - `treasury`: The treasury address receiving platform fees
+    /// - `fee_bps`: Initial platform fee in basis points (0-1000, default 500 = 5%)
+    /// - `auto_release_delay`: Time in seconds before escrow auto-releases (default 7 days)
+    ///
+    /// # Preconditions
+    /// - Contract must not have been initialized before
+    /// - `fee_bps` must be ≤ 1000 (10% cap)
+    /// - All addresses must be valid
+    ///
+    /// # Errors
+    /// Panics if called more than once or if `fee_bps` exceeds cap.
+    ///
+    /// # Workflow
+    /// Initialize → Create Escrow → (Release | Dispute | Auto-release)
     /// Calling this a second time will panic — persistent storage ensures the
     /// `ADMIN` key survives ledger archival so the guard cannot be bypassed.
     pub fn initialize(
@@ -727,6 +829,28 @@ impl EscrowContract {
     }
 
     /// Update the platform fee — admin only, capped at 1 000 bps (10%).
+    ///
+    /// Changes the global platform fee applied to all new escrows. The fee is
+    /// calculated as a percentage of the escrowed amount and transferred to the
+    /// treasury upon release. This setting does not retroactively affect already-created escrows.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `new_fee_bps`: New fee in basis points (1 basis point = 0.01%)
+    ///
+    /// # Preconditions
+    /// - Caller must be admin (auth required)
+    /// - `new_fee_bps` must not exceed 1000 (10% cap)
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Caller is not the admin
+    /// - `new_fee_bps` exceeds 1000
+    ///
+    /// # Examples
+    /// - 0 bps = 0% fee
+    /// - 500 bps = 5% fee
+    /// - 1000 bps = 10% fee (maximum)
     pub fn update_fee(env: Env, new_fee_bps: u32) {
         let admin: Address = env
             .storage()
@@ -757,6 +881,25 @@ impl EscrowContract {
     /// compatibility:
     /// - Price < $0.10 → 500 bps (5%)
     /// - Price $0.10–$0.50 → 400 bps (4%)
+    /// Get the current platform fee dynamically based on MNT/USDC price.
+    ///
+    /// If dynamic fee is enabled, this returns a fee adjusted based on MNT token price.
+    /// Falls back to the fixed fee if dynamic pricing is disabled or unavailable.
+    /// Pricing tiers:
+    /// - Price < $0.10 → 500 bps (5%)
+    /// - Price $0.10–$0.50 → 400 bps (4%)
+    /// - Price $0.50–$1.00 → 300 bps (3%)
+    /// - Price > $1.00 → 200 bps (2%)
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    ///
+    /// # Return Value
+    /// Fee in basis points (e.g., 500 = 5%)
+    ///
+    /// # Workflow
+    /// Internally fetches MNT price from the oracle/liquidity pool,
+    /// computes the dynamic fee, caches it, and returns the value.
     /// - Price $0.50–$1.00 → 300 bps (3%)
     /// - Price > $1.00 → 200 bps (2%)
     pub fn get_dynamic_fee(env: Env) -> u32 {
@@ -887,6 +1030,20 @@ impl EscrowContract {
     }
 
     /// Update the treasury address — admin only.
+    ///
+    /// Changes where platform fees are transferred on escrow release.
+    /// Does not affect already-held fees or pending escrows.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `new_treasury`: The new treasury address to receive fees
+    ///
+    /// # Preconditions
+    /// - Caller must be admin (auth required)
+    /// - `new_treasury` must be a valid address
+    ///
+    /// # Errors
+    /// Panics if caller is not the admin.
     pub fn update_treasury(env: Env, new_treasury: Address) {
         let admin: Address = env
             .storage()
@@ -906,6 +1063,26 @@ impl EscrowContract {
 
     /// Add or remove an approved token (admin only).
     /// Emits a TokenApproved or TokenRejected event.
+    ///
+    /// Maintains a whitelist of token contracts that can be used in escrows.
+    /// Learners can only create escrows with approved tokens. Adding a token to
+    /// the approved list allows new escrows to be created with that token.
+    /// Removing a token does not affect existing escrows but prevents new ones.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `token_address`: The token contract address to add or remove
+    /// - `approved`: `true` to add to whitelist, `false` to remove
+    ///
+    /// # Preconditions
+    /// - Caller must be admin (auth required)
+    /// - `token_address` must be a valid token contract
+    ///
+    /// # Errors
+    /// Panics if caller is not the admin.
+    ///
+    /// # Events
+    /// Emits TokenApprovalEventData with the token address and approval status.
     pub fn set_approved_token(env: Env, token_address: Address, approved: bool) {
         let admin: Address = env
             .storage()
@@ -1298,6 +1475,25 @@ impl EscrowContract {
     }
 
     /// Public view: compute the graduated platform fee for a mentor/amount.
+    /// Compute the platform fee for a given mentor and amount.
+    ///
+    /// Calculates the fee that will be charged for an escrow based on the current
+    /// fee schedule and the mentor's tier (if staking contract is configured).
+    /// Returns `(gross_amount * fee_bps) / 10_000`.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `mentor`: The mentor address (used to determine tier-based fee discounts)
+    /// - `amount`: The gross amount to compute fee for
+    ///
+    /// # Return Value
+    /// The platform fee in token smallest units (e.g., stroops for USDC).
+    ///
+    /// # Workflow
+    /// 1. Look up mentor's staking tier (if available)
+    /// 2. Apply tier-based fee discount (if schedule exists)
+    /// 3. Apply dynamic fee if enabled
+    /// 4. Return computed fee amount
     ///
     /// Falls back to the flat `FeeBps` rate when no fee schedule is configured.
     pub fn compute_platform_fee(env: Env, mentor: Address, amount: i128) -> i128 {
@@ -1364,8 +1560,41 @@ impl EscrowContract {
     /// Panics if:
     /// - `amount` ≤ 0
     /// - `token_address` is not on the approved whitelist
-    /// - learner's on-chain balance is insufficient
-    /// - Caller is not the learner
+    /// Create a new escrow contract between a mentor and learner.
+    ///
+    /// Transfers the specified `amount` from the learner's wallet to the escrow contract,
+    /// deducts the platform fee, and stores the remainder for the mentor to claim later.
+    /// The escrow enters `Active` state and will auto-release after the configured delay
+    /// if not manually released or disputed.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `mentor`: The mentor receiving the payment upon release
+    /// - `learner`: The learner funding and initially controlling the escrow
+    /// - `amount`: The gross amount in token smallest units (e.g., stroops for USDC)
+    /// - `session_id`: Unique session identifier (e.g., mentor-session timestamp)
+    /// - `token_address`: The token contract to transfer funds in
+    /// - `session_end_time`: Unix timestamp when the session ends (triggers auto-release eligibility)
+    ///
+    /// # Preconditions
+    /// - `token_address` must be in the approved token whitelist
+    /// - `amount` must be positive (> 0)
+    /// - `learner` must have sufficient balance and approve token transfer
+    /// - Caller must be the learner (requester auth)
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Token is not approved
+    /// - Amount is zero or negative
+    /// - Learner has insufficient balance or approval
+    /// - Token transfer fails
+    ///
+    /// # Return Value
+    /// The new escrow ID (u64) for use in release, dispute, or status queries.
+    ///
+    /// # Workflow
+    /// Learner calls create_escrow → funds held in escrow → mentor or learner
+    /// can release, dispute, or auto-release after delay
     pub fn create_escrow(
         env: Env,
         mentor: Address,
@@ -1395,8 +1624,36 @@ impl EscrowContract {
 
     /// Release funds to the mentor (called by learner or admin).
     ///
-    /// Calculates the platform fee (`gross * fee_bps / 10_000`), transfers the
-    /// fee to the treasury, and transfers the remainder to the mentor.
+    /// Release the escrowed funds to the mentor and fees to the treasury.
+    ///
+    /// Caller must be either the learner (can release at any time after creation),
+    /// or the mentor (can release after `session_end_time` has passed). Calculates
+    /// the platform fee, transfers it to the treasury, and transfers the remainder
+    /// to the mentor. Transitions escrow to `Released` state.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `caller`: The address initiating the release (learner or mentor)
+    /// - `escrow_id`: The ID of the escrow to release
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` state
+    /// - Caller must be the learner (can release anytime) OR mentor (after session_end_time)
+    /// - Escrow funds must not have been previously released, refunded, or resolved
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Active state
+    /// - Caller is not the learner or mentor
+    /// - Mentor tries to release before session_end_time
+    /// - Token transfer fails (insufficient treasury balance or token error)
+    ///
+    /// # Workflow
+    /// active_escrow → release_funds → funds transferred to mentor + treasury
+    /// Emits EscrowReleased event with mentor address and amounts.
+    ///
+    /// # Gas Estimation
+    /// Use `estimate_release_escrow_cost` to predict gas consumption for this operation.
     pub fn release_funds(env: Env, caller: Address, escrow_id: u64) {
         let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("release"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
@@ -1442,6 +1699,30 @@ impl EscrowContract {
                 escrow_id
             );
         }
+
+        let interaction_minutes = if escrow.session_end_time > escrow.created_at {
+            ((escrow.session_end_time - escrow.created_at) / 60) as u32
+        } else {
+            REQUIRED_INTERACTION_MINUTES
+        };
+        let authenticity =
+            verify_session_authenticity(&env, interaction_minutes, true);
+        let low_fee_key = DataKey::LowFeeSessionCount(
+            escrow.mentor.clone(),
+            escrow.learner.clone(),
+        );
+        let current_low_fee_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&low_fee_key)
+            .unwrap_or(0);
+        let bypass = detect_platform_bypass(&env, current_low_fee_count, escrow.amount);
+        if !authenticity.is_authentic || bypass.is_colluding {
+            panic_with_error!(&env, Error::SessionAuthFailed);
+        }
+        env.storage()
+            .persistent()
+            .set(&low_fee_key, &bypass.low_fee_count);
 
         Self::_do_release(&env, &mut escrow, &key, &caller);
     }
@@ -1696,6 +1977,36 @@ impl EscrowContract {
     /// calculation) fail, the failure is counted against
     /// `MAX_FAILED_ATTEMPTS` (3).  After 3 consecutive failures the
     /// auto-release path is permanently disabled for this escrow, and the
+    /// Attempt to automatically release an escrow after the configured delay.
+    ///
+    /// Anyone can call this to trigger automatic release if the session has ended
+    /// and the configured auto-release delay has passed. The escrow transitions
+    /// to `Released` and funds are transferred to the mentor. Implements exponential
+    /// backoff for failed releases (stuck escrows) with configurable retry logic.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the escrow to attempt auto-release
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` state
+    /// - Current time must be ≥ `session_end_time + auto_release_delay`
+    /// - Escrow must not have been previously disputed or manually released
+    ///
+    /// # Errors
+    /// If the release fails (e.g., token transfer fails), the escrow may enter
+    /// backoff state. Multiple failed attempts trigger the "stuck escrow" protocol,
+    /// allowing escalation via `report_stuck_escrow` or `emergency_release`.
+    ///
+    /// # Workflow
+    /// active_escrow → (after delay) → try_auto_release → auto-released or
+    /// stuck (requiring emergency intervention or manual recovery)
+    /// Emits EscrowAutoReleased event if successful.
+    ///
+    /// # Gas Optimization
+    /// This operation is optimized for batching multiple auto-releases via
+    /// `batch_release` (admin-only). `emergency_release` (multi-sig admin bypass)
+    /// must be used to unlock the funds if this operation persistently fails.
     /// `emergency_release` (multi-sig admin bypass) must be used to unlock
     /// the funds.
     pub fn try_auto_release(env: Env, escrow_id: u64) {
@@ -1917,7 +2228,37 @@ impl EscrowContract {
         true
     }
 
-    /// Open a dispute (called by mentor or learner).
+    /// Open a dispute on an active escrow, freezing funds until resolved.
+    ///
+    /// Either party (mentor or learner) can open a dispute on an `Active` escrow.
+    /// The escrow transitions to `Disputed` state and funds remain frozen until
+    /// an authorized arbitrator calls `resolve_dispute` to split the funds based
+    /// on a percentage allocation. A reason code is recorded for auditing.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `caller`: The address opening the dispute (must be mentor or learner)
+    /// - `escrow_id`: The ID of the escrow to dispute
+    /// - `reason`: A symbol reason code (e.g., "quality_issue", "no_delivery")
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` state
+    /// - Caller must be the mentor or learner
+    /// - Escrow must not have been previously disputed, released, or refunded
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Active state
+    /// - Caller is neither the mentor nor learner
+    /// - Escrow is already disputed, released, or resolved
+    ///
+    /// # Workflow
+    /// active_escrow → dispute → frozen → resolve_dispute (split by percentage)
+    /// Emits DisputeOpened event with caller and reason.
+    ///
+    /// # Post-Dispute Resolution
+    /// Funds remain frozen until `resolve_dispute` is called by an authorized
+    /// arbitrator to allocate the escrowed amount between the parties.
     pub fn dispute(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
         let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("dispute"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
@@ -1973,6 +2314,42 @@ impl EscrowContract {
     /// Admin only. Can only be called on `Disputed` escrows.
     ///
     /// - `mentor_pct`: percentage (0–100) of `escrow.amount` sent to the mentor.
+    /// Resolve a disputed escrow by splitting funds between mentor and learner.
+    ///
+    /// Admin-only operation that splits a disputed escrow's escrowed amount based
+    /// on a percentage allocation. The mentor receives `mentor_pct` percent of the
+    /// escrowed amount, and the learner receives the remainder (`100 - mentor_pct`).
+    /// No platform fee is deducted — the full escrowed amount is distributed.
+    /// Transitions escrow to `Resolved` state.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the disputed escrow to resolve
+    /// - `mentor_pct`: Percentage (0–100) of the escrowed amount to allocate to mentor
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Disputed` state
+    /// - Caller must be admin (auth required)
+    /// - `mentor_pct` must be 0–100 (inclusive)
+    /// - Escrow must not have been previously released or refunded
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Disputed state
+    /// - Caller is not the admin
+    /// - `mentor_pct` is outside 0–100 range
+    /// - Token transfer fails
+    /// - Escrow has already been resolved
+    ///
+    /// # Example Allocations
+    /// - `mentor_pct = 100` → all funds to mentor
+    /// - `mentor_pct = 50` → equal split
+    /// - `mentor_pct = 0` → all funds to learner
+    ///
+    /// # Workflow
+    /// disputed_escrow → resolve_dispute(50) → equal split to both parties
+    /// Emits DisputeResolved event with mentor percentage and amounts.
+    ///
     ///   The remainder (`100 - mentor_pct`) goes to the learner. No platform fee
     ///   is deducted — the full escrowed amount is split between the parties.
     pub fn resolve_dispute(env: Env, escrow_id: u64, mentor_pct: u32) {
@@ -2051,6 +2428,37 @@ impl EscrowContract {
     }
 
     /// Refund tokens to the learner (admin only).
+    ///
+    /// Refund an escrow to the learner — admin only.
+    ///
+    /// Admin-only operation that returns the entire escrowed amount to the learner.
+    /// Can only be called on `Active` or `Disputed` escrows. Once called, the escrow
+    /// transitions to `Refunded` state and cannot be released or resolved.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the escrow to refund
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` or `Disputed` state
+    /// - Caller must be admin (auth required)
+    /// - Escrow must not have been previously released or refunded
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Active or Disputed state
+    /// - Caller is not the admin
+    /// - Escrow is already released, refunded, or resolved
+    /// - Token transfer fails (insufficient funds or token error)
+    ///
+    /// # Workflow
+    /// active_escrow → refund → full amount returned to learner
+    /// Emits EscrowRefunded event with learner address and amount.
+    ///
+    /// # Use Cases
+    /// - Session cancelled before delivery
+    /// - Mentor unable to complete work (emergency refund)
+    /// - Admin-initiated reversal for policy violations
     ///
     /// Can be called on `Active` or `Disputed` escrows; panics if already
     /// `Released`, `Refunded`, or `Resolved`.
@@ -2687,7 +3095,40 @@ impl EscrowContract {
     /// Compatibility entry-point for the historical `emergency_release` name.
     ///
     /// Delegates to `execute_emergency_action` after verifying `escrow_id` /
-    /// `reason_hash` match the stored proposal. Prefer the explicit
+    /// Emergency release of an escrow by 4-of-7 multisig vote (bypass admin workflow).
+    ///
+    /// A high-security operation that allows the multisig admin group to force-release
+    /// a stuck or disputed escrow without going through the normal release/resolve workflow.
+    /// Requires explicit signatures from 4 of 7 designated signers, and the operation is
+    /// permanently recorded in immutable audit logs for regulatory compliance.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `caller`: The multisig address triggering the release
+    /// - `escrow_id`: The ID of the escrow to emergency-release
+    /// - `reason_hash`: Hash of the reason/justification for the emergency release
+    /// - `action_id`: Pre-approved action ID from `propose_emergency_action`
+    ///
+    /// # Preconditions
+    /// - Caller must be the multisig admin (auth required)
+    /// - Escrow must exist (any state)
+    /// - Action ID must have received 4-of-7 multisig approvals
+    /// - Circuit breaker limits must be respected (10% of total active pool per 24h)
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Caller is not the multisig admin
+    /// - Action hasn't been fully approved
+    /// - Circuit breaker limit exceeded
+    /// - Token transfer fails
+    ///
+    /// # Workflow
+    /// Stuck/Disputed Escrow → emergency_release (multisig) → Funds released,
+    /// immutable audit trail created
+    /// Emits EmergencyReleaseExecutedEventData with all signers and reason.
+    ///
+    /// # Security
+    /// - `reason_hash` match the stored proposal. Prefer the explicit
     /// propose → approve → execute flow.
     pub fn emergency_release(
         env: Env,
@@ -3076,6 +3517,23 @@ impl EscrowContract {
             .get(&DataKey::MultisigAdmin)
     }
 
+    /// Retrieve an escrow by ID.
+    ///
+    /// Returns the full escrow record including mentor, learner, amount, status,
+    /// and timestamps. This is a read-only view operation.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the escrow to retrieve
+    ///
+    /// # Return Value
+    /// The `Escrow` record with all state, or panics if escrow does not exist.
+    ///
+    /// # Preconditions
+    /// - Escrow with this ID must exist
+    ///
+    /// # Errors
+    /// Panics if escrow does not exist.
     pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
@@ -3471,6 +3929,34 @@ impl EscrowContract {
     // Milestone escrow functions
     // -----------------------------------------------------------------------
 
+    /// Create a milestone-based escrow with multiple staged payments.
+    ///
+    /// Similar to `create_escrow` but splits the total into multiple milestones,
+    /// each with its own deliverable description hash and payment amount.
+    /// The learner funds the entire escrow upfront, but funds are released milestone
+    /// by milestone as each is completed and approved.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `mentor`: The mentor address
+    /// - `learner`: The learner address and funder
+    /// - `total_amount`: Total gross amount across all milestones
+    /// - `milestones`: Vector of `MilestoneSpec` (description_hash, amount pairs)
+    /// - `token_address`: The token contract address
+    /// - `session_end_time`: Unix timestamp for session completion
+    ///
+    /// # Preconditions
+    /// - Token must be approved
+    /// - Sum of milestone amounts must equal `total_amount`
+    /// - Each milestone must have a valid description hash
+    /// - Learner must have sufficient balance
+    ///
+    /// # Errors
+    /// Panics if milestone amounts don't sum to total_amount or token is not approved.
+    ///
+    /// # Workflow
+    /// create_milestone_escrow → complete_milestone(0) → ... → complete_milestone(n)
+    /// Funds are released progressively as each milestone is completed.
     pub fn create_milestone_escrow(
         env: Env,
         mentor: Address,
@@ -3561,6 +4047,31 @@ impl EscrowContract {
         count
     }
 
+    /// Mark a milestone as completed and release its funds to the mentor.
+    ///
+    /// Only the learner can call this to mark a milestone as completed after
+    /// the mentor has delivered on that milestone's deliverable. Once marked
+    /// complete, the milestone's allocated amount is transferred to the mentor
+    /// and the milestone transitions to `Completed` state.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the milestone escrow
+    /// - `milestone_index`: The zero-indexed milestone to complete
+    ///
+    /// # Preconditions
+    /// - Escrow must be a milestone-based escrow
+    /// - Milestone must be in `Pending` status
+    /// - Caller must be the learner
+    /// - Escrow must be in `Active` status
+    ///
+    /// # Errors
+    /// Panics if milestone is already completed, disputed, or escrow is not active.
+    ///
+    /// # Workflow
+    /// Milestone Pending → complete_milestone → Completed (funds transferred)
+    /// Multiple milestones can be completed in sequence, or one can be disputed
+    /// to freeze the entire escrow and trigger arbitration.
     pub fn complete_milestone(env: Env, escrow_id: u64, milestone_index: u32) {
         let key = (symbol_short!("MESCROW"), escrow_id);
         env.storage()
@@ -3667,6 +4178,32 @@ impl EscrowContract {
         );
     }
 
+    /// Dispute a specific milestone in a milestone-based escrow.
+    ///
+    /// Either party can dispute a single milestone, which transitions the entire
+    /// escrow to `Disputed` state. This freezes all remaining funds and requires
+    /// arbitrator intervention to resolve. The specific milestone is marked as
+    /// `Disputed` and a reason code is recorded.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the milestone escrow
+    /// - `milestone_index`: The zero-indexed milestone to dispute
+    /// - `reason`: Symbol reason code for the dispute
+    ///
+    /// # Preconditions
+    /// - Escrow must be a milestone-based escrow
+    /// - Milestone must be in `Pending` status
+    /// - Caller must be the mentor or learner
+    /// - Escrow must be in `Active` status
+    ///
+    /// # Errors
+    /// Panics if milestone is already completed/disputed or escrow is not active.
+    ///
+    /// # Workflow
+    /// Active → dispute_milestone → Disputed (escrow frozen, awaiting arbitration)
+    /// The entire escrow enters dispute flow; `resolve_dispute` will split the
+    /// escrowed amount between both parties based on the arbitrator's decision.
     pub fn dispute_milestone(env: Env, escrow_id: u64, milestone_index: u32, reason: Symbol) {
         let key = (symbol_short!("MESCROW"), escrow_id);
         env.storage()

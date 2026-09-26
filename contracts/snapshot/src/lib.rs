@@ -1,8 +1,9 @@
 #![no_std]
 
-use shared::StakeRecord;
+use shared::{compute_checksum, StakeRecord};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, FromVal, IntoVal, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, FromVal, IntoVal,
+    Symbol, Vec,
 };
 
 #[contracttype]
@@ -15,6 +16,7 @@ pub enum DataKey {
     DelegationContract,
     Snapshot(u32, Address),   // (snapshot_id, voter)
     SnapshotTotalSupply(u32), // snapshot_id
+    SnapshotChecksum(u32),    // snapshot_id
 }
 
 #[contract]
@@ -72,6 +74,7 @@ impl SnapshotContract {
         );
 
         let thirty_days_ledgers = 30 * 24 * 60 * 60 / 5; // Approx 5s per ledger
+        let mut staker_data: Vec<(Address, i128)> = Vec::new(&env);
 
         for staker in stakers.iter() {
             // Get stake record from the staking contract.
@@ -92,7 +95,18 @@ impl SnapshotContract {
             env.storage()
                 .persistent()
                 .extend_ttl(&key, thirty_days_ledgers, thirty_days_ledgers);
+
+            staker_data.push_back((staker.clone(), record.amount));
         }
+
+        // Compute checksum of staker data after reading and store under SnapshotChecksum
+        let serialized = staker_data.to_xdr(&env);
+        let checksum = compute_checksum(&env, &serialized);
+        let cs_key = DataKey::SnapshotChecksum(snapshot_id);
+        env.storage().persistent().set(&cs_key, &checksum);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cs_key, thirty_days_ledgers, thirty_days_ledgers);
 
         // Also extend TTL for total supply
         let ts_key = DataKey::SnapshotTotalSupply(snapshot_id);
@@ -157,6 +171,51 @@ impl SnapshotContract {
             .persistent()
             .get(&DataKey::SnapshotTotalSupply(snapshot_id))
             .unwrap_or(0)
+    }
+
+    /// Verifies the integrity of a recorded snapshot against its checksum.
+    pub fn verify_snapshot_integrity(env: Env, snapshot_id: u32) -> bool {
+        let stored_checksum: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotChecksum(snapshot_id))
+        {
+            Some(cs) => cs,
+            None => return false,
+        };
+
+        let staking_contract: Address = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingContract)
+        {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let stakers: Vec<Address> = env.invoke_contract(
+            &staking_contract,
+            &Symbol::new(&env, "get_stakers"),
+            Vec::new(&env),
+        );
+
+        let mut staker_data: Vec<(Address, i128)> = Vec::new(&env);
+        for staker in stakers.iter() {
+            let amount: i128 = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Snapshot(snapshot_id, staker.clone()))
+            {
+                Some(amt) => amt,
+                None => return false,
+            };
+            staker_data.push_back((staker, amount));
+        }
+
+        let serialized = staker_data.to_xdr(&env);
+        let computed = compute_checksum(&env, &serialized);
+
+        computed == stored_checksum
     }
 }
 
@@ -517,4 +576,37 @@ mod test {
         assert_eq!(r.unlock_cooldown_until, expected_until);
         assert_eq!(r.tier, expected_tier);
     }
+
+    #[test]
+    fn test_verify_snapshot_integrity() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let snapshot_id = env.register(SnapshotContract, ());
+        let staking_id = env.register(MockStaking, ());
+        let delegation_id = env.register(MockDelegation, ());
+        let client = SnapshotContractClient::new(&env, &snapshot_id);
+        let staking = MockStakingClient::new(&env, &staking_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &staking_id, &delegation_id);
+
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        staking.set_total_staked(&1000);
+        staking.set_stakers(&Vec::from_array(&env, [voter1.clone(), voter2.clone()]));
+        staking.set_stake(&voter1, &400);
+        staking.set_stake(&voter2, &600);
+
+        // Record snapshot 1
+        client.record_snapshot(&1);
+
+        // Check that snapshot integrity verification passes
+        assert!(client.verify_snapshot_integrity(&1));
+
+        // Unknown snapshot ID returns false
+        assert!(!client.verify_snapshot_integrity(&999));
+    }
 }
+
