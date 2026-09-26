@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{pause_guard::require_not_paused, ReentrancyGuard};
+use shared::{pagination::Pagination, pause_guard::require_not_paused, ReentrancyGuard};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec,
 };
@@ -661,6 +661,19 @@ impl ReferralContract {
             .unwrap_or(vec![&env])
     }
 
+    /// Returns a bounded page from one epoch's top-referrer leaderboard.
+    /// `offset` is zero-based and `limit` is capped by `MAX_PAGE_SIZE`.
+    pub fn get_epoch_leaderboard_page(
+        env: Env,
+        epoch: u32,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<(Address, u32)> {
+        let leaderboard = Self::get_epoch_leaderboard(env.clone(), epoch);
+        let (start, end) = Pagination::bounds(leaderboard.len(), offset, limit);
+        leaderboard.slice(start..end)
+    }
+
     // --- Legacy views ---
 
     pub fn get_referral_count(env: Env, referrer: Address) -> u32 {
@@ -902,6 +915,26 @@ mod test {
 
         let epoch = (f.env.ledger().timestamp() / LEADERBOARD_EPOCH_SECS) as u32;
         assert_eq!(f.client().get_epoch_referral_count(&epoch, &referrer), 5);
+    }
+
+    #[test]
+    fn test_epoch_leaderboard_page() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let first = Address::generate(&f.env);
+        let second = Address::generate(&f.env);
+        let third = Address::generate(&f.env);
+
+        register_n_referrals(&f.env, &client, &first, 3);
+        register_n_referrals(&f.env, &client, &second, 2);
+        register_n_referrals(&f.env, &client, &third, 1);
+
+        let epoch = (f.env.ledger().timestamp() / LEADERBOARD_EPOCH_SECS) as u32;
+        let page = client.get_epoch_leaderboard_page(&epoch, &1, &2);
+
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), (second, 2));
+        assert_eq!(page.get(1).unwrap(), (third, 1));
     }
 
     #[test]
