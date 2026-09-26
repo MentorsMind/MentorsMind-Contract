@@ -91,17 +91,25 @@ use shared::{
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address, Bytes, Env,
-    Symbol, Vec, IntoVal, BytesN,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    xdr::ToXdr, Address, Bytes, Env, Symbol, Vec, IntoVal, BytesN,
 };
 use shared::{
     AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS,
 };
 use shared::{
     validate_evidence_sufficiency, detect_payment_timing_manipulation, check_multisig_threshold,
+    detect_platform_bypass, verify_session_authenticity, REQUIRED_INTERACTION_MINUTES,
     EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval,
     EmergencyFundLock, PaymentAuditEntry,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    SessionAuthFailed = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -491,6 +499,8 @@ pub enum DataKey {
     /// Whether an escrow's funds are currently isolated due to a detected
     /// payment-manipulation attack.
     IsolatedEscrow(u64),
+    /// Number of low-fee sessions released for a mentor/learner pair.
+    LowFeeSessionCount(Address, Address),
     /// Payment audit trail for a given escrow.
     PaymentAudit(u64),
 }
@@ -1689,6 +1699,30 @@ impl EscrowContract {
                 escrow_id
             );
         }
+
+        let interaction_minutes = if escrow.session_end_time > escrow.created_at {
+            ((escrow.session_end_time - escrow.created_at) / 60) as u32
+        } else {
+            REQUIRED_INTERACTION_MINUTES
+        };
+        let authenticity =
+            verify_session_authenticity(&env, interaction_minutes, true);
+        let low_fee_key = DataKey::LowFeeSessionCount(
+            escrow.mentor.clone(),
+            escrow.learner.clone(),
+        );
+        let current_low_fee_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&low_fee_key)
+            .unwrap_or(0);
+        let bypass = detect_platform_bypass(&env, current_low_fee_count, escrow.amount);
+        if !authenticity.is_authentic || bypass.is_colluding {
+            panic_with_error!(&env, Error::SessionAuthFailed);
+        }
+        env.storage()
+            .persistent()
+            .set(&low_fee_key, &bypass.low_fee_count);
 
         Self::_do_release(&env, &mut escrow, &key, &caller);
     }

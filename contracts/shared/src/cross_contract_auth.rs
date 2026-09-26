@@ -36,6 +36,14 @@ impl ContractRegistry for InterfaceRegistryLookup {
 pub struct CrossContractAuth;
 
 impl CrossContractAuth {
+    /// Returns whether the current call was invoked by the expected address.
+    ///
+    /// This is intentionally a non-panicking predicate so callers can map a
+    /// failed call-chain check to their contract-specific error type.
+    pub fn verify_caller(env: &Env, expected: &Address) -> bool {
+        env.invoker() == *expected
+    }
+
     /// Panics if `candidate` is not registered under `interface_id` in the
     /// interface registry at `registry`. Use when wiring a peer contract
     /// address into privileged storage (e.g. `set_staking_contract`).

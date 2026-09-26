@@ -10,6 +10,7 @@ use soroban_sdk::contracterror;
 pub mod account_security;
 pub mod admin;
 pub mod cross_contract_auth;
+pub use cross_contract_auth::CrossContractAuth;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
