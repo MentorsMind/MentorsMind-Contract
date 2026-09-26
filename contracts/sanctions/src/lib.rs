@@ -2,6 +2,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Vec,
 };
+use shared::{PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT};
 
 const MAX_BATCH: u32 = 100;
 
@@ -24,14 +25,25 @@ impl Sanctions {
             panic!("already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Admin,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Add a single SHA-256 hash to the sanctions list. Admin only.
     pub fn add_to_list(env: Env, address_hash: BytesN<32>) {
         Self::require_admin(&env);
+        let key = DataKey::Sanctioned(address_hash.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Sanctioned(address_hash.clone()), &true);
+            .set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events()
             .publish((symbol_short!("addr_add"),), address_hash);
     }
@@ -53,9 +65,15 @@ impl Sanctions {
             panic!("batch exceeds 100");
         }
         for hash in hashes.iter() {
+            let key = DataKey::Sanctioned(hash.clone());
             env.storage()
                 .persistent()
-                .set(&DataKey::Sanctioned(hash.clone()), &true);
+                .set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
             env.events()
                 .publish((symbol_short!("addr_add"),), hash);
         }
@@ -64,10 +82,22 @@ impl Sanctions {
     /// Hash the Address via SHA-256 of its XDR encoding and check the list.
     pub fn is_sanctioned(env: Env, address: Address) -> bool {
         let hash = hash_address(&env, &address);
-        env.storage()
+        let key = DataKey::Sanctioned(hash);
+        let is_sanctioned = env.storage()
             .persistent()
-            .get(&DataKey::Sanctioned(hash))
-            .unwrap_or(false)
+            .get(&key)
+            .unwrap_or(false);
+
+        // Extend TTL on read to keep frequently-checked entries hot
+        if is_sanctioned {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        is_sanctioned
     }
 
     fn require_admin(env: &Env) {
@@ -172,5 +202,33 @@ mod test {
             hashes.push_back(BytesN::from_array(&env, &[0u8; 32]));
         }
         c.add_batch(&hashes);
+    }
+
+    #[test]
+    fn test_ttl_extension_on_add_and_read() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, _) = deploy(&env);
+
+        let addr = Address::generate(&env);
+        let hash = hash_address(&env, &addr);
+
+        // Add to list with TTL extension
+        c.add_to_list(&hash);
+        assert!(c.is_sanctioned(&addr));
+
+        // Verify entry is still readable after TTL extension on read
+        assert!(c.is_sanctioned(&addr));
+
+        // Verify batch add also extends TTL
+        let addr2 = Address::generate(&env);
+        let mut hashes: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::Vec::new(&env);
+        hashes.push_back(hash_address(&env, &addr2));
+        c.add_batch(&hashes);
+        assert!(c.is_sanctioned(&addr2));
+
+        // Multiple reads should keep TTL extended
+        assert!(c.is_sanctioned(&addr));
+        assert!(c.is_sanctioned(&addr2));
     }
 }

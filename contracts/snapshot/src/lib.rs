@@ -2,9 +2,14 @@
 
 use shared::{compute_checksum, StakeRecord};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, FromVal, IntoVal,
+    contract, contractclient, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, FromVal, IntoVal,
     Symbol, Vec,
 };
+
+#[contractclient(name = "SnapshotContractClient")]
+pub trait SnapshotContractTrait {
+    fn get_voting_power(env: Env, snapshot_id: u32, voter: Address) -> i128;
+}
 
 #[contracttype]
 #[derive(Clone)]

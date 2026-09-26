@@ -36,9 +36,14 @@ use shared::governance_voting::{
 };
 use shared::StakeRecord;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
     Address, Bytes, BytesN, Env, IntoVal, Symbol, Vec,
 };
+
+#[contractclient(name = "SnapshotContractClient")]
+pub trait SnapshotContractTrait {
+    fn get_voting_power(env: Env, snapshot_id: u32, voter: Address) -> i128;
+}
 
 // Instance storage: frequently read config
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -812,11 +817,8 @@ impl GovernanceContract {
             .get(&DataKey::DelegationContract)
             .expect("delegation contract not set");
 
-        let snapshot_weight: i128 = env.invoke_contract(
-            &snapshot_contract,
-            &Symbol::new(&env, "get_voting_power"),
-            (proposal_id, voter.clone()).into_val(&env),
-        );
+        let snapshot_weight: i128 = SnapshotContractClient::new(&env, &snapshot_contract)
+            .get_voting_power(&proposal_id, &voter);
 
         let delegated_power: i128 = env.invoke_contract(
             &delegation_contract,
