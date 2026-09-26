@@ -224,7 +224,8 @@ impl CreditScoreContract {
             action: symbol_short!("updated"),
             user,
             score,
-        }.publish(env);
+        }
+        .publish(&env);
     }
 
     pub fn compute_score(env: Env, user: Address) -> u32 {

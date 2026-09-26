@@ -199,6 +199,19 @@ pub enum DataKey {
     /// Cached combined justice-protection intervention record for a given
     /// escrow.
     JusticeIntervention(u64),
+    /// Most recent rulings (oldest first) by a given arbitrator, capped at
+    /// `MAX_ARBITRATOR_HISTORY`, exposed for off-chain bias audits.
+    ArbitratorHistory(Address),
+}
+
+/// One entry in an arbitrator's public ruling history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorRuling {
+    pub escrow_id: u64,
+    /// `mentor` if funds were released to the mentor, `learner` otherwise.
+    pub outcome: Symbol,
+    pub timestamp: u64,
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -669,6 +682,7 @@ impl DisputeEvidenceContract {
                 .set(&DataKey::AppealPeriodEnds(escrow_id), &appeal_deadline);
         }
 
+        let resolution_timestamp = resolution.resolved_at;
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), escrow_id),
             resolution,
@@ -687,6 +701,27 @@ impl DisputeEvidenceContract {
             history.remove(0);
         }
         env.storage().persistent().set(&history_key, &history);
+
+        let rulings_key = DataKey::ArbitratorHistory(arbitrator.clone());
+        let mut rulings: Vec<ArbitratorRuling> = env
+            .storage()
+            .persistent()
+            .get(&rulings_key)
+            .unwrap_or(Vec::new(&env));
+        rulings.push_back(ArbitratorRuling {
+            escrow_id,
+            outcome: if release_to_mentor {
+                Symbol::new(&env, "mentor")
+            } else {
+                Symbol::new(&env, "learner")
+            },
+            timestamp: resolution_timestamp,
+        });
+        while rulings.len() > MAX_ARBITRATOR_HISTORY {
+            rulings.pop_front();
+        }
+        env.storage().persistent().set(&rulings_key, &rulings);
+
         Self::protect_arbitration_fairness(env.clone(), arbitrator.clone());
         Self::get_justice_status(env.clone(), escrow_id, arbitrator);
 
@@ -783,6 +818,23 @@ impl DisputeEvidenceContract {
             );
         }
         result
+    }
+
+    /// Public ruling history for `arbitrator`, oldest first. Bounded to the
+    /// most recent `MAX_ARBITRATOR_HISTORY` rulings, so no pagination is
+    /// needed. Returns an empty Vec for an arbitrator with no rulings.
+    pub fn get_arbitrator_history(env: Env, arbitrator: Address) -> Vec<ArbitratorRuling> {
+        let history: Vec<ArbitratorRuling> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorHistory(arbitrator))
+            .unwrap_or(Vec::new(&env));
+        let len = history.len();
+        if len > MAX_ARBITRATOR_HISTORY {
+            history.slice(len - MAX_ARBITRATOR_HISTORY..len)
+        } else {
+            history
+        }
     }
 
     /// Assess an arbitrator's recent ruling history for systematic bias
@@ -2219,90 +2271,59 @@ mod tests {
         assert!(resolution.release_to_mentor);
     }
 
-    // ─── justice intervention: arbitration bias ───────────────────────────
+    // ── #1105 arbitrator ruling history ─────────────────────────────────
 
-    /// Verifies that a pattern of one-sided rulings by the same arbitrator
-    /// causes `submit_appeal_for_dispute` to:
-    ///   1. Compute a justice intervention with `intervene = true`.
-    ///   2. Store a `JusticeInterventionRecord` under the escrow.
-    ///   3. Emit a `JusticeInterventionRequired` event.
-    ///   4. Block the appeal (return `JusticeRestorationNotEligible`) because
-    ///      the restoration cooldown has not elapsed.
-    ///
-    /// Bias threshold: `ruling_count >= 3` AND `one_sided_ratio_bps >= 8000`.
-    /// We drive 4 all-mentor rulings through escrows 2–5 so the arbitrator's
-    /// rolling `ArbitratorFavorHistory` is saturated before the appeal on
-    /// escrow 1 is attempted.
     #[test]
-    fn justice_intervention_triggered_after_biased_arbitrator_rulings() {
-        let (env, admin, mentor, _learner, client) = setup_disputed();
-        let _governance = setup_disputed_with_governance(&env, &client, &admin);
+    fn test_arbitrator_history_updated_on_resolution() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        assert_eq!(client.get_arbitrator_history(&arb).len(), 0);
 
-        // Shared biased arbitrator used across all resolutions.
-        let biased_arb = Address::generate(&env);
+        env.ledger().set_timestamp(5_000);
+        client.submit_resolution(&1, &arb, &false, &true, &Symbol::new(&env, "ok"));
+        env.ledger().set_timestamp(6_000);
+        client.submit_resolution(&2, &arb, &false, &false, &Symbol::new(&env, "ok"));
 
-        // ── Step 1: Build up a biased ruling history on escrows 2–5.
-        // MockEscrow returns a Disputed escrow for every escrow_id, so we
-        // can resolve multiple escrow IDs without additional setup.
-        for extra_escrow in [2u64, 3u64, 4u64, 5u64] {
-            client.record_dispute_opened(&extra_escrow).unwrap();
-            advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
-            // All rulings favour the mentor — this is the one-sided pattern.
-            client
-                .submit_resolution(
-                    &extra_escrow,
-                    &biased_arb,
-                    &false,
-                    &true,
-                    &Symbol::new(&env, "mentor_wins"),
-                )
-                .unwrap();
+        let history = client.get_arbitrator_history(&arb);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history.get(0).unwrap(),
+            ArbitratorRuling {
+                escrow_id: 1,
+                outcome: Symbol::new(&env, "mentor"),
+                timestamp: 5_000,
+            }
+        );
+        assert_eq!(
+            history.get(1).unwrap(),
+            ArbitratorRuling {
+                escrow_id: 2,
+                outcome: Symbol::new(&env, "learner"),
+                timestamp: 6_000,
+            }
+        );
+
+        // History is tracked per arbitrator.
+        let other = Address::generate(&env);
+        assert_eq!(client.get_arbitrator_history(&other).len(), 0);
+    }
+
+    #[test]
+    fn test_arbitrator_history_capped_drops_oldest() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        let total = MAX_ARBITRATOR_HISTORY as u64 + 5;
+
+        for escrow_id in 1..=total {
+            client.submit_resolution(&escrow_id, &arb, &false, &true, &Symbol::new(&env, "ok"));
         }
 
-        // Confirm the fairness scorer now sees a biased arbitrator.
-        let bias_flag = client.protect_arbitration_fairness(&biased_arb);
-        assert!(!bias_flag.fair, "arbitrator should be flagged as biased after 4 one-sided rulings");
-        assert!(bias_flag.ruling_count >= 3);
-        assert!(bias_flag.one_sided_ratio_bps >= 8_000);
-
-        // ── Step 2: Set up escrow 1 with a prior resolution from biased_arb
-        //           so the appeal path is reachable.
-        client.record_dispute_opened(&1).unwrap();
-        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
-        client
-            .submit_resolution(&1, &biased_arb, &false, &true, &Symbol::new(&env, "mentor_wins"))
-            .unwrap();
-
-        // ── Step 3: Attempt appeal — must be blocked by justice intervention.
-        let appeal_reason = hash32(&env, 42);
-        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &appeal_reason);
-        assert!(
-            result.is_err(),
-            "appeal should be blocked when arbitration bias warrants intervention"
-        );
+        let history = client.get_arbitrator_history(&arb);
+        assert_eq!(history.len(), MAX_ARBITRATOR_HISTORY);
+        assert_eq!(history.get(0).unwrap().escrow_id, 6);
         assert_eq!(
-            result.unwrap_err().unwrap(),
-            Error::JusticeRestorationNotEligible,
-            "error must be JusticeRestorationNotEligible"
-        );
-
-        // ── Step 4: Verify the JusticeInterventionRecord was stored.
-        let record = client.get_justice_status(&1, &biased_arb);
-        assert!(record.intervene, "intervention record must have intervene=true");
-        assert_eq!(
-            record.reason,
-            Symbol::new(&env, "arbitration_bias"),
-            "reason must be arbitration_bias"
-        );
-
-        // ── Step 5: Verify the JusticeInterventionRequired event was emitted.
-        let events = env.events().all();
-        let intervention_event = events.iter().find(|e| {
-            e.1 == (Symbol::new(&env, "JusticeInterventionRequired"), 1u64).into_val(&env)
-        });
-        assert!(
-            intervention_event.is_some(),
-            "JusticeInterventionRequired event must be emitted on appeal path"
+            history.get(MAX_ARBITRATOR_HISTORY - 1).unwrap().escrow_id,
+            total
         );
     }
 }

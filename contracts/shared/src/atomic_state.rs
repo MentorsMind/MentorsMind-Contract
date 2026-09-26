@@ -238,19 +238,21 @@ pub fn is_transition_expired(context: &StateTransitionContext, now: u64) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn test_checkpoint_validation() {
+        let env = Env::default();
         let context = StateTransitionContext {
-            transition_id: BytesN::from_array(&[0u8; 32]),
+            transition_id: BytesN::from_array(&env, &[0u8; 32]),
             entity_id: 1,
-            pre_state: Symbol::new(&"Active"),
-            post_state: Symbol::new(&"Released"),
+            pre_state: Symbol::new(&env, "Active"),
+            post_state: Symbol::new(&env, "Released"),
             started_at: 1000,
             timeout_at: 2000,
             checkpoints_passed: 5,
             total_checkpoints: 5,
-            lock_holder: Address::generate(&Env::default()),
+            lock_holder: Address::generate(&env),
             rollback_initiated: false,
         };
         
@@ -259,16 +261,17 @@ mod tests {
 
     #[test]
     fn test_transition_timeout_check() {
+        let env = Env::default();
         let context = StateTransitionContext {
-            transition_id: BytesN::from_array(&[0u8; 32]),
+            transition_id: BytesN::from_array(&env, &[0u8; 32]),
             entity_id: 1,
-            pre_state: Symbol::new(&"Active"),
-            post_state: Symbol::new(&"Released"),
+            pre_state: Symbol::new(&env, "Active"),
+            post_state: Symbol::new(&env, "Released"),
             started_at: 1000,
             timeout_at: 2000,
             checkpoints_passed: 0,
             total_checkpoints: 5,
-            lock_holder: Address::generate(&Env::default()),
+            lock_holder: Address::generate(&env),
             rollback_initiated: false,
         };
         

@@ -184,6 +184,27 @@ fn test_release_partial() {
 }
 
 #[test]
+fn test_release_blocks_platform_bypass_after_low_fee_threshold() {
+    let f = TestFixture::setup();
+    let mut escrow_ids = Vec::new(&f.env);
+
+    for index in 0..6 {
+        escrow_ids.push_back(f.create_escrow_at(1, 0, &alloc::format!("LOW{}", index)));
+    }
+
+    for index in 0..5 {
+        f.client().release_funds(&f.learner, &escrow_ids.get(index).unwrap());
+    }
+
+    let blocked_id = escrow_ids.get(5).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.client().release_funds(&f.learner, &blocked_id);
+    }));
+    assert!(result.is_err(), "platform-bypass session must not release");
+    assert_eq!(f.client().get_escrow(&blocked_id).status, EscrowStatus::Active);
+}
+
+#[test]
 fn test_three_session_package_full_lifecycle() {
     let f = TestFixture::setup_with_fee(1000);
     let id = f.create_package_escrow_at(3000, 0, "PKG1", 3);

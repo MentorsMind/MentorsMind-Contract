@@ -13,9 +13,17 @@ use shared::{
     trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
+    BytesN, Env, Symbol, Vec,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AccessDenied = 1,
+    NotFound = 2,
+}
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd)]
@@ -27,7 +35,7 @@ pub enum KycLevel {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KycRecord {
     pub level: KycLevel,
     pub expiry: u64,
@@ -194,6 +202,62 @@ impl KycRegistry {
             .persistent()
             .get::<_, KycRecord>(&DataKey::Kyc(user))
             .map(|record| record.expiry)
+    }
+
+    /// Read a subject's KYC record enforcing consent and need-to-know minimization.
+    ///
+    /// The caller's purpose is minimized against need-to-know rules, then validated
+    /// against unexpired consent granted by the subject. Returns `Error::AccessDenied`
+    /// if access is unauthorized or isolated, and `Error::NotFound` if no record exists.
+    pub fn get_kyc_record(
+        env: Env,
+        address: Address,
+        caller: Address,
+        purpose: Symbol,
+    ) -> Result<KycRecord, Error> {
+        caller.require_auth();
+
+        let isolated: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PrivacyIsolated(address.clone()))
+            .unwrap_or(false);
+        if isolated {
+            return Err(Error::AccessDenied);
+        }
+
+        // Minimize requested fields to what caller needs for `purpose`
+        let minimized = minimize_to_need_to_know(&env, &purpose, ALL_FIELDS);
+        if minimized == 0 {
+            return Err(Error::AccessDenied);
+        }
+
+        let consent: Option<ConsentRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Consent(address.clone(), purpose));
+
+        let now = env.ledger().timestamp();
+        let access = match &consent {
+            Some(record) => check_access(record, minimized, now),
+            None => AccessDecision {
+                allowed: false,
+                allowed_fields: 0,
+                denied_fields: minimized,
+            },
+        };
+
+        if !access.allowed {
+            return Err(Error::AccessDenied);
+        }
+
+        let record: KycRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Kyc(address))
+            .ok_or(Error::NotFound)?;
+
+        Ok(record)
     }
 
     /// Renew a user's KYC level and expiry. Operator only.
@@ -607,7 +671,7 @@ impl KycRegistry {
     }
 
     /// Add verification authenticity with requirement validation and exploitation prevention mechanisms.
-    pub fn authenticate_verification_requirements(
+    pub fn authenticate_verification_reqs(
         env: Env,
         user: Address,
         verified_reqs: u32,
@@ -737,6 +801,8 @@ impl KycRegistry {
         );
 
         restored
+    }
+
     // ── Identity verification & fraud detection (#904) ─────────────────────
 
     /// Verify a user's identity using multi-factor checks.
@@ -791,7 +857,7 @@ impl KycRegistry {
             let key = DataKey::CrossPlatformIdentity(user_clone.clone(), Symbol::new(&env, "default"));
             let record = shared::CrossPlatformIdentity {
                 platform_id: Symbol::new(&env, "default"),
-                user_id: identity_hash.clone(),
+                user: user_clone.clone(),
                 verified: true,
                 correlation_score: 100,
             };

@@ -35,7 +35,7 @@
 /// 4. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
 #[allow(dead_code)]
 
-use soroban_sdk::{contractevent, contracttype, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.
@@ -48,34 +48,22 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 // Internal emit helper
 // ---------------------------------------------------------------------------
 
-#[contractevent]
-#[derive(Clone)]
-pub struct StandardEvent<D> {
-    #[topic]
-    pub contract: Symbol,
-    #[topic]
-    pub version: u32,
-    #[topic]
-    pub event_type: Symbol,
-    pub data: D,
-}
-
 /// Low-level emit — all typed helpers delegate here.
 ///
 /// Emits `(contract, version, event_type)` as the topic tuple.
 #[inline]
-pub fn emit<D: IntoVal<Env, Val> + Clone>(
+pub fn emit<D: IntoVal<Env, Val>>(
     env: &Env,
     contract: Symbol,
     event_type: Symbol,
     data: D,
 ) {
-    StandardEvent {
-        contract,
-        version: EVENT_SCHEMA_VERSION,
-        event_type,
+    env.events()
+        .publish((contract, EVENT_SCHEMA_VERSION, event_type), data);
+    env.events().publish(
+        (contract, EVENT_SCHEMA_VERSION, event_type),
         data,
-    }.publish(env);
+    );
 }
 
 // ---------------------------------------------------------------------------

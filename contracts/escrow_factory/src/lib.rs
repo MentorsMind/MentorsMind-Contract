@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, IntoVal, Symbol, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
 
@@ -10,6 +10,14 @@ use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAc
 use shared::GasEstimate;
 use shared::dynamic_fees::{calculate_dynamic_fee, DynamicFeeResult};
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::CrossContractAuth;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    Unauthorized = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,6 +281,11 @@ impl EscrowFactory {
         token: Address,
         session_id: Symbol,
     ) -> Address {
+        let admin = Self::admin(&env);
+        if !CrossContractAuth::verify_caller(&env, &admin) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
         // Check pause guardian
         if let Some(guardian) = env.storage().persistent().get::<_, Address>(&PAUSE_GUARDIAN) {
             let is_paused: bool = env.invoke_contract(
