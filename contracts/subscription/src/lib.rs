@@ -1791,4 +1791,87 @@ mod test {
         assert_eq!(page.len(), 1);
         assert_eq!(page.get(0).unwrap().plan_id, plan_id);
     }
+
+    // -----------------------------------------------------------------------
+    // Auto-renewal tests for issue #3
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_renewal_succeeds_after_billing_date() {
+        let (env, client, admin, escrow, mentor, learner) = setup();
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Pre-authorize renewal
+        client.authorize_renewal(&sub_id, &200i128);
+
+        // Advance time past next_billing_date
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + 1;
+        });
+
+        // Renewal should succeed
+        client.renew(&sub_id);
+
+        let record = client.get_subscription(&sub_id);
+        assert_eq!(record.status, SubscriptionStatus::Active);
+        assert_eq!(token.balance(&learner), 800);
+        assert_eq!(token.balance(&escrow), 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "billing date not reached")]
+    fn test_renewal_rejected_before_grace_period() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        client.authorize_renewal(&sub_id, &200i128);
+
+        // Advance time to before (next_billing_date - RENEWAL_GRACE_SECS)
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH - RENEWAL_GRACE_SECS - 1;
+        });
+
+        // Renewal should fail
+        client.renew(&sub_id);
+    }
+
+    #[test]
+    fn test_subscription_expires_after_grace_period() {
+        let (env, client, admin, escrow, mentor, learner) = setup();
+        let (token_address, token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        client.authorize_renewal(&sub_id, &200i128);
+
+        // Advance time past next_billing_date + SUBSCRIPTION_EXPIRY_GRACE_SECS
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + SUBSCRIPTION_EXPIRY_GRACE_SECS + 1;
+        });
+
+        // Call renew - should transition to Expired
+        client.renew(&sub_id);
+
+        let record = client.get_subscription(&sub_id);
+        assert_eq!(record.status, SubscriptionStatus::Expired);
+        // No payment should be pulled when subscription expires
+        assert_eq!(token.balance(&learner), 900);
+        assert_eq!(token.balance(&escrow), 98);
+    }
 }
