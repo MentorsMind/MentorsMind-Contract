@@ -23,22 +23,6 @@ use soroban_sdk::Env;
 
 pub const MAX_PAGE_SIZE: u32 = 50;
 
-pub struct Pagination {
-    pub offset: u32,
-    pub limit: u32,
-}
-
-impl Pagination {
-    pub fn new(offset: u32, limit: u32) -> Self {
-        Self { offset, limit }
-    }
-
-/// Hard ceiling on the number of items a single view may return.
-///
-/// Liquidation bots and governance tooling enumerate positions off-chain, so a
-/// page must stay small enough to fit inside a single transaction's budget.
-pub const MAX_PAGE_SIZE: u32 = 50;
-
 /// Inclusive/exclusive page window helper shared by every paginated view.
 pub struct Pagination;
 
