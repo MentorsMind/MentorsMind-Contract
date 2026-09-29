@@ -75,7 +75,10 @@ pub enum DataKey {
     Balance(Address),
     TotalSupply,
     Metadata,
+    /// Address allowed to trigger the emergency pause (set by admin).
     PauseGuardian,
+    /// `true` while the token is paused; absent/`false` means active.
+    Paused,
 }
 
 const SUPPLY_CAP: i128 = 100_000_000 * 10_000_000; // 100M with 7 decimals
@@ -130,7 +133,7 @@ impl MNTToken {
             .expect("Not initialized");
         admin.require_auth();
 
-        Self::assert_not_paused(&env);
+        Self::require_not_paused(&env);
 
         if amount <= 0 {
             panic!("Amount must be positive");
@@ -177,7 +180,7 @@ impl MNTToken {
     /// - Insufficient balance
     pub fn do_burn(env: Env, from: Address, amount: i128) {
         from.require_auth();
-        Self::assert_not_paused(&env);
+        Self::require_not_paused(&env);
 
         if amount <= 0 {
             panic!("Amount must be positive");
@@ -187,6 +190,14 @@ impl MNTToken {
         if balance < amount {
             panic!("Insufficient balance");
         }
+
+        let total_supply = Self::total_supply(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(from.clone()), &(balance - amount));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalSupply, &(total_supply - amount));
 
         env.events().publish(
             (
@@ -205,32 +216,98 @@ impl MNTToken {
             .unwrap_or(0)
     }
 
-    /// Set the pause guardian contract address. Admin only.
-    pub fn set_pause_guardian(env: Env, guardian: Address) {
-        let admin: Address = env
+    /// Set the address allowed to pause and unpause the token.
+    ///
+    /// Auth: `admin` must be the stored admin and must authorise.
+    ///
+    /// Panics if:
+    /// - Contract is not initialized
+    /// - `admin` is not the stored admin
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseGuardian, &guardian);
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                Symbol::new(&env, "PauseGuardianSet"),
+            ),
+            guardian,
+        );
+    }
+
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PauseGuardian)
+    }
+
+    /// Emergency stop: blocks mint, transfer, transfer_from, burn and burn_from.
+    ///
+    /// Auth: `guardian` must be the stored pause guardian and must authorise.
+    ///
+    /// Panics if:
+    /// - No pause guardian has been set
+    /// - `guardian` is not the stored pause guardian
+    pub fn pause(env: Env, guardian: Address) {
+        Self::require_pause_guardian(&env, &guardian);
+        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Paused")),
+            guardian,
+        );
+    }
+
+    /// Restores normal operation after `pause`.
+    ///
+    /// Auth: `guardian` must be the stored pause guardian and must authorise.
+    ///
+    /// Panics if:
+    /// - No pause guardian has been set
+    /// - `guardian` is not the stored pause guardian
+    pub fn unpause(env: Env, guardian: Address) {
+        Self::require_pause_guardian(&env, &guardian);
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Unpaused")),
+            guardian,
+        );
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) {
+        let stored: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Admin)
             .expect("Not initialized");
+        if *admin != stored {
+            panic!("Unauthorized");
+        }
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
     }
 
-    /// Panics if the pause guardian reports the system is paused.
-    fn assert_not_paused(env: &Env) {
-        if let Some(guardian) = env
+    fn require_pause_guardian(env: &Env, guardian: &Address) {
+        let stored: Address = env
             .storage()
             .persistent()
-            .get::<_, Address>(&DataKey::PauseGuardian)
-        {
-            let is_paused: bool = env.invoke_contract(
-                &guardian,
-                &soroban_sdk::Symbol::new(env, "is_paused"),
-                soroban_sdk::Vec::new(env),
-            );
-            if is_paused {
-                panic!("Contract is paused");
-            }
+            .get(&DataKey::PauseGuardian)
+            .expect("Pause guardian not set");
+        if *guardian != stored {
+            panic!("Unauthorized");
+        }
+        guardian.require_auth();
+    }
+
+    /// Panics with "Contract is paused" while the token is paused.
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("Contract is paused");
         }
     }
 }
@@ -294,7 +371,7 @@ impl TokenInterface for MNTToken {
     /// - Insufficient balance
     fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
         from.require_auth();
-        Self::assert_not_paused(&env);
+        Self::require_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -337,7 +414,7 @@ impl TokenInterface for MNTToken {
     /// - Insufficient balance
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
-        Self::assert_not_paused(&env);
+        Self::require_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -386,7 +463,7 @@ impl TokenInterface for MNTToken {
 
     fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
         spender.require_auth();
-        Self::assert_not_paused(&env);
+        Self::require_not_paused(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -414,6 +491,10 @@ impl TokenInterface for MNTToken {
                 from.clone(),
             ),
             BurnEventData { amount },
+        );
+        env.storage().persistent().set(
+            &DataKey::Allowance(from.clone(), spender.clone()),
+            &(allowance - amount),
         );
         env.storage()
             .persistent()
@@ -456,14 +537,59 @@ impl TokenInterface for MNTToken {
 mod test {
     extern crate std;
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{vec, Env, IntoVal, Symbol, TryFromVal};
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::xdr::{ContractEventBody, ScAddress};
+    use soroban_sdk::{Env, IntoVal, Symbol, TryFromVal, Val, Vec};
+
+    /// Events from the last invocation as `(contract, topics, data)` tuples.
+    fn all_events(env: &Env) -> std::vec::Vec<(Address, Vec<Val>, Val)> {
+        env.events()
+            .all()
+            .events()
+            .iter()
+            .map(|e| {
+                let contract = Address::try_from_val(
+                    env,
+                    &ScAddress::Contract(e.contract_id.clone().unwrap()),
+                )
+                .unwrap();
+                let ContractEventBody::V0(body) = &e.body;
+                let mut topics = Vec::new(env);
+                for t in body.topics.iter() {
+                    topics.push_back(Val::try_from_val(env, t).unwrap());
+                }
+                (contract, topics, Val::try_from_val(env, &body.data).unwrap())
+            })
+            .collect()
+    }
+
+    /// Last `MNTToken`-namespaced event from the most recent invocation.
+    fn last_mnt_event(env: &Env) -> (Address, Vec<Val>, Val) {
+        let ns: Val = Symbol::new(env, "MNTToken").into_val(env);
+        all_events(env)
+            .into_iter()
+            .rev()
+            .find(|(_, topics, _)| topics.get(0).map(|t| t.shallow_eq(&ns)).unwrap_or(false))
+            .expect("no MNTToken event")
+    }
+
+    fn setup() -> (Env, Address, Address, MNTTokenClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let contract_id = env.register(MNTToken, ());
+        let client = MNTTokenClient::new(&env, &contract_id);
+        client.initialize(&admin);
+        client.set_pause_guardian(&admin, &guardian);
+        (env, admin, guardian, client)
+    }
 
     #[test]
     fn test_initialization() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let contract_id = env.register_contract(None, MNTToken);
+        let contract_id = env.register(MNTToken, ());
         let client = MNTTokenClient::new(&env, &contract_id);
 
         client.initialize(&admin);
@@ -479,16 +605,14 @@ mod test {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
-        let contract_id = env.register_contract(None, MNTToken);
+        let contract_id = env.register(MNTToken, ());
         let client = MNTTokenClient::new(&env, &contract_id);
 
         client.initialize(&admin);
 
         client.mint(&user, &1000);
+        let last_event = last_mnt_event(&env);
         assert_eq!(client.balance(&user), 1000);
-
-        let events = env.events().all();
-        let last_event = events.last().unwrap();
         assert_eq!(last_event.0, contract_id.clone());
         assert_eq!(
             last_event.1,
@@ -503,10 +627,8 @@ mod test {
         assert_eq!(mint_data.amount, 1000);
 
         client.burn(&user, &400);
+        let last_event = last_mnt_event(&env);
         assert_eq!(client.balance(&user), 600);
-
-        let events = env.events().all();
-        let last_event = events.last().unwrap();
 
         assert_eq!(last_event.0, contract_id.clone());
         assert_eq!(
@@ -529,18 +651,16 @@ mod test {
         let admin = Address::generate(&env);
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
-        let contract_id = env.register_contract(None, MNTToken);
+        let contract_id = env.register(MNTToken, ());
         let client = MNTTokenClient::new(&env, &contract_id);
 
         client.initialize(&admin);
         client.mint(&user1, &1000);
 
         client.transfer(&user1, &user2, &300);
+        let last_event = last_mnt_event(&env);
         assert_eq!(client.balance(&user1), 700);
         assert_eq!(client.balance(&user2), 300);
-
-        let events = env.events().all();
-        let last_event = events.last().unwrap();
 
         assert_eq!(last_event.0, contract_id.clone());
         assert_eq!(
@@ -564,17 +684,15 @@ mod test {
         let admin = Address::generate(&env);
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
-        let contract_id = env.register_contract(None, MNTToken);
+        let contract_id = env.register(MNTToken, ());
         let client = MNTTokenClient::new(&env, &contract_id);
 
         client.initialize(&admin);
         client.mint(&user1, &1000);
 
         client.approve(&user1, &user2, &500, &100);
+        let mut last_event = last_mnt_event(&env);
         assert_eq!(client.allowance(&user1, &user2), 500);
-
-        let events = env.events().all();
-        let mut last_event = events.last().unwrap();
 
         assert_eq!(last_event.0, contract_id.clone());
         assert_eq!(
@@ -591,12 +709,10 @@ mod test {
         assert_eq!(approve_data.amount, 500);
 
         client.transfer_from(&user2, &user1, &user2, &200);
+        last_event = last_mnt_event(&env);
         assert_eq!(client.balance(&user1), 800);
         assert_eq!(client.balance(&user2), 200);
         assert_eq!(client.allowance(&user1, &user2), 300);
-
-        let events2 = env.events().all();
-        last_event = events2.last().unwrap();
 
         assert_eq!(last_event.0, contract_id.clone());
         assert_eq!(
@@ -620,7 +736,7 @@ mod test {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
-        let contract_id = env.register_contract(None, MNTToken);
+        let contract_id = env.register(MNTToken, ());
         let client = MNTTokenClient::new(&env, &contract_id);
 
         client.initialize(&admin);
@@ -644,7 +760,7 @@ mod test {
         let admin = Address::generate(&env);
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
-        let contract_id = env.register_contract(None, MNTToken);
+        let contract_id = env.register(MNTToken, ());
         let client = MNTTokenClient::new(&env, &contract_id);
 
         client.initialize(&admin);
@@ -685,5 +801,145 @@ mod test {
         client.burn_from(&user2, &user1, &200);
         assert_eq!(client.balance(&user1), 300);
         assert_eq!(client.allowance(&user1, &user2), 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pause guardian
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_pause_guardian_stores_guardian() {
+        let (_env, _admin, guardian, client) = setup();
+        assert_eq!(client.get_pause_guardian(), Some(guardian));
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_set_pause_guardian_rejects_non_admin() {
+        let (env, _admin, _guardian, client) = setup();
+        let stranger = Address::generate(&env);
+        client.set_pause_guardian(&stranger, &stranger);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_pause_rejects_non_guardian() {
+        let (env, _admin, _guardian, client) = setup();
+        let stranger = Address::generate(&env);
+        client.pause(&stranger);
+    }
+
+    #[test]
+    #[should_panic(expected = "Pause guardian not set")]
+    fn test_pause_requires_guardian_to_be_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let client = MNTTokenClient::new(&env, &env.register(MNTToken, ()));
+        client.initialize(&admin);
+        client.pause(&admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_transfer_rejected_while_paused() {
+        let (env, _admin, guardian, client) = setup();
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        client.mint(&user1, &1000);
+        client.pause(&guardian);
+        client.transfer(&user1, &user2, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_transfer_from_rejected_while_paused() {
+        let (env, _admin, guardian, client) = setup();
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        client.mint(&user1, &1000);
+        client.approve(&user1, &user2, &500, &100);
+        client.pause(&guardian);
+        client.transfer_from(&user2, &user1, &user2, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_mint_rejected_while_paused() {
+        let (env, _admin, guardian, client) = setup();
+        let user = Address::generate(&env);
+        client.pause(&guardian);
+        client.mint(&user, &1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_burn_rejected_while_paused() {
+        let (env, _admin, guardian, client) = setup();
+        let user = Address::generate(&env);
+        client.mint(&user, &1000);
+        client.pause(&guardian);
+        client.burn(&user, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_burn_from_rejected_while_paused() {
+        let (env, _admin, guardian, client) = setup();
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        client.mint(&user1, &1000);
+        client.approve(&user1, &user2, &500, &100);
+        client.pause(&guardian);
+        client.burn_from(&user2, &user1, &100);
+    }
+
+    #[test]
+    fn test_operations_succeed_after_unpause() {
+        let (env, _admin, guardian, client) = setup();
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        client.mint(&user1, &1000);
+
+        client.pause(&guardian);
+        assert!(client.is_paused());
+        assert!(client.try_transfer(&user1, &user2, &100).is_err());
+        assert!(client.try_mint(&user1, &100).is_err());
+        assert!(client.try_burn(&user1, &100).is_err());
+        assert_eq!(client.balance(&user1), 1000);
+
+        client.unpause(&guardian);
+        assert!(!client.is_paused());
+
+        client.transfer(&user1, &user2, &300);
+        client.mint(&user2, &50);
+        client.burn(&user1, &200);
+        assert_eq!(client.balance(&user1), 500);
+        assert_eq!(client.balance(&user2), 350);
+        assert_eq!(client.total_supply(), 850);
+    }
+
+    #[test]
+    fn test_pause_and_unpause_emit_events() {
+        let (env, _admin, guardian, client) = setup();
+
+        client.pause(&guardian);
+        let events = all_events(&env);
+        let (contract, topics, data) = events.last().unwrap();
+        assert_eq!(*contract, client.address);
+        assert_eq!(
+            *topics,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Paused")).into_val(&env)
+        );
+        assert_eq!(Address::try_from_val(&env, data).unwrap(), guardian);
+
+        client.unpause(&guardian);
+        let events = all_events(&env);
+        let (_, topics, _) = events.last().unwrap();
+        assert_eq!(
+            *topics,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Unpaused")).into_val(&env)
+        );
     }
 }
