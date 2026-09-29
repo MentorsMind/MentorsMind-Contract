@@ -1631,6 +1631,60 @@ mod tests {
     }
 
     #[test]
+    fn test_submission_cooldown_enforced() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission should succeed
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Immediate resubmission should fail with cooldown error
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        assert_eq!(
+            client.try_submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None),
+            Err(Ok(Error::SubmissionCooldown))
+        );
+
+        // Advance time past cooldown
+        env.ledger().with_mut(|li| li.timestamp += SUBMISSION_COOLDOWN_SECS);
+
+        // Now resubmission should succeed
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify we have 2 evidence items
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn test_submission_cooldown_can_be_disabled() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        // Disable cooldown
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Immediate resubmission should now succeed
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify we have 2 evidence items
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
     fn submit_appeal_after_deadline_fails() {
         let (env, admin, mentor, _learner, client) = setup_disputed();
         let _governance_contract = setup_disputed_with_governance(&env, &client, &admin);

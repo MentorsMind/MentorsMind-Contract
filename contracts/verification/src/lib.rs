@@ -1245,3 +1245,80 @@ mod test {
     }
 }
 
+
+    #[test]
+    fn test_grace_period_boundary_before_expiry() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[3u8; 32]);
+        
+        // Verify mentor with expiry at timestamp 1000
+        let expiry = 1000u64;
+        f.env.ledger().set_timestamp(0);
+        client.verify_mentor(&f.mentor, &credential_hash, &expiry);
+        
+        // At expiry - 1s (timestamp 999), should still be verified (not in grace)
+        f.env.ledger().set_timestamp(999);
+        let status = client.get_verification_status(&f.mentor);
+        assert!(status.is_verified);
+        assert!(!status.is_grace);
+    }
+
+    #[test]
+    fn test_grace_period_boundary_at_exact_expiry() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[4u8; 32]);
+        
+        // Verify mentor with expiry at timestamp 1000
+        let expiry = 1000u64;
+        f.env.ledger().set_timestamp(0);
+        client.verify_mentor(&f.mentor, &credential_hash, &expiry);
+        
+        // At exact expiry (timestamp 1000), should still be verified (grace started)
+        f.env.ledger().set_timestamp(1000);
+        let status = client.get_verification_status(&f.mentor);
+        assert!(status.is_verified);
+        assert!(status.is_grace); // Now in grace period
+    }
+
+    #[test]
+    fn test_grace_period_boundary_within_grace() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[5u8; 32]);
+        
+        // Verify mentor with expiry at timestamp 1000
+        let expiry = 1000u64;
+        f.env.ledger().set_timestamp(0);
+        client.verify_mentor(&f.mentor, &credential_hash, &expiry);
+        
+        // Within grace period: expiry + grace_period_secs - 1s
+        let grace_expires = expiry + DEFAULT_GRACE_PERIOD_SECS;
+        let test_time = grace_expires - 1;
+        f.env.ledger().set_timestamp(test_time);
+        
+        let status = client.get_verification_status(&f.mentor);
+        assert!(status.is_verified);
+        assert!(status.is_grace); // Still in grace
+    }
+
+    #[test]
+    fn test_grace_period_boundary_after_grace_expires() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[6u8; 32]);
+        
+        // Verify mentor with expiry at timestamp 1000
+        let expiry = 1000u64;
+        f.env.ledger().set_timestamp(0);
+        client.verify_mentor(&f.mentor, &credential_hash, &expiry);
+        
+        // After grace period expires: expiry + grace_period_secs
+        let grace_expires = expiry + DEFAULT_GRACE_PERIOD_SECS;
+        f.env.ledger().set_timestamp(grace_expires);
+        
+        let status = client.get_verification_status(&f.mentor);
+        assert!(!status.is_verified); // No longer verified
+        assert!(!status.is_grace);
+    }

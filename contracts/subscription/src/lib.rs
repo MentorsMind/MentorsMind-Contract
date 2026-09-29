@@ -1,11 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
 
 use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_sub_expiry_grace,
     DEFAULT_SUB_EXPIRY_GRACE,
-    Pagination, MAX_PAGE_SIZE,
+    detect_fee_gaming, Pagination, PenaltyTier, MAX_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,13 @@ pub const DEFAULT_PLATFORM_FEE_BPS: i128 = 250; // 2.5%
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    FeeGamingDetected = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +105,9 @@ pub enum DataKey {
     /// Cumulative revenue paid to a mentor, denominated per token.
     /// Key: (mentor, token) → i128 total received (net of platform fee).
     MentorRevenue(Address, Address),
+    /// Count and volume of successful early renewals, tracked per learner.
+    GraceRenewalCount(Address),
+    GraceRenewalVolume(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +459,7 @@ impl SubscriptionContract {
     /// timely renewal.  The subscription must also not have lapsed beyond
     /// `SUBSCRIPTION_EXPIRY_GRACE_SECS` past the billing date; if it has, the
     /// subscription is transitioned to `Expired` and renewal is rejected.
-    pub fn renew(env: Env, subscription_id: u32) {
+    pub fn renew(env: Env, subscription_id: u32) -> Result<(), Error> {
         let mut record: SubscriptionRecord = env
             .storage()
             .persistent()
@@ -482,7 +492,7 @@ impl SubscriptionContract {
                 (symbol_short!("expired"), subscription_id),
                 (record.learner, record.plan_id),
             );
-            return;
+            return Ok(());
         }
 
         // Apply grace period: allow renewal up to RENEWAL_GRACE_SECS before
@@ -533,7 +543,43 @@ impl SubscriptionContract {
                 },
             );
             // Return without panicking — state is correctly Expired.
-            return;
+            return Ok(());
+        }
+
+        let is_grace_renewal = now < record.next_billing_date;
+        let prior_grace_renewals: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraceRenewalCount(record.learner.clone()))
+            .unwrap_or(0);
+        let prior_grace_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraceRenewalVolume(record.learner.clone()))
+            .unwrap_or(0);
+        let renewal_count = prior_grace_renewals
+            .saturating_add(if is_grace_renewal { 1 } else { 0 });
+        let renewal_volume = if is_grace_renewal {
+            prior_grace_volume.saturating_add(required)
+        } else {
+            prior_grace_volume
+        };
+        let fee_gaming = detect_fee_gaming(&env, renewal_count, renewal_volume);
+        let penalty_tier = if fee_gaming.is_evading {
+            PenaltyTier::PermanentBan
+        } else {
+            PenaltyTier::None
+        };
+        if penalty_tier == PenaltyTier::PermanentBan {
+            return Err(Error::FeeGamingDetected);
+        }
+        if is_grace_renewal {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GraceRenewalCount(record.learner.clone()), &renewal_count);
+            env.storage()
+                .persistent()
+                .set(&DataKey::GraceRenewalVolume(record.learner.clone()), &renewal_volume);
         }
 
         // Deduct from the pre-authorized allowance first.
@@ -555,6 +601,7 @@ impl SubscriptionContract {
             (symbol_short!("renewed"), subscription_id),
             (record.learner, record.plan_id),
         );
+        Ok(())
     }
 
     /// Cancel a subscription — learner only, effective end of billing period.
@@ -1225,6 +1272,37 @@ mod test {
 
         client.renew(&sub_id);
         assert_eq!(token.balance(&escrow), 200);
+    }
+
+    #[test]
+    fn test_repeated_grace_window_renewals_trigger_fee_gaming_error() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+        token_admin.mint(&learner, &5000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        for _ in 0..20 {
+            let record = client.get_subscription(&sub_id);
+            env.ledger().with_mut(|ledger| {
+                ledger.timestamp = record.next_billing_date - RENEWAL_GRACE_SECS;
+            });
+            client.authorize_renewal(&sub_id, &100i128);
+            client.renew(&sub_id);
+        }
+
+        let record = client.get_subscription(&sub_id);
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp = record.next_billing_date - RENEWAL_GRACE_SECS;
+        });
+        client.authorize_renewal(&sub_id, &100i128);
+
+        assert!(matches!(
+            client.try_renew(&sub_id),
+            Err(Ok(Error::FeeGamingDetected))
+        ));
     }
 
     #[test]

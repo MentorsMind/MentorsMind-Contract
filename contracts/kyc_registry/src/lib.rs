@@ -11,6 +11,8 @@ use shared::{
     contain_data_breach, detect_cross_session_leak,
     CrossSessionLeakResult, DataBreachContainment,
     trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
+    // pagination
+    Pagination, MAX_PAGE_SIZE,
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
@@ -59,6 +61,12 @@ pub enum DataKey {
     Rbac,
     Kyc(Address),
     KycExpiryAlert(Address),
+    /// Index for efficient KYC expiry queries: (expiry_timestamp, user_address) -> true
+    ExpiryIndex(u64, Address),
+    /// Registry of all users who have KYC records for efficient iteration
+    UserRegistry,
+    /// Count of users in the registry
+    UserCount,
     /// Subject-granted consent for a purpose (privacy protection, #data-access-control).
     Consent(Address, Symbol),
     /// Timestamps of `accessor` reading `subject`'s data, for exploitation monitoring.
@@ -94,6 +102,9 @@ const ACCESS_LOG_CAP: u32 = 20;
 /// Alerts are raised once expiry is within this window (30 days).
 const EXPIRY_ALERT_WINDOW: u64 = 30 * 24 * 60 * 60;
 
+/// Maximum batch size for batch operations.
+const MAX_BATCH: u32 = 100;
+
 #[contractclient(name = "RbacContractClient")]
 pub trait RbacContractTrait {
     fn has_role(env: Env, role: Symbol, account: Address) -> bool;
@@ -110,6 +121,7 @@ impl KycRegistry {
             panic!("Already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::UserCount, &0u32);
     }
 
     pub fn set_rbac_contract(env: Env, admin: Address, rbac: Address) {
@@ -133,6 +145,14 @@ impl KycRegistry {
             panic!("KYC expiry must be in the future");
         }
 
+        // Remove old expiry index entry if it exists
+        if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user.clone())) {
+            env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, user.clone()));
+        } else {
+            // Add user to registry if this is their first KYC record
+            Self::add_user_to_registry(&env, &user);
+        }
+
         let record = KycRecord {
             level,
             expiry,
@@ -142,6 +162,11 @@ impl KycRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Kyc(user.clone()), &record);
+
+        // Add new expiry index entry
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiryIndex(expiry, user.clone()), &true);
 
         env.events()
             .publish((symbol_short!("kyc_set"), user), record.level);
@@ -162,6 +187,14 @@ impl KycRegistry {
 
         let count = entries.len();
         for entry in entries.iter() {
+            // Remove old expiry index entry if it exists
+            if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(entry.user.clone())) {
+                env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, entry.user.clone()));
+            } else {
+                // Add user to registry if this is their first KYC record
+                Self::add_user_to_registry(&env, &entry.user);
+            }
+
             let record = KycRecord {
                 level: entry.level,
                 expiry: entry.expiry,
@@ -171,6 +204,11 @@ impl KycRegistry {
             env.storage()
                 .persistent()
                 .set(&DataKey::Kyc(entry.user.clone()), &record);
+
+            // Add new expiry index entry
+            env.storage()
+                .persistent()
+                .set(&DataKey::ExpiryIndex(entry.expiry, entry.user.clone()), &true);
         }
 
         env.events()
@@ -202,6 +240,36 @@ impl KycRegistry {
             .persistent()
             .get::<_, KycRecord>(&DataKey::Kyc(user))
             .map(|record| record.expiry)
+    }
+
+    /// Get addresses whose KYC is expiring before the given timestamp, with pagination.
+    /// Returns a list of addresses where KycRecord.expiry <= before_timestamp.
+    /// Limit is clamped to MAX_PAGE_SIZE for performance.
+    pub fn get_expiring_kyc(env: Env, before_timestamp: u64, offset: u32, limit: u32) -> Vec<Address> {
+        let mut results = Vec::new(&env);
+        let clamped_limit = if limit == 0 { 1 } else { limit.min(MAX_PAGE_SIZE) };
+        
+        // Get the list of all users from the registry
+        let user_registry_key = DataKey::UserRegistry;
+        let all_users: Vec<Address> = env.storage().persistent().get(&user_registry_key).unwrap_or(Vec::new(&env));
+        
+        let total_users = all_users.len() as u32;
+        let (start, end) = Pagination::new(offset, clamped_limit).bounds(total_users);
+        
+        // Iterate through users in the pagination range
+        for i in start..end {
+            if let Some(user_addr) = all_users.get(i) {
+                // Check if user still has a KYC record (they might have been revoked)
+                if let Some(kyc_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user_addr.clone())) {
+                    // Check if the KYC record is expiring
+                    if kyc_record.expiry <= before_timestamp {
+                        results.push_back(user_addr.clone());
+                    }
+                }
+            }
+        }
+        
+        results
     }
 
     /// Read a subject's KYC record enforcing consent and need-to-know minimization.
@@ -275,6 +343,11 @@ impl KycRegistry {
             panic!("KYC expiry must be in the future");
         }
 
+        // Remove old expiry index entry if it exists
+        if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user.clone())) {
+            env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, user.clone()));
+        }
+
         let provider_hash = env
             .storage()
             .persistent()
@@ -294,6 +367,11 @@ impl KycRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::KycExpiryAlert(user.clone()));
+
+        // Add new expiry index entry
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiryIndex(new_expiry, user.clone()), &true);
 
         env.events()
             .publish((symbol_short!("kyc_renew"), user), (record.level, new_expiry));
@@ -341,6 +419,11 @@ impl KycRegistry {
     pub fn revoke_kyc(env: Env, operator: Address, user: Address) {
         Self::require_operator(&env, &operator);
 
+        // Remove old expiry index entry if it exists
+        if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user.clone())) {
+            env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, user.clone()));
+        }
+
         env.storage()
             .persistent()
             .remove(&DataKey::Kyc(user.clone()));
@@ -348,7 +431,35 @@ impl KycRegistry {
             .persistent()
             .remove(&DataKey::KycExpiryAlert(user.clone()));
 
+        // Note: We don't remove from UserRegistry to avoid registry compaction
+        Self::remove_user_from_registry(&env, &user);
+
         env.events().publish((symbol_short!("kyc_rvk"), user), ());
+    }
+
+    /// Batch revoke KYC for multiple users in a single transaction (Issue #1048).
+    /// Operator only. Batch size is capped at MAX_BATCH = 100.
+    /// Each revoked record emits a revocation event.
+    pub fn batch_revoke_kyc(env: Env, operator: Address, users: Vec<Address>) {
+        Self::require_operator(&env, &operator);
+
+        let batch_size = users.len();
+        if batch_size > MAX_BATCH as usize {
+            panic!("Batch size exceeds maximum of {}", MAX_BATCH);
+        }
+
+        for user in users.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Kyc(user.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::KycExpiryAlert(user.clone()));
+            env.events().publish((symbol_short!("kyc_rvk"), user.clone()), ());
+        }
+
+        env.events()
+            .publish((symbol_short!("kyc_brvk"), operator), batch_size as u32);
     }
 
     /// Grant or update a subject's consent for `purpose`, scoping exactly
@@ -638,6 +749,29 @@ impl KycRegistry {
         {
             panic!("KYC_OPERATOR role required");
         }
+    }
+
+    /// Add a user to the registry if not already present
+    fn add_user_to_registry(env: &Env, user: &Address) {
+        // Only add if the user doesn't already have a KYC record
+        if !env.storage().persistent().has(&DataKey::Kyc(user.clone())) {
+            let user_count: u32 = env.storage().persistent().get(&DataKey::UserCount).unwrap_or(0);
+            
+            // Store the user address in the registry with index as key
+            let user_registry_key = DataKey::UserRegistry;
+            let mut users: Vec<Address> = env.storage().persistent().get(&user_registry_key).unwrap_or(Vec::new(env));
+            users.push_back(user.clone());
+            env.storage().persistent().set(&user_registry_key, &users);
+            env.storage().persistent().set(&DataKey::UserCount, &(user_count + 1));
+        }
+    }
+
+    /// Remove a user from the registry (called when KYC is revoked)
+    fn remove_user_from_registry(env: &Env, _user: &Address) {
+        // For simplicity, we don't actually remove from the registry
+        // This avoids the complexity of compacting the registry
+        // In production, you'd want a more sophisticated approach
+        // The get_expiring_kyc function will skip users without KYC records
     }
 
     // ─── Onboarding Fairness & Barrier Gaming Protection ───────────────

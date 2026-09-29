@@ -2,6 +2,8 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+use shared::admin::{AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS};
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -9,6 +11,9 @@ pub enum Error {
     AlreadyInitialized = 1,
     Unauthorized = 2,
     RoleNotGranted = 3,
+    NoPendingTransfer = 4,
+    TimelockActive = 5,
+    WrongNewAdmin = 6,
 }
 
 #[contracttype]
@@ -20,6 +25,7 @@ pub enum DataKey {
     RoleMember(Symbol, Address),
     RoleMembers(Symbol),
     RoleMemberCount(Symbol),
+    PendingAdminTransfer,
 }
 
 #[contract]
@@ -117,6 +123,106 @@ impl RbacContract {
             .unwrap_or(0)
     }
 
+    /// Propose a change to the SuperAdmin. Current admin only.
+    /// The new admin may accept after MIN_ADMIN_TIMELOCK_SECS.
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_super_admin(&env, &current_admin)?;
+
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(MIN_ADMIN_TIMELOCK_SECS)
+            .expect("timestamp overflow");
+
+        let transfer = AdminTransfer {
+            new_admin: new_admin.clone(),
+            effective_at,
+            status: AdminChangeProposal::Proposed,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdminTransfer, &transfer);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_proposed"), new_admin),
+            effective_at,
+        );
+
+        Ok(())
+    }
+
+    /// Accept a proposed admin transfer. Callable only by the new_admin after timelock.
+    pub fn accept_admin_change(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+
+        let mut transfer: AdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+            .ok_or(Error::NoPendingTransfer)?;
+
+        if transfer.new_admin != new_admin {
+            return Err(Error::WrongNewAdmin);
+        }
+
+        if env.ledger().timestamp() < transfer.effective_at {
+            return Err(Error::TimelockActive);
+        }
+
+        // Update SuperAdmin
+        env.storage()
+            .instance()
+            .set(&DataKey::SuperAdmin, &new_admin);
+
+        // Grant SUPER_ADMIN role to new admin
+        Self::grant_internal(&env, &Self::super_admin_role(env.clone()), &new_admin);
+
+        // Mark transfer as accepted
+        transfer.status = AdminChangeProposal::Accepted;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdminTransfer, &transfer);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_accepted"), new_admin.clone()),
+            env.ledger().timestamp(),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer. Current admin only.
+    pub fn cancel_admin_change(env: Env, current_admin: Address) -> Result<(), Error> {
+        Self::require_super_admin(&env, &current_admin)?;
+
+        let mut transfer: AdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+            .ok_or(Error::NoPendingTransfer)?;
+
+        transfer.status = AdminChangeProposal::Revoked;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdminTransfer, &transfer);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAdminTransfer);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_cancelled"),),
+            current_admin,
+        );
+
+        Ok(())
+    }
+
     pub fn super_admin_role(env: Env) -> Symbol {
         Symbol::new(&env, "SUPER_ADMIN")
     }
@@ -198,7 +304,8 @@ impl RbacContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use shared::admin::MIN_ADMIN_TIMELOCK_SECS;
 
     #[test]
     fn grants_and_revokes_roles() {
@@ -218,5 +325,67 @@ mod tests {
 
         client.revoke_role(&admin, &role, &operator);
         assert!(!client.has_role(&role, &operator));
+    }
+
+    #[test]
+    fn test_admin_rotation_propose_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(0);
+
+        let contract_id = env.register_contract(None, RbacContract);
+        let client = RbacContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        // Propose admin change
+        client.propose_admin_change(&admin, &new_admin);
+
+        // Try to accept before timelock - should fail
+        assert_eq!(
+            client.try_accept_admin_change(&new_admin),
+            Err(Ok(Error::TimelockActive))
+        );
+
+        // Advance time past timelock
+        env.ledger().set_timestamp(MIN_ADMIN_TIMELOCK_SECS);
+
+        // Accept admin change
+        client.accept_admin_change(&new_admin);
+
+        // Verify new admin has SUPER_ADMIN role
+        let super_admin_role = client.super_admin_role();
+        assert!(client.has_role(&super_admin_role, &new_admin));
+    }
+
+    #[test]
+    fn test_admin_rotation_cancel() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(0);
+
+        let contract_id = env.register_contract(None, RbacContract);
+        let client = RbacContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        // Propose admin change
+        client.propose_admin_change(&admin, &new_admin);
+
+        // Cancel the transfer
+        client.cancel_admin_change(&admin);
+
+        // Advance time past timelock
+        env.ledger().set_timestamp(MIN_ADMIN_TIMELOCK_SECS);
+
+        // Try to accept - should fail (no pending transfer)
+        assert_eq!(
+            client.try_accept_admin_change(&new_admin),
+            Err(Ok(Error::NoPendingTransfer))
+        );
     }
 }

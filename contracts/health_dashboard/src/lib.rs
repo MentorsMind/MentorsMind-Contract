@@ -4,73 +4,10 @@ use shared::health_reporter::{
     AlertSeverity, HealthMetric, HealthThresholds, MetricCategory, SystemHealth,
 };
 use shared::pagination::{OperationBudget, Pagination, MAX_PAGE_SIZE};
+use shared::escrow::{EscrowRecord, EscrowStatus};
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Env, IntoVal, Map, Symbol, Vec,
 };
-
-// ---------------------------------------------------------------------------
-// Types (mirror `mentorminds_escrow` for cross-contract decode stability)
-// ---------------------------------------------------------------------------
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowStatus {
-    /// Escrow funds are locked pending session completion.
-    Active,
-    /// Funds have been released to the mentor upon successful completion.
-    Released,
-    /// A dispute has been opened by a party, freezing escrow movement.
-    Disputed,
-    /// Escrow funds have been refunded back to the learner.
-    Refunded,
-    /// The dispute has been arbitrated and settled.
-    Resolved,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Escrow {
-    /// Unique numeric identifier for the escrow instance.
-    pub id: u64,
-    /// Address of the mentor delivering the session.
-    pub mentor: Address,
-    /// Address of the learner paying for the session.
-    pub learner: Address,
-    /// Total escrow principal amount, in token smallest units.
-    pub amount: i128,
-    /// Associated mentoring session identifier symbol.
-    pub session_id: Symbol,
-    /// Current lifecycle state of the escrow.
-    pub status: EscrowStatus,
-    /// Timestamp (seconds) when the escrow was initialized.
-    pub created_at: u64,
-    /// Contract address of the payment token (e.g. USDC or MNT).
-    pub token_address: Address,
-    /// Fee collected by the platform protocol, in token smallest units.
-    pub platform_fee: i128,
-    /// Net token amount payable to the mentor, in token smallest units.
-    pub net_amount: i128,
-    /// Expected completion timestamp (seconds) of the mentoring session.
-    pub session_end_time: u64,
-    /// Grace period in seconds after session_end_time before auto-release triggers.
-    pub auto_release_delay: u64,
-    /// Reason code symbol provided if a dispute is filed.
-    pub dispute_reason: Symbol,
-    /// Timestamp (seconds) when the dispute was resolved, or 0 if unresolved.
-    pub resolved_at: u64,
-    /// USD equivalent valuation of the escrow, in token smallest units.
-    pub usd_amount: i128,
-    /// Quoted token amount converted from reference currency.
-    pub quoted_token_amount: i128,
-    /// Source asset address for cross-currency routed escrows.
-    pub send_asset: Address,
-    /// Destination asset address received by the mentor.
-    pub dest_asset: Address,
-    /// Total scheduled sessions included in this escrow agreement.
-    pub total_sessions: u32,
-    /// Number of scheduled sessions verified as completed so far.
-    pub sessions_completed: u32,
-}
 
 /// Dispute rate alert threshold in basis points (2000 bps = 20.00%).
 ///
@@ -156,6 +93,10 @@ pub enum DataKey {
     /// Number of disputes ever opened against a given mentor, used by
     /// [`HealthDashboardContract::get_mentor_dispute_rate`].
     MentorDisputeCount(Address),
+    /// Sequential index of mentor addresses for paginated dispute stats queries.
+    MentorIndex(u32),
+    /// Total number of unique mentors that have had disputes opened.
+    MentorCount,
     /// Health metric storage keys partitioned by page number.
     MetricPage(u32),
     /// Total number of stored metric pages.
@@ -350,7 +291,7 @@ impl HealthDashboardContract {
             .get(&DataKey::Config)
             .expect("Not initialized");
 
-        let escrow: Escrow = env.invoke_contract(
+        let escrow: EscrowRecord = env.invoke_contract(
             &cfg.escrow,
             &Symbol::new(&env, "get_escrow"),
             (escrow_id,).into_val(&env),
@@ -364,11 +305,26 @@ impl HealthDashboardContract {
 
         let mentor_key = DataKey::MentorDisputeCount(escrow.mentor.clone());
         let dispute_count: u32 = env.storage().persistent().get(&mentor_key).unwrap_or(0);
+        let is_new_mentor = dispute_count == 0;
         let dispute_count = dispute_count.saturating_add(1);
         env.storage().persistent().set(&mentor_key, &dispute_count);
 
-        let rate_bps =
-            Self::compute_mentor_dispute_rate(&env, &cfg, &escrow.mentor, dispute_count);
+        // Add mentor to index if this is the first dispute
+        if is_new_mentor {
+            let mentor_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MentorCount)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MentorIndex(mentor_count), &escrow.mentor);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MentorCount, &mentor_count.saturating_add(1));
+        }
+
+        let rate_bps = Self::compute_mentor_dispute_rate(&env, &cfg, &escrow.mentor, dispute_count);
         if rate_bps > DISPUTE_RATE_ALERT_BPS {
             env.events().publish(
                 (Symbol::new(&env, "MentorDisputeRateAlert"), escrow.mentor),
@@ -442,6 +398,42 @@ impl HealthDashboardContract {
             .get(&DataKey::MentorDisputeCount(mentor.clone()))
             .unwrap_or(0);
         Self::compute_mentor_dispute_rate(&env, &cfg, &mentor, dispute_count)
+    }
+
+    /// Paginated view of all mentors with their dispute statistics.
+    /// Returns a page of `(Address, DisputeStats)` tuples, with `limit` clamped
+    /// to `MAX_PAGE_SIZE`. Offset and limit follow standard pagination semantics.
+    pub fn get_dispute_stats_page(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<(Address, DisputeStats)> {
+        use shared::Pagination;
+
+        let total_mentors: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorCount)
+            .unwrap_or(0);
+
+        let (start, end) = Pagination::bounds(total_mentors, offset, limit);
+
+        let mut result = soroban_sdk::Vec::new(&env);
+
+        // Fetch the global dispute stats once
+        let global_stats = Self::load_dispute_stats(&env);
+
+        for i in start..end {
+            if let Some(mentor) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::MentorIndex(i))
+            {
+                result.push_back((mentor, global_stats.clone()));
+            }
+        }
+
+        result
     }
 
     // ─── Protocol solvency (Issue #771) ─────────────────────────────────
@@ -905,11 +897,13 @@ impl HealthDashboardContract {
         // Flag learners with avg < 3.0 across 5+ sessions
         let mut flagged_learners: Vec<Address> = Vec::new(env);
         for learner in learner_vec.iter() {
-            if let Ok(Ok((avg_times_100, count))) = env.try_invoke_contract::<(u64, u64), soroban_sdk::Error>(
-                &cfg.reputation,
-                &Symbol::new(env, "get_learner_rating"),
-                (learner.clone(),).into_val(env),
-            ) {
+            if let Ok(Ok((avg_times_100, count))) = env
+                .try_invoke_contract::<(u64, u64), soroban_sdk::Error>(
+                    &cfg.reputation,
+                    &Symbol::new(env, "get_learner_rating"),
+                    (learner.clone(),).into_val(env),
+                )
+            {
                 // avg < 3.0 means avg_times_100 < 300
                 // count >= 5 for meaningful sample
                 if count >= 5 && avg_times_100 < 300 {
@@ -1026,14 +1020,14 @@ mod test {
             2
         }
 
-        pub fn get_escrow(env: Env, id: u64) -> Escrow {
+        pub fn get_escrow(env: Env, id: u64) -> EscrowRecord {
             let t = Address::generate(&env);
             let m1 = Address::generate(&env);
             let m2 = Address::generate(&env);
             let l1 = Address::generate(&env);
             let l2 = Address::generate(&env);
             if id == 1 {
-                Escrow {
+                EscrowRecord {
                     id: 1,
                     mentor: m1,
                     learner: l1,
@@ -1056,7 +1050,7 @@ mod test {
                     sessions_completed: 0,
                 }
             } else {
-                Escrow {
+                EscrowRecord {
                     id: 2,
                     mentor: m2,
                     learner: l2,
@@ -1503,14 +1497,14 @@ mod test {
                     .set(&DisputeMockKey::Escrow(id), &mentor);
             }
 
-            pub fn get_escrow(env: Env, id: u64) -> Escrow {
+            pub fn get_escrow(env: Env, id: u64) -> EscrowRecord {
                 let mentor: Address = env
                     .storage()
                     .persistent()
                     .get(&DisputeMockKey::Escrow(id))
                     .unwrap();
                 let dummy = mentor.clone();
-                Escrow {
+                EscrowRecord {
                     id,
                     mentor,
                     learner: dummy.clone(),
@@ -1722,9 +1716,9 @@ mod test {
             MANY_ESCROWS
         }
 
-        pub fn get_escrow(env: Env, id: u64) -> Escrow {
+        pub fn get_escrow(env: Env, id: u64) -> EscrowRecord {
             let t = Address::generate(&env);
-            Escrow {
+            EscrowRecord {
                 id,
                 mentor: Address::generate(&env),
                 learner: Address::generate(&env),

@@ -370,6 +370,15 @@ pub trait MultisigAdminTrait {
     fn get_threshold(env: Env) -> u32;
 }
 
+/// Cross-contract client for the Insurance contract used for coverage verification.
+#[soroban_sdk::contractclient(name = "InsuranceClient")]
+pub trait InsuranceContractTrait {
+    fn deposit(env: Env, provider: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+    fn claim(env: Env, escrow_id: Symbol, learner: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+    fn get_coverage_ratio(env: Env) -> u32;
+    fn get_pool_balance(env: Env) -> i128;
+}
+
 /// Local mirror of `multisig_admin::ProposalRecord` used for cross-contract
 /// validation of emergency release approvals. Field order MUST match the
 /// multisig definition for correct SCV serialization.
@@ -2180,18 +2189,10 @@ impl EscrowContract {
             .persistent()
             .get::<_, Address>(&DataKey::InsuranceContract)
         {
-            let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
-                &insurance,
-                &Symbol::new(env, "verify_coverage_on_release"),
-                (
-                    escrow.id,
-                    escrow.mentor.clone(),
-                    escrow.amount,
-                )
-                    .into_val(env),
-            );
+            let result = InsuranceClient::new(env, &insurance)
+                .try_get_coverage_ratio();
             let ok = match result {
-                Ok(inner_result) => inner_result.is_ok(),
+                Ok(ratio) => ratio > 0, // Coverage is available if ratio > 0
                 Err(_) => false,
             };
             if !ok {

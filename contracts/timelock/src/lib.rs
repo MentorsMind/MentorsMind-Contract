@@ -6,6 +6,7 @@ use shared::events::{
     emit_timelock_event, evt_timelock_adm_xfr, evt_timelock_cancel, evt_timelock_emerg_cancel,
     evt_timelock_exec, evt_timelock_guardian_set, evt_timelock_init, evt_timelock_sched,
 };
+use shared::{Pagination, MAX_PAGE_SIZE};
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, Address, Bytes, BytesN, Env,
     Symbol, Val, Vec,
@@ -157,6 +158,14 @@ pub struct Operation {
 
 #[contracttype]
 #[derive(Clone)]
+pub struct OperationEntry {
+    pub operation_id: BytesN<32>,
+    pub operation: Operation,
+    pub cancelled: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct GuardianActionAudit {
     pub action_id: BytesN<32>,
     pub guardian: Address,
@@ -190,7 +199,10 @@ pub enum DataKey {
     NamespaceRoot,
     Admin,
     OpCount,
+    OperationCount,
+    OperationIndex(u32),
     Op(BytesN<32>),
+    Cancelled(BytesN<32>),
     /// Address of a separate `MultisigAdminContract` with emergency powers
     /// to cancel any pending operation, regardless of proposer.
     GuardianMultisig,
@@ -226,6 +238,9 @@ impl TimelockController {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::OpCount, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::OperationCount, &0u32);
         emit_timelock_event(&env, evt_timelock_init(&env), admin);
         Ok(())
     }
@@ -278,7 +293,23 @@ impl TimelockController {
             ready_at,
             done: false,
         };
-        env.storage().persistent().set(&DataKey::Op(op_id.clone()), &op);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Op(op_id.clone()), &op);
+        let operation_index: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OperationCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OperationIndex(operation_index), &op_id);
+        env.storage().instance().set(
+            &DataKey::OperationCount,
+            &operation_index
+                .checked_add(1)
+                .expect("operation count overflow"),
+        );
 
         emit_timelock_event(
             &env,
@@ -327,7 +358,7 @@ impl TimelockController {
 
     /// Cancel a scheduled operation.
     pub fn cancel(env: Env, operation_id: BytesN<32>) {
-        let op: Operation = env
+        let mut op: Operation = env
             .storage()
             .persistent()
             .get(&DataKey::Op(operation_id.clone()))
@@ -347,7 +378,13 @@ impl TimelockController {
             op.proposer.require_auth();
         }
 
-        env.storage().persistent().remove(&DataKey::Op(operation_id.clone()));
+        op.done = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Op(operation_id.clone()), &op);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Cancelled(operation_id.clone()), &true);
 
         emit_timelock_event(&env, evt_timelock_cancel(&env), operation_id);
     }
@@ -417,9 +454,14 @@ impl TimelockController {
             now,
         )?;
 
+        let mut op = op;
+        op.done = true;
         env.storage()
             .persistent()
-            .remove(&DataKey::Op(operation_id.clone()));
+            .set(&DataKey::Op(operation_id.clone()), &op);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Cancelled(operation_id.clone()), &true);
 
         emit_timelock_event(
             &env,
@@ -554,6 +596,44 @@ impl TimelockController {
             .persistent()
             .get(&DataKey::Op(operation_id))
             .expect("operation not found")
+    }
+
+    /// Return the number of operations ever scheduled, including finalized ones.
+    pub fn get_operation_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OperationCount)
+            .unwrap_or(0)
+    }
+
+    /// Return a bounded page of operations in scheduling order.
+    pub fn get_operations_page(env: Env, offset: u32, limit: u32) -> Vec<OperationEntry> {
+        let total = Self::get_operation_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit.min(MAX_PAGE_SIZE));
+        let mut page = Vec::new(&env);
+        for index in start..end {
+            let operation_id: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OperationIndex(index))
+                .expect("operation index is inconsistent");
+            let operation: Operation = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Op(operation_id.clone()))
+                .expect("operation history is inconsistent");
+            let cancelled = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Cancelled(operation_id.clone()))
+                .unwrap_or(false);
+            page.push_back(OperationEntry {
+                operation_id,
+                operation,
+                cancelled,
+            });
+        }
+        page
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -822,6 +902,53 @@ mod tests {
         assert_ne!(id_a, id_b, "different salts must yield different op_ids");
     }
 
+    #[test]
+    fn test_operation_pages_include_scheduled_executed_and_cancelled_history() {
+        let (env, admin, client) = setup();
+        let scheduled_id = schedule_op(&env, &client, &admin);
+
+        let cancelled_id = schedule_op(&env, &client, &admin);
+        client.cancel(&cancelled_id);
+
+        let target = env.register_contract(None, MockTarget);
+        let function = Symbol::new(&env, "set_fee");
+        let mut args = Vec::new(&env);
+        args.push_back(25u32.into_val(&env));
+        let salt = BytesN::from_array(&env, &[3u8; 32]);
+        let executed_id = client.schedule(&admin, &target, &function, &args, &MIN_DELAY, &salt);
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp += MIN_DELAY + TIMESTAMP_TOLERANCE_SECS;
+        });
+        client.execute(&executed_id);
+
+        assert_eq!(client.get_operation_count(), 3);
+        let first_page = client.get_operations_page(&0, &2);
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page.get(0).unwrap().operation_id, scheduled_id);
+        assert!(!first_page.get(0).unwrap().cancelled);
+        assert_eq!(first_page.get(1).unwrap().operation_id, cancelled_id);
+        assert!(first_page.get(1).unwrap().cancelled);
+        assert!(first_page.get(1).unwrap().operation.done);
+
+        let second_page = client.get_operations_page(&2, &2);
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page.get(0).unwrap().operation_id, executed_id);
+        assert!(!second_page.get(0).unwrap().cancelled);
+        assert!(second_page.get(0).unwrap().operation.done);
+        assert!(client.get_operations_page(&3, &MAX_PAGE_SIZE).is_empty());
+    }
+
+    #[test]
+    fn test_operations_page_clamps_limit_to_max_page_size() {
+        let (env, admin, client) = setup();
+        for _ in 0..=MAX_PAGE_SIZE {
+            schedule_op(&env, &client, &admin);
+        }
+
+        let page = client.get_operations_page(&0, &u32::MAX);
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+    }
+
     // -----------------------------------------------------------------------
     // Guardian multisig emergency cancellation (#745)
     // -----------------------------------------------------------------------
@@ -907,8 +1034,13 @@ mod tests {
         guardian_client.sign_action(&signers.get(3).unwrap(), &action_id);
         guardian_client.execute_action(&action_id);
 
-        // Operation no longer exists — the malicious schedule was cancelled.
-        assert!(client.try_get_operation(&op_id).is_err());
+        // The cancelled operation remains available in historical listings.
+        let operation = client.get_operation(&op_id);
+        assert!(operation.done);
+        let history = client.get_operations_page(&0, &MAX_PAGE_SIZE);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().operation_id, op_id);
+        assert!(history.get(0).unwrap().cancelled);
     }
 
     #[test]

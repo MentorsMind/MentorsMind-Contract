@@ -2,6 +2,19 @@
 
 This folder tracks event-emission coverage for state-changing contract operations.
 
+For comprehensive event schema documentation, see [`docs/events.md`](../../docs/events.md).
+
+## Event Schema Reference
+
+All MentorsMind contracts use a standardized 3-element topic tuple:
+- `(contract: Symbol, version: u32, event_type: Symbol)`
+
+See the main [Event Documentation](../../docs/events.md) for:
+- Complete event types by contract
+- Schema version policy
+- Usage examples and best practices
+- Guidelines for adding new events
+
 ## Covered automated suites
 
 - `contracts/dispute_evidence/src/lib.rs`
@@ -24,3 +37,9 @@ Escrow lifecycle event test expectations are tracked as:
 4. dispute flow emits open + resolution events in deterministic order.
 
 These cases should stay aligned with `docs/TESTING.md` when event payload schemas change.
+
+## Related Documentation
+
+- [`docs/events.md`](../../docs/events.md) - Complete event schema reference
+- [`event_ordering_matrix.md`](event_ordering_matrix.md) - Expected event sequences
+- [`events_schema.json`](../../events_schema.json) - Machine-readable schema

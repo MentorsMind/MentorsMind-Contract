@@ -43,6 +43,7 @@ fn test_governance_state_machine_transitions() {
     let states = [
         ProposalStatus::Active,
         ProposalStatus::Passed,
+        ProposalStatus::Queued,
         ProposalStatus::Failed,
         ProposalStatus::Executed,
         ProposalStatus::Cancelled,
@@ -56,7 +57,9 @@ fn test_governance_state_machine_transitions() {
                 (ProposalStatus::Active, ProposalStatus::Passed)
                     | (ProposalStatus::Active, ProposalStatus::Failed)
                     | (ProposalStatus::Active, ProposalStatus::Cancelled)
+                    | (ProposalStatus::Passed, ProposalStatus::Queued)
                     | (ProposalStatus::Passed, ProposalStatus::Executed)
+                    | (ProposalStatus::Queued, ProposalStatus::Executed)
             );
             assert_eq!(
                 is_valid, expected_valid,
@@ -64,6 +67,44 @@ fn test_governance_state_machine_transitions() {
                 from, to
             );
         }
+    }
+}
+
+#[test]
+fn test_governance_passed_to_queued_is_valid() {
+    let env = Env::default();
+    assert!(ProposalStatus::is_valid_transition(
+        &env,
+        &ProposalStatus::Passed,
+        &ProposalStatus::Queued
+    ));
+}
+
+#[test]
+fn test_governance_queued_to_executed_is_valid() {
+    let env = Env::default();
+    assert!(ProposalStatus::is_valid_transition(
+        &env,
+        &ProposalStatus::Queued,
+        &ProposalStatus::Executed
+    ));
+}
+
+#[test]
+fn test_governance_invalid_transitions_from_queued() {
+    let env = Env::default();
+    for to in [
+        ProposalStatus::Active,
+        ProposalStatus::Passed,
+        ProposalStatus::Queued,
+        ProposalStatus::Failed,
+        ProposalStatus::Cancelled,
+    ] {
+        assert!(
+            !ProposalStatus::is_valid_transition(&env, &ProposalStatus::Queued, &to),
+            "Queued -> {:?} must be rejected",
+            to
+        );
     }
 }
 

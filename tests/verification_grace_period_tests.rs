@@ -230,11 +230,25 @@ fn test_grace_period_boundaries() {
 
     client.set_grace_period(&500u64);
 
-    // Exactly at grace boundary start (expiry + grace)
+    // At timestamp 1999 (expiry - 1s, still active)
+    f.env.ledger().set_timestamp(1999);
+    assert!(
+        client.is_verified(&f.mentor),
+        "should be verified at expiry - 1s (still active)"
+    );
+
+    // Exactly at grace boundary start (expiry + grace = 2000 + 500 = 2500)
     f.env.ledger().set_timestamp(2500);
     assert!(
         client.is_verified(&f.mentor),
         "should be verified at grace boundary start"
+    );
+
+    // At expiry + grace - 1s (still in grace)
+    f.env.ledger().set_timestamp(2499);
+    assert!(
+        client.is_verified(&f.mentor),
+        "should be verified at grace boundary - 1s"
     );
 
     // One second past grace boundary

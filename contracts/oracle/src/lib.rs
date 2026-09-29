@@ -77,6 +77,21 @@ const ORACLE_REORG_SAFE_DEPTH: u32 = 12;
 // ---------------------------------------------------------------------------
 
 /// A single price observation submitted by a feeder.
+///
+/// Represents an atomic price submission from a single feeder at a specific point in time.
+/// The oracle stores up to `MAX_POINTS` (10) recent observations per asset, maintaining
+/// a rolling window of price history.
+///
+/// # Fields
+/// * `price` - The price value in the token's smallest unit (e.g., 100_000_000 for 1.00 USD).
+///   Must be strictly positive.
+/// * `timestamp` - Unix timestamp (seconds) when the price was observed/submitted.
+///   Used to filter stale readings (older than `MAX_STALENESS_SECS` = 1 hour).
+/// * `feeder` - Address of the price feed operator who submitted this reading.
+///   Validated against the registered feeder list.
+/// * `submitted_at_ledger` - Stellar ledger sequence at submission time.
+///   Used for reorg-safe depth checks to prevent serving prices from recent ledgers
+///   that may be subject to reordering.
 #[contracttype]
 #[derive(Clone)]
 pub struct PricePoint {
@@ -97,6 +112,33 @@ pub struct OracleSource {
 }
 
 /// Snapshot of oracle health exposed to callers (e.g. treasury).
+///
+/// Reports the current state of the oracle's data feeds for a specific asset.
+/// Useful for consumers to determine if they can safely rely on price feeds or if they
+/// should apply fallback logic due to staleness or insufficient feeder participation.
+///
+/// # Fields
+/// * `active_feeders` - Number of distinct feeders with a non-stale reading in the current
+///   observation window. A feeder is considered "active" if their most recent submission
+///   is within the last `MAX_STALENESS_SECS` (3600 seconds = 1 hour).
+///   Must be >= `MIN_FEEDERS` (3) to compute valid prices.
+/// * `last_update` - Unix timestamp (seconds) of the most recently accepted reading
+///   across all feeders for this asset. Allows consumers to calculate age/freshness.
+/// * `is_stale` - Boolean flag: `true` if the most recent reading is older than
+///   `MAX_STALENESS_SECS`, indicating the oracle has not received fresh data.
+///
+/// # Example
+/// ```ignore
+/// // Check oracle health before processing a payment route:
+/// let health = oracle.get_oracle_health(&Symbol::new(&env, "USD"));
+/// if health.is_stale {
+///     // Reject the route; oracle data is too old
+///     panic!("oracle data stale; payment rejected");
+/// }
+/// if health.active_feeders < 3 {
+///     // Apply extra validation; not enough independent feeders
+/// }
+/// ```
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleHealth {
@@ -273,6 +315,46 @@ impl OracleContract {
     // Price submission (#866: reorg protection + feeder accountability)
     // -----------------------------------------------------------------------
 
+    /// Submit a price observation for an asset (feeder only).
+    ///
+    /// Accepts a new price reading from an authorized feeder and stores it in the rolling window.
+    /// The submission is subject to:
+    /// * **Authorization**: Caller must be registered as a feeder or hold the ORACLE_FEEDER role.
+    /// * **Validation**: Price must be strictly positive.
+    /// * **Circuit breaker**: Price must not deviate more than the configured threshold
+    ///   (default 50% = `DEFAULT_CB_THRESHOLD_BPS`) from the current TWAP.
+    /// * **Chain isolation**: Submissions are rejected if the oracle chain is isolated
+    ///   (e.g., due to cross-chain sync failures).
+    /// * **Reorg safety**: Submissions from ledgers within `ORACLE_REORG_SAFE_DEPTH` (12)
+    ///   of the current sequence are stored but flagged for later filtering.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `feeder` - Address of the feeder submitting the reading. Must authenticate.
+    /// * `asset` - Symbol identifying the asset (e.g., `Symbol::new(&env, "USD")` or `"XLM"`).
+    /// * `price` - The price value in the smallest unit of the asset's denomination.
+    ///   Must be > 0.
+    /// * `timestamp` - Unix timestamp (seconds) when the price was observed.
+    ///   Used to filter stale readings and compute TWAP.
+    ///
+    /// # Panics
+    /// * If feeder is not authorized.
+    /// * If `price <= 0`.
+    /// * If price deviates more than the circuit-breaker threshold from TWAP.
+    /// * If oracle chain is isolated.
+    /// * If MEV arbitrage is detected.
+    ///
+    /// # Events
+    /// Emits `OraclePriceUpdateEvent` on success, carrying the asset, price, and timestamp.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let feeder = Address::generate(&env);
+    /// let asset = Symbol::new(&env, "USDC");
+    /// let price = 1_0000000; // 1.00 USD in USDC smallest unit
+    /// let now = env.ledger().timestamp();
+    /// oracle.submit_price(&feeder, &asset, &price, &now);
+    /// ```
     pub fn submit_price(env: Env, feeder: Address, asset: Symbol, price: i128, timestamp: u64) {
         feeder.require_auth();
         if !Self::is_feeder(&env, &feeder)
@@ -448,8 +530,38 @@ impl OracleContract {
         (Self::median(inliers), last_updated)
     }
 
-    /// Return the current TWAP and monitor callers whose reads show a
-    /// suspicious spot-price deviation.
+    /// Return the current Time-Weighted Average Price (TWAP) for an asset.
+    ///
+    /// Computes a rolling-window TWAP using the most recent price points and their
+    /// inter-submission intervals. The TWAP is updated whenever a new price is submitted
+    /// and reflects the average price over the last `TWAP_WINDOW` (5) price submissions.
+    ///
+    /// Before returning the TWAP, this function monitors the caller for MEV (Maximal
+    /// Extractable Value) arbitrage risk by comparing the spot price to the TWAP and
+    /// recording any suspicious patterns. Callers with high MEV risk are logged for
+    /// protocol monitoring.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `asset` - Symbol identifying the asset (e.g., `Symbol::new(&env, "USD")`).
+    ///
+    /// # Returns
+    /// The TWAP as an `i128` value in the asset's smallest unit.
+    ///
+    /// # Panics
+    /// * If no TWAP is available (fewer than 2 price submissions have been stored).
+    /// * If all price points are stale or fail reorg-safety checks.
+    /// * If fewer than `MIN_FEEDERS` (3) have non-stale readings.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let asset = Symbol::new(&env, "USDC");
+    /// // Feeders have submitted prices over the last minute.
+    /// let twap = oracle.get_twap(&asset);
+    /// // twap is now the time-weighted average of recent submissions.
+    /// // For example, if prices were 1.00 USD, 1.00 USD, 1.02 USD (in that order),
+    /// // and TWAP_WINDOW=5, the result reflects the weighted average of those readings.
+    /// ```
     pub fn get_twap(env: Env, asset: Symbol) -> i128 {
         let twap_key = (symbol_short!("TWAP"), asset.clone());
         let twap_state: TwapState = env
@@ -619,6 +731,43 @@ impl OracleContract {
         now.saturating_sub(last_updated) > MAX_STALENESS_SECS
     }
 
+    /// Get the health status of the oracle feed for an asset.
+    ///
+    /// Returns a snapshot of the current oracle state, including the number of active feeders,
+    /// the timestamp of the most recent accepted reading, and whether the data is stale.
+    /// This is a non-mutating view function suitable for off-chain monitoring and for
+    /// on-chain verification before consuming price data.
+    ///
+    /// An asset's feed is considered **healthy** when:
+    /// * At least `MIN_FEEDERS` (3) distinct feeders have submitted non-stale readings.
+    /// * The most recent reading is within the last `MAX_STALENESS_SECS` (3600 seconds).
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `asset` - Symbol identifying the asset (e.g., `Symbol::new(&env, "USD")`).
+    ///
+    /// # Returns
+    /// An `OracleHealth` struct containing:
+    /// * `active_feeders` - Count of distinct feeders with fresh data.
+    /// * `last_update` - Timestamp of the most recent accepted reading.
+    /// * `is_stale` - Boolean flag indicating whether the most recent reading exceeds `MAX_STALENESS_SECS`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let asset = Symbol::new(&env, "USDC");
+    /// let health = oracle.get_oracle_health(&asset);
+    /// 
+    /// if health.is_stale {
+    ///     // Oracle has no recent data; consider rejecting the operation
+    ///     return Err("oracle stale");
+    /// }
+    /// if health.active_feeders < 3 {
+    ///     // Fewer than expected feeders are participating; apply additional scrutiny
+    /// }
+    /// 
+    /// // Safe to consume price data
+    /// let twap = oracle.get_twap(&asset);
+    /// ```
     pub fn get_oracle_health(env: Env, asset: Symbol) -> OracleHealth {
         let now = env.ledger().timestamp();
         let key = (symbol_short!("PRICES"), asset);
