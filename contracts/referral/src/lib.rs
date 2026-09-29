@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{pagination::Pagination, pause_guard::require_not_paused, ReentrancyGuard};
+use shared::{pagination::Pagination, pause_guard::require_not_paused, ReentrancyGuard, ttl_utils::TTLManager};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec,
 };
@@ -683,11 +683,32 @@ impl ReferralContract {
             .unwrap_or(0)
     }
 
-    pub fn get_pending_rewards(env: Env, referrer: Address) -> i128 {
-        env.storage()
+    /// Returns referral information for a referee (if found), with TTL extension.
+    pub fn get_referral_info(env: Env, referee: Address) -> Option<ReferralInfo> {
+        let key = DataKey::Referral(referee.clone());
+        let result = env.storage()
             .persistent()
-            .get(&DataKey::PendingReward(referrer))
-            .unwrap_or(0)
+            .get::<_, ReferralInfo>(&key);
+        
+        // Extend TTL on successful read to keep the record accessible.
+        if result.is_some() {
+            TTLManager::extend_persistent(&env, &key);
+        }
+        
+        result
+    }
+
+    pub fn get_pending_rewards(env: Env, referrer: Address) -> i128 {
+        let key = DataKey::PendingReward(referrer);
+        let result = env.storage()
+            .persistent()
+            .get::<_, i128>(&key)
+            .unwrap_or(0);
+        
+        // Extend TTL to ensure pending rewards remain accessible.
+        TTLManager::extend_persistent(&env, &key);
+        
+        result
     }
 
     /// Total MNT minted through referrals so far.
