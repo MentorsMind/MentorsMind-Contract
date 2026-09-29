@@ -31,9 +31,11 @@ pub trait SnapshotTrait {
 use shared::events::{
     emit_delegation_event, evt_del_delegated, evt_del_suspended, evt_del_undelegated,
 };
+use shared::{Pagination, MAX_PAGE_SIZE};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
 };
+
 
 #[contracttype]
 #[derive(Clone)]
@@ -63,7 +65,11 @@ pub enum DataKey {
     /// Emergency switch that forces direct voting fallback by blocking new
     /// delegation writes while preserving existing read-only snapshots.
     DelegationSuspended,
+    /// Delegator count and sequential index per delegate for pagination (#1118).
+    DelegatorCount(Address),
+    DelegatorIndex(Address, u32),
 }
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -360,9 +366,20 @@ impl DelegationContract {
                 .set(&DataKey::Delegators(delegate.clone()), &delegators);
         }
 
+        let count = delegators.len();
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegatorCount(delegate.clone()), &count);
+        for (i, d) in delegators.iter().enumerate() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::DelegatorIndex(delegate.clone(), i as u32), &d);
+        }
+
         env.events()
             .publish((Symbol::new(&env, "delegated"), delegator), delegate);
     }
+
 
     /// Cancels the caller's outgoing delegation, returning its weight to it.
     pub fn revoke(env: Env, delegator: Address) {
@@ -393,6 +410,41 @@ impl DelegationContract {
             .get(&DataKey::Delegators(delegate))
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    /// Total count of delegators for `delegate` (#1118).
+    pub fn get_delegator_count(env: Env, delegate: Address) -> u32 {
+        let count_key = DataKey::DelegatorCount(delegate.clone());
+        if let Some(c) = env.storage().persistent().get::<_, u32>(&count_key) {
+            c
+        } else {
+            Self::get_delegators(env, delegate).len()
+        }
+    }
+
+    /// Paginated list of delegators for `delegate`, clamped to `MAX_PAGE_SIZE` (#1118).
+    pub fn get_delegators_page(
+        env: Env,
+        delegate: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        let total = Self::get_delegator_count(env.clone(), delegate.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            let idx_key = DataKey::DelegatorIndex(delegate.clone(), i);
+            if let Some(d) = env.storage().persistent().get::<_, Address>(&idx_key) {
+                page.push_back(d);
+            } else {
+                let all = Self::get_delegators(env.clone(), delegate.clone());
+                if let Some(d) = all.get(i) {
+                    page.push_back(d);
+                }
+            }
+        }
+        page
+    }
+
 
     /// The holder's own weight as recorded by the governance snapshot
     /// contract, ignoring any delegation.
@@ -500,13 +552,26 @@ impl DelegationContract {
         if remaining.is_empty() {
             env.storage()
                 .persistent()
-                .remove(&DataKey::Delegators(delegate));
+                .remove(&DataKey::Delegators(delegate.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DelegatorCount(delegate));
         } else {
             env.storage()
                 .persistent()
-                .set(&DataKey::Delegators(delegate), &remaining);
+                .set(&DataKey::Delegators(delegate.clone()), &remaining);
+            let count = remaining.len();
+            env.storage()
+                .persistent()
+                .set(&DataKey::DelegatorCount(delegate.clone()), &count);
+            for (i, d) in remaining.iter().enumerate() {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::DelegatorIndex(delegate.clone(), i as u32), &d);
+            }
         }
     }
+
 
     fn require_initialized(env: &Env) {
         if !env.storage().instance().has(&ADMIN) {
