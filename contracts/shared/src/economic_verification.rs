@@ -198,3 +198,191 @@ pub fn validate_market_observations(
     let confidence = ((prices.len() as u32 * 10_000) / (observations.len() as u32)).min(10_000);
     MarketValidation { valid: prices.len() >= 2 && suspicious * 2 < observations.len() as u32, aggregate_price: aggregate, confidence_bps: confidence, suspicious_venues: suspicious }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::Env;
+
+    /// Test fund conservation with balanced flows where prior + inflows = current + outflows + fees.
+    #[test]
+    fn test_validate_fund_conservation_balanced_flows() {
+        let env = Env::default();
+
+        let prior_balance = 1000i128;
+        let inflows = 500i128;
+        let outflows = 400i128;
+        let fees = 100i128;
+        let current_balance = 1000 + 500 - 400 - 100;
+
+        let result = validate_fund_conservation(&env, prior_balance, inflows, outflows, fees, current_balance);
+
+        assert_eq!(result.valid, true);
+        assert_eq!(result.observed, current_balance);
+        assert_eq!(result.expected, current_balance);
+        assert_eq!(result.invariant, EconomicInvariant::FundConservation);
+    }
+
+    /// Test fund conservation with zero flows (no movement).
+    #[test]
+    fn test_validate_fund_conservation_zero_flows() {
+        let env = Env::default();
+
+        let prior_balance = 1000i128;
+        let current_balance = 1000i128;
+
+        let result = validate_fund_conservation(&env, prior_balance, 0, 0, 0, current_balance);
+
+        assert_eq!(result.valid, true);
+        assert_eq!(result.observed, current_balance);
+        assert_eq!(result.expected, current_balance);
+    }
+
+    /// Test fund conservation fails when observed != expected.
+    #[test]
+    fn test_validate_fund_conservation_imbalanced_flows() {
+        let env = Env::default();
+
+        let prior_balance = 1000i128;
+        let inflows = 500i128;
+        let outflows = 400i128;
+        let fees = 100i128;
+        let current_balance = 900i128; // Incorrect: should be 1000
+
+        let result = validate_fund_conservation(&env, prior_balance, inflows, outflows, fees, current_balance);
+
+        assert_eq!(result.valid, false);
+        assert_eq!(result.observed, current_balance);
+        assert_eq!(result.expected, 1000);
+    }
+
+    /// Test fund conservation detects overflow in the arithmetic.
+    #[test]
+    fn test_validate_fund_conservation_overflow_returns_invalid() {
+        let env = Env::default();
+
+        let prior_balance = i128::MAX;
+        let inflows = 100i128;
+        let outflows = 0i128;
+        let fees = 0i128;
+        let current_balance = 0i128;
+
+        let result = validate_fund_conservation(&env, prior_balance, inflows, outflows, fees, current_balance);
+
+        assert_eq!(result.valid, false);
+        assert_eq!(result.expected, i128::MAX);
+    }
+
+    /// Test fund conservation with large single-unit rounding errors.
+    #[test]
+    fn test_validate_fund_conservation_single_unit_error() {
+        let env = Env::default();
+
+        let prior_balance = 1000i128;
+        let inflows = 500i128;
+        let outflows = 400i128;
+        let fees = 100i128;
+        let expected = prior_balance + inflows - outflows - fees; // 1000
+        let current_balance = expected - 1; // Off by 1
+
+        let result = validate_fund_conservation(&env, prior_balance, inflows, outflows, fees, current_balance);
+
+        assert_eq!(result.valid, false, "Single-unit discrepancy should be detected");
+        assert_eq!(result.expected, expected);
+        assert_eq!(result.observed, current_balance);
+    }
+
+    /// Test validate_reward_distribution with balanced allocation.
+    #[test]
+    fn test_validate_reward_distribution_balanced() {
+        let env = Env::default();
+
+        let total_reward = 1000i128;
+        let mut allocations = Vec::new(&env);
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 600i128,
+            amount: 600i128,
+        });
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 400i128,
+            amount: 400i128,
+        });
+
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+
+        assert_eq!(result.valid, true);
+        assert_eq!(result.observed, 1000);
+        assert_eq!(result.expected, 1000);
+    }
+
+    /// Test validate_reward_distribution with rounding within tolerance.
+    #[test]
+    fn test_validate_reward_distribution_within_rounding_tolerance() {
+        let env = Env::default();
+
+        let total_reward = 1000i128;
+        let mut allocations = Vec::new(&env);
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 666i128,
+            amount: 666i128,
+        });
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 334i128,
+            amount: 334i128,
+        });
+
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+
+        assert_eq!(result.valid, true);
+        assert_eq!(result.observed, 1000);
+        assert_eq!(result.expected, 1000);
+    }
+
+    /// Test validate_reward_distribution rejects allocation with negative amount.
+    #[test]
+    fn test_validate_reward_distribution_rejects_negative_amount() {
+        let env = Env::default();
+
+        let total_reward = 1000i128;
+        let mut allocations = Vec::new(&env);
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 500i128,
+            amount: -100i128, // Negative amount
+        });
+
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+
+        assert_eq!(result.valid, false);
+    }
+
+    /// Test validate_reward_distribution rejects excessive rounding error.
+    #[test]
+    fn test_validate_reward_distribution_rejects_excessive_rounding() {
+        let env = Env::default();
+
+        let total_reward = 1000i128;
+        let mut allocations = Vec::new(&env);
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 500i128,
+            amount: 400i128,
+        });
+        allocations.push_back(RewardAllocation {
+            recipient: soroban_sdk::Address::generate(&env),
+            weight: 500i128,
+            amount: 500i128,
+        });
+
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+
+        assert_eq!(result.valid, false);
+        assert_eq!(result.expected, 1000);
+        assert_eq!(result.observed, 900);
+    }
+}

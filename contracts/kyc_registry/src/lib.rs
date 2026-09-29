@@ -102,6 +102,9 @@ const ACCESS_LOG_CAP: u32 = 20;
 /// Alerts are raised once expiry is within this window (30 days).
 const EXPIRY_ALERT_WINDOW: u64 = 30 * 24 * 60 * 60;
 
+/// Maximum batch size for batch operations.
+const MAX_BATCH: u32 = 100;
+
 #[contractclient(name = "RbacContractClient")]
 pub trait RbacContractTrait {
     fn has_role(env: Env, role: Symbol, account: Address) -> bool;
@@ -432,6 +435,31 @@ impl KycRegistry {
         Self::remove_user_from_registry(&env, &user);
 
         env.events().publish((symbol_short!("kyc_rvk"), user), ());
+    }
+
+    /// Batch revoke KYC for multiple users in a single transaction (Issue #1048).
+    /// Operator only. Batch size is capped at MAX_BATCH = 100.
+    /// Each revoked record emits a revocation event.
+    pub fn batch_revoke_kyc(env: Env, operator: Address, users: Vec<Address>) {
+        Self::require_operator(&env, &operator);
+
+        let batch_size = users.len();
+        if batch_size > MAX_BATCH as usize {
+            panic!("Batch size exceeds maximum of {}", MAX_BATCH);
+        }
+
+        for user in users.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Kyc(user.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::KycExpiryAlert(user.clone()));
+            env.events().publish((symbol_short!("kyc_rvk"), user.clone()), ());
+        }
+
+        env.events()
+            .publish((symbol_short!("kyc_brvk"), operator), batch_size as u32);
     }
 
     /// Grant or update a subject's consent for `purpose`, scoping exactly
