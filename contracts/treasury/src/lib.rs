@@ -2464,3 +2464,150 @@ impl TreasuryContract {
     }
 }
 
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+
+    /// DEX that pulls the approved XLM from the treasury and returns MNT 1:1.
+    #[contract]
+    pub struct MockDex;
+
+    #[contractimpl]
+    impl MockDex {
+        pub fn swap_exact_in(
+            env: Env,
+            token_in: Address,
+            _token_out: Address,
+            amount_in: i128,
+            _min_out: i128,
+            recipient: Address,
+        ) -> i128 {
+            let dex = env.current_contract_address();
+            token::Client::new(&env, &token_in).transfer_from(&dex, &recipient, &dex, &amount_in);
+            amount_in
+        }
+    }
+
+    #[contract]
+    pub struct MockMnt;
+
+    #[contractimpl]
+    impl MockMnt {
+        pub fn burn(_env: Env, _from: Address, _amount: i128) {}
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            0
+        }
+    }
+
+    struct BuybackFixture {
+        env: Env,
+        treasury: Address,
+        xlm: Address,
+        mnt: Address,
+        dex: Address,
+    }
+
+    impl BuybackFixture {
+        fn new(xlm_reserve: i128) -> Self {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let admin = Address::generate(&env);
+            let staking = Address::generate(&env);
+            let timelock = Address::generate(&env);
+            let treasury = env.register_contract(None, TreasuryContract);
+            let client = TreasuryContractClient::new(&env, &treasury);
+            client.initialize(&admin, &staking, &timelock, &None);
+
+            let xlm = env.register_stellar_asset_contract_v2(admin.clone()).address();
+            let mnt = env.register_contract(None, MockMnt);
+            let dex = env.register_contract(None, MockDex);
+            client.set_approved_token(&xlm, &true);
+            client.set_approved_token(&mnt, &true);
+            token::StellarAssetClient::new(&env, &xlm).mint(&treasury, &xlm_reserve);
+
+            Self { env, treasury, xlm, mnt, dex }
+        }
+
+        fn client(&self) -> TreasuryContractClient<'_> {
+            TreasuryContractClient::new(&self.env, &self.treasury)
+        }
+
+        fn buyback(&self, xlm_amount: i128) {
+            self.client().buyback_and_burn(
+                &self.xlm,
+                &self.mnt,
+                &self.dex,
+                &xlm_amount,
+                &1,
+                &DexInterface { swap_fn: Symbol::new(&self.env, "swap_exact_in") },
+                &None,
+                &None,
+            );
+        }
+
+        fn xlm_balance(&self) -> i128 {
+            token::Client::new(&self.env, &self.xlm).balance(&self.treasury)
+        }
+    }
+
+    #[test]
+    fn test_rapid_buybacks_trigger_velocity_deferral() {
+        let f = BuybackFixture::new(1_000);
+
+        // Two buybacks inside one window stay under the velocity warn level
+        // (10% then ~22% of the remaining reserve) and execute.
+        f.buyback(100);
+        f.buyback(100);
+        assert_eq!(f.xlm_balance(), 800);
+        assert_eq!(f.client().get_buyback_window_volume(), 200);
+
+        // Third rapid buyback: 300 / 800 = 37.5% velocity with all historical
+        // volume concentrated in this window -> deferred, no swap executed.
+        f.buyback(100);
+        let last = f.env.events().all().last().unwrap();
+        assert_eq!(
+            last.1,
+            (symbol_short!("buyback"), symbol_short!("deferred")).into_val(&f.env)
+        );
+
+        assert_eq!(f.xlm_balance(), 800);
+        assert_eq!(f.client().get_buyback_window_volume(), 200);
+        let deferred = f.client().get_last_deferred_buyback().unwrap();
+        assert_eq!(deferred.xlm_amount, 100);
+        assert_eq!(deferred.window_volume, 300);
+        assert!(deferred.velocity_bps > shared::threat_intelligence::ECONOMIC_VELOCITY_WARN_BPS);
+        assert!(deferred.retry_after > deferred.deferred_at);
+    }
+
+    #[test]
+    fn test_deferred_buyback_proceeds_after_velocity_window_resets() {
+        let f = BuybackFixture::new(1_000);
+        f.buyback(100);
+        f.buyback(100);
+        f.buyback(100);
+        assert_eq!(f.xlm_balance(), 800);
+
+        let retry_after = f.client().get_last_deferred_buyback().unwrap().retry_after;
+        f.env.ledger().with_mut(|li| li.timestamp = retry_after);
+
+        f.buyback(100);
+        assert_eq!(f.xlm_balance(), 700);
+        assert_eq!(f.client().get_buyback_window_volume(), 100);
+    }
+
+    #[test]
+    fn test_spaced_buybacks_are_not_deferred() {
+        let f = BuybackFixture::new(1_000);
+        for _ in 0..3 {
+            f.buyback(100);
+            f.env
+                .ledger()
+                .with_mut(|li| li.timestamp += BUYBACK_VELOCITY_WINDOW_SECS);
+        }
+        assert_eq!(f.xlm_balance(), 700);
+        assert!(f.client().get_last_deferred_buyback().is_none());
+    }
+}
