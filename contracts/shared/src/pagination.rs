@@ -84,19 +84,45 @@ pub trait BoundedIteration {
     }
 }
 
+/// Explicit ceiling on the number of units of work a single invocation may do.
+///
+/// Soroban contracts cannot inspect their own remaining CPU/memory budget at
+/// runtime (see the module docs), so loops over on-chain collections use an
+/// `OperationBudget` instead: call [`consume`](Self::consume) once before each
+/// unit of work and stop (or return a partial page) when it returns
+/// [`BudgetExceeded`].
+///
+/// ```ignore
+/// let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+/// for id in start..end {
+///     if budget.consume().is_err() {
+///         break;
+///     }
+///     // ... process `id` ...
+/// }
+/// ```
 pub struct OperationBudget {
+    /// Units of work already consumed in this invocation.
     consumed: u32,
+    /// Maximum units of work allowed; [`consume`](Self::consume) fails once reached.
     max: u32,
 }
 
+/// Returned by [`OperationBudget::consume`] when the budget's ceiling has
+/// already been reached. The caller should stop iterating.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BudgetExceeded;
 
 impl OperationBudget {
+    /// Creates a budget allowing at most `max` calls to [`consume`](Self::consume).
     pub fn new(max: u32) -> Self {
         Self { consumed: 0, max }
     }
 
+    /// Records one unit of work.
+    ///
+    /// Returns `Err(BudgetExceeded)` without changing state if `max` units have
+    /// already been consumed.
     pub fn consume(&mut self) -> Result<(), BudgetExceeded> {
         if self.consumed >= self.max {
             return Err(BudgetExceeded);
@@ -105,10 +131,12 @@ impl OperationBudget {
         Ok(())
     }
 
+    /// Units of work consumed so far.
     pub fn consumed(&self) -> u32 {
         self.consumed
     }
 
+    /// Units of work still available before [`consume`](Self::consume) fails.
     pub fn remaining(&self) -> u32 {
         self.max.saturating_sub(self.consumed)
     }
