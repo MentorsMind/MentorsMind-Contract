@@ -107,7 +107,19 @@
       "events": {
         "registered": { "description": "Referral registered" },
         "reward": { "description": "Referral reward distributed" },
-        "admin_prop": { "description": "Admin change proposed" }
+        "admin_prop": { "description": "Admin change proposed" },
+        "velocity_alert": {
+          "description": "Referral reward mint deferred by token velocity protection (topics: Referral, VelocityAlert, referrer)",
+          "version": 1,
+          "fields": [
+            { "name": "amount", "type": "i128" },
+            { "name": "window_minted", "type": "i128" },
+            { "name": "velocity_bps", "type": "u32" },
+            { "name": "concentration_bps", "type": "u32" },
+            { "name": "health_score", "type": "u32" },
+            { "name": "retry_after", "type": "u64" }
+          ]
+        }
       }
     },
     "verify": {
