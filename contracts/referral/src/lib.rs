@@ -1495,4 +1495,87 @@ mod test {
             "Pending reward should be cleared"
         );
     }
+
+    // --- Mint velocity protection tests (#1085) ---
+
+    /// Fixture with a small referral mint budget so a burst of completions
+    /// is a large share of it.
+    fn setup_velocity_fixture() -> TestFixture {
+        let f = TestFixture::setup();
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: 500 * 10_000_000,
+        });
+        f
+    }
+
+    /// Completes one mentor referral for `referrer` and claims the reward.
+    /// Returns true if the claim was deferred with a `VelocityAlert` event.
+    fn complete_and_claim(f: &TestFixture, referrer: &Address) -> bool {
+        let referee = Address::generate(&f.env);
+        f.client().register_referral(referrer, &referee, &true);
+        f.client().fulfill_referral(&referee);
+        f.client().claim_reward(referrer);
+
+        let events = f.env.events().all();
+        let last = events.last().unwrap();
+        last.1
+            == (
+                Symbol::new(&f.env, "Referral"),
+                Symbol::new(&f.env, "VelocityAlert"),
+                referrer.clone(),
+            )
+                .into_val(&f.env)
+    }
+
+    #[test]
+    fn test_rapid_referral_completions_trigger_velocity_alert() {
+        let f = setup_velocity_fixture();
+        let referrer = Address::generate(&f.env);
+
+        // Stay within the 5-referrals-per-epoch suspicious-pattern threshold so
+        // the velocity check is the guard that fires.
+        let mut deferred_on = None;
+        for i in 0..5 {
+            let minted_before = f.client().get_global_referral_minted();
+            let window_before = f.client().get_window_minted();
+            if complete_and_claim(&f, &referrer) {
+                // Nothing minted or recorded; reward stays pending.
+                assert_eq!(f.client().get_global_referral_minted(), minted_before);
+                assert_eq!(f.client().get_window_minted(), window_before);
+                assert!(f.client().get_pending_rewards(&referrer) > 0);
+                deferred_on = Some(i);
+                break;
+            }
+            assert_eq!(f.client().get_pending_rewards(&referrer), 0);
+        }
+
+        let deferred_on = deferred_on.expect("rapid completions should trigger a VelocityAlert");
+        assert!(deferred_on > 0, "a single claim should not trip velocity protection");
+    }
+
+    #[test]
+    fn test_velocity_deferred_reward_claimable_after_window_resets() {
+        let f = setup_velocity_fixture();
+        let referrer = Address::generate(&f.env);
+
+        let mut deferred = false;
+        for _ in 0..5 {
+            if complete_and_claim(&f, &referrer) {
+                deferred = true;
+                break;
+            }
+        }
+        assert!(deferred, "rapid completions should trigger a VelocityAlert");
+        assert!(f.client().get_pending_rewards(&referrer) > 0);
+
+        f.env
+            .ledger()
+            .with_mut(|li| li.timestamp += REFERRAL_VELOCITY_WINDOW_SECS);
+        f.client().claim_reward(&referrer);
+
+        assert_eq!(f.client().get_pending_rewards(&referrer), 0);
+        assert!(f.client().get_window_minted() > 0);
+    }
 }
