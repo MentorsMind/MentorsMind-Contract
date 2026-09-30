@@ -13,9 +13,11 @@ use shared::{
     trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
 };
+use shared::metadata_validation::{audit_information_accuracy, InformationAuditRecord};
+
 
 /// Default grace period: 7 days in seconds
 const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
@@ -26,6 +28,18 @@ const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 pub enum Error {
     IdentityMismatch = 1,
 }
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataManipulationAlert {
+    #[topic]
+    pub category: Symbol,
+    #[topic]
+    pub mentor: Address,
+    pub disinformation_score: u32,
+    pub timestamp: u64,
+}
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,7 +70,9 @@ pub enum DataKey {
     AccountMonitoringLog(Address),
     CrossPlatformCreds(Address, Symbol),
     BridgedIdentity(Address, Symbol),
+    InformationAuditRecord(Address),
 }
+
 
 /// Maximum rolling outcome scores retained per (mentor, specialization) for
 /// fraud/expertise scoring.
@@ -352,9 +368,9 @@ impl VerificationContract {
 
     /// Get detailed verification status including grace period info.
     pub fn get_verification_status(env: Env, mentor: Address) -> VerificationStatus {
-        let key = DataKey::Verification(mentor);
+        let key = DataKey::Verification(mentor.clone());
         let rec: Option<VerificationRecord> = env.storage().persistent().get(&key);
-        match rec {
+        let status = match &rec {
             None => VerificationStatus {
                 is_verified: false,
                 is_grace: false,
@@ -373,8 +389,46 @@ impl VerificationContract {
                     grace_expires_at: grace_expires,
                 }
             }
+        };
+
+        // Audit information accuracy on credential read (#1119)
+        let (total_claims, verified_claims, disinfo_flags) = match &rec {
+            Some(r) => {
+                let now = env.ledger().timestamp();
+                let grace_expires = r.expiry.checked_add(r.grace_period_secs).unwrap_or(u64::MAX);
+                if !r.is_active || now > grace_expires {
+                    (1u32, 0u32, 2u32)
+                } else if now > r.expiry {
+                    (1u32, 1u32, 1u32)
+                } else {
+                    (1u32, 1u32, 0u32)
+                }
+            }
+            None => (1u32, 0u32, 2u32),
+        };
+
+        let audit = audit_information_accuracy(total_claims, verified_claims, disinfo_flags);
+        if !audit.accuracy_verified || disinfo_flags > 0 {
+            let audit_key = DataKey::InformationAuditRecord(mentor.clone());
+            env.storage().persistent().set(&audit_key, &audit);
+
+            MetadataManipulationAlert {
+                category: symbol_short!("meta_alt"),
+                mentor: mentor.clone(),
+                disinformation_score: audit.disinformation_score,
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
         }
+
+        status
     }
+
+    pub fn get_information_audit_record(env: Env, mentor: Address) -> Option<InformationAuditRecord> {
+        let audit_key = DataKey::InformationAuditRecord(mentor);
+        env.storage().persistent().get(&audit_key)
+    }
+
 
     /// Renew a mentor's verification by setting a new expiry (admin only).
     ///
@@ -1322,3 +1376,29 @@ mod test {
         assert!(!status.is_verified); // No longer verified
         assert!(!status.is_grace);
     }
+
+    #[test]
+    fn test_get_verification_status_creates_audit_record_for_manipulated_credential() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[7u8; 32]);
+        
+        let expiry = 1000u64;
+        f.env.ledger().set_timestamp(0);
+        client.verify_mentor(&f.mentor, &credential_hash, &expiry);
+
+        // Advance time past grace period so credential becomes expired/manipulated
+        let grace_expires = expiry + DEFAULT_GRACE_PERIOD_SECS;
+        f.env.ledger().set_timestamp(grace_expires + 100);
+
+        let status = client.get_verification_status(&f.mentor);
+        assert!(!status.is_verified);
+
+        let audit = client.get_information_audit_record(&f.mentor);
+        assert!(audit.is_some());
+        let record = audit.unwrap();
+        assert!(record.audited);
+        assert!(!record.accuracy_verified);
+    }
+}
+
