@@ -3,6 +3,97 @@
 //!
 //! Enforces consistent TTL extension policies across all contract storage tiers (instance,
 //! persistent, temporary) to prevent unexpected data expiration during active operations.
+//!
+//! # Ledger arithmetic
+//!
+//! Soroban expresses TTLs in *ledgers*, not seconds. Every constant in this module
+//! assumes the Stellar mainnet target close time of ~5 seconds per ledger:
+//!
+//! ```text
+//! 1 day  = 86_400 s / 5 s  =  17_280 ledgers   (ONE_DAY_LEDGERS)
+//! 7 days = 7  * 17_280     = 120_960 ledgers   (SEVEN_DAYS_LEDGERS)
+//! 30 days = 30 * 17_280    = 518_400 ledgers   (THIRTY_DAYS_LEDGERS)
+//! ```
+//!
+//! If the network close time changes, the *ledger* counts stay the same but the
+//! wall-clock durations they represent shift proportionally.
+//!
+//! # Which constants to use for which storage tier
+//!
+//! `extend_ttl(threshold, extend_to)` is a no-op while the entry's remaining TTL is
+//! above `threshold`; once it drops to or below `threshold` the TTL is raised to
+//! `extend_to`. Each tier therefore has a *threshold* / *bump* pair:
+//!
+//! | Storage tier | Threshold constant              | Bump constant            | Meaning                                |
+//! |--------------|---------------------------------|--------------------------|----------------------------------------|
+//! | Instance     | [`INSTANCE_LIFETIME_THRESHOLD`]   | [`INSTANCE_BUMP_AMOUNT`]   | < 7 days left → extend to 30 days      |
+//! | Persistent   | [`PERSISTENT_LIFETIME_THRESHOLD`] | [`PERSISTENT_BUMP_AMOUNT`] | < 7 days left → extend to 30 days      |
+//! | Temporary    | [`TEMPORARY_LIFETIME_THRESHOLD`]  | [`TEMPORARY_BUMP_AMOUNT`]  | < ~4.8 hours left → extend to 1 day    |
+//!
+//! Rules of thumb for new contracts:
+//!
+//! - **Instance** storage holds contract-wide config (admin, token addresses,
+//!   counters). Bump it on every state-changing entry point.
+//! - **Persistent** storage holds per-user / per-record data that must never be
+//!   lost (escrows, stakes, balances). Bump the specific key on every read *and*
+//!   write that the protocol depends on.
+//! - **Temporary** storage holds cheap, disposable data (nonces, rate-limit
+//!   windows, in-flight dependency markers). It is deleted permanently on expiry and
+//!   cannot be restored, so never put funds-bearing state here.
+//!
+//! [`SAFETY_MARGIN_LEDGERS`] and [`WARNING_THRESHOLD_LEDGERS`] are *monitoring*
+//! constants used by [`ExpirationMonitor`]; they are not passed to `extend_ttl`
+//! directly (except as the temporary-tier threshold).
+//!
+//! # Usage
+//!
+//! Calling `extend_ttl` directly with the shared constants for all three tiers:
+//!
+//! ```ignore
+//! use shared::ttl_utils::{
+//!     INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+//!     PERSISTENT_LIFETIME_THRESHOLD, TEMPORARY_BUMP_AMOUNT, TEMPORARY_LIFETIME_THRESHOLD,
+//! };
+//! use soroban_sdk::{contracttype, Env};
+//!
+//! #[contracttype]
+//! pub enum DataKey {
+//!     Escrow(u64),
+//!     Nonce(u64),
+//! }
+//!
+//! fn touch_storage(env: &Env, escrow_id: u64, nonce: u64) {
+//!     // Instance tier: contract-wide config, bumped on every call.
+//!     env.storage()
+//!         .instance()
+//!         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+//!
+//!     // Persistent tier: long-lived, funds-bearing records.
+//!     env.storage().persistent().extend_ttl(
+//!         &DataKey::Escrow(escrow_id),
+//!         PERSISTENT_LIFETIME_THRESHOLD,
+//!         PERSISTENT_BUMP_AMOUNT,
+//!     );
+//!
+//!     // Temporary tier: short-lived, disposable data.
+//!     env.storage().temporary().extend_ttl(
+//!         &DataKey::Nonce(nonce),
+//!         TEMPORARY_LIFETIME_THRESHOLD,
+//!         TEMPORARY_BUMP_AMOUNT,
+//!     );
+//! }
+//! ```
+//!
+//! The same policy is wrapped by [`TTLManager`], which is the preferred entry point
+//! so that every contract stays on one policy:
+//!
+//! ```ignore
+//! use shared::ttl_utils::TTLManager;
+//!
+//! TTLManager::extend_instance(&env);
+//! TTLManager::extend_persistent(&env, &DataKey::Escrow(escrow_id));
+//! TTLManager::extend_temporary(&env, &DataKey::Nonce(nonce));
+//! ```
 
 use soroban_sdk::{
     contracttype, symbol_short, xdr::ToXdr, Bytes, BytesN, Env, IntoVal, Symbol, Val,
@@ -12,44 +103,96 @@ use soroban_sdk::{
 // Unified TTL Constants & Safety Margins (Assuming ~5s Stellar ledger close time)
 // ---------------------------------------------------------------------------
 
-/// 1 day in ledgers (~17,280 ledgers assuming 5-second close times).
+/// One day expressed in ledgers: `86_400 s / 5 s = 17_280` ledgers.
+///
+/// Base unit for every other constant in this module. Not tied to a single
+/// storage tier; also used directly as [`TEMPORARY_BUMP_AMOUNT`] and
+/// [`WARNING_THRESHOLD_LEDGERS`].
 pub const ONE_DAY_LEDGERS: u32 = 17_280;
 
-/// 7 days in ledgers (~120,960 ledgers).
+/// Seven days expressed in ledgers: `7 × 17_280 = 120_960` ledgers.
+///
+/// Used as the extension *threshold* for the instance and persistent tiers
+/// ([`INSTANCE_LIFETIME_THRESHOLD`], [`PERSISTENT_LIFETIME_THRESHOLD`]).
 pub const SEVEN_DAYS_LEDGERS: u32 = 7 * ONE_DAY_LEDGERS;
 
-/// 30 days in ledgers (~518,400 ledgers).
+/// Thirty days expressed in ledgers: `30 × 17_280 = 518_400` ledgers.
+///
+/// Used as the extension *target* for the instance and persistent tiers
+/// ([`INSTANCE_BUMP_AMOUNT`], [`PERSISTENT_BUMP_AMOUNT`]).
 pub const THIRTY_DAYS_LEDGERS: u32 = 30 * ONE_DAY_LEDGERS;
 
-/// Safety margin ledgers (~4.8 hours = 3,456 ledgers) added to prevent race conditions.
+/// Safety margin: `17_280 / 5 = 3_456` ledgers (~4.8 hours).
+///
+/// Monitoring constant. [`ExpirationMonitor`] reports [`AlertLevel::Critical`]
+/// once an entry has this many ledgers or fewer remaining. It is also the
+/// extension threshold for the temporary tier ([`TEMPORARY_LIFETIME_THRESHOLD`]),
+/// so a temporary entry is refreshed before it gets within ~4.8 hours of expiry.
 pub const SAFETY_MARGIN_LEDGERS: u32 = ONE_DAY_LEDGERS / 5;
 
-/// 24-hour advance warning threshold for expiration monitoring (~17,280 ledgers).
+/// Advance-warning window: `17_280` ledgers (24 hours).
+///
+/// Monitoring constant, applies to any tier. [`ExpirationMonitor`] reports
+/// [`AlertLevel::Warning`] once an entry has this many ledgers or fewer remaining
+/// (and more than [`SAFETY_MARGIN_LEDGERS`]).
 pub const WARNING_THRESHOLD_LEDGERS: u32 = ONE_DAY_LEDGERS;
 
-/// Standard threshold below which instance storage should be extended.
+/// **Instance tier** threshold: `120_960` ledgers (7 days).
+///
+/// Pass as the first argument to `env.storage().instance().extend_ttl(..)`.
+/// While the contract instance has more than 7 days left, the call is a no-op.
 pub const INSTANCE_LIFETIME_THRESHOLD: u32 = SEVEN_DAYS_LEDGERS;
 
-/// Standard bump amount for instance storage (extends to 30 days).
+/// **Instance tier** bump target: `518_400` ledgers (30 days).
+///
+/// Pass as the second argument to `env.storage().instance().extend_ttl(..)`.
+/// When the threshold is crossed, the instance TTL is raised back to 30 days.
 pub const INSTANCE_BUMP_AMOUNT: u32 = THIRTY_DAYS_LEDGERS;
 
-/// Standard threshold below which persistent storage entries should be extended.
+/// **Persistent tier** threshold: `120_960` ledgers (7 days).
+///
+/// Pass as the `threshold` argument to `env.storage().persistent().extend_ttl(key, ..)`.
+/// Use for long-lived records such as escrows, stakes and balances.
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = SEVEN_DAYS_LEDGERS;
 
-/// Standard bump amount for persistent storage entries (extends to 30 days).
+/// **Persistent tier** bump target: `518_400` ledgers (30 days).
+///
+/// Pass as the `extend_to` argument to `env.storage().persistent().extend_ttl(key, ..)`.
+/// An archived persistent entry can be restored, but restoring costs a fee and
+/// blocks the contract until it happens, so keep it bumped.
 pub const PERSISTENT_BUMP_AMOUNT: u32 = THIRTY_DAYS_LEDGERS;
 
-/// Standard threshold below which temporary storage entries should be extended.
+/// **Temporary tier** threshold: `3_456` ledgers (~4.8 hours, equal to
+/// [`SAFETY_MARGIN_LEDGERS`]).
+///
+/// Pass as the `threshold` argument to `env.storage().temporary().extend_ttl(key, ..)`.
 pub const TEMPORARY_LIFETIME_THRESHOLD: u32 = SAFETY_MARGIN_LEDGERS;
 
-/// Standard bump amount for temporary storage entries (extends to 1 day).
+/// **Temporary tier** bump target: `17_280` ledgers (1 day).
+///
+/// Pass as the `extend_to` argument to `env.storage().temporary().extend_ttl(key, ..)`.
+/// Temporary entries are deleted permanently when they expire, so only use this
+/// tier for data that is safe to lose (nonces, rate-limit windows, markers).
 pub const TEMPORARY_BUMP_AMOUNT: u32 = ONE_DAY_LEDGERS;
 
 // ---------------------------------------------------------------------------
 // Types & Enums
 // ---------------------------------------------------------------------------
 
-/// Alert severity for storage expiration monitoring.
+/// Severity of a storage entry's remaining lifetime, as computed by
+/// [`ExpirationMonitor::assess_lifetime`].
+///
+/// Levels are ordered (`Safe < Warning < Critical < Expired`), so callers can
+/// compare them directly, e.g. `if alert.level >= AlertLevel::Critical { .. }`.
+/// The numeric discriminants are stable and are what gets published in the
+/// `("ttl", "alert", key)` event payload.
+///
+/// | Level      | Remaining ledgers                                               |
+/// |------------|-----------------------------------------------------------------|
+/// | `Safe`     | more than [`WARNING_THRESHOLD_LEDGERS`] (> 24 h)                |
+/// | `Warning`  | ≤ [`WARNING_THRESHOLD_LEDGERS`] and > [`SAFETY_MARGIN_LEDGERS`] |
+/// | `Critical` | ≤ [`SAFETY_MARGIN_LEDGERS`] (≤ ~4.8 h) and > 0                  |
+/// | `Expired`  | 0                                                               |
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -64,14 +207,24 @@ pub enum AlertLevel {
     Expired = 4,
 }
 
-/// Detailed TTL monitoring report.
+/// TTL health report for a single storage key, returned by
+/// [`ExpirationMonitor::assess_lifetime`] and [`ExpirationMonitor::monitor_and_notify`].
+///
+/// A `TTLAlert` is a pure computation from ledger numbers; producing one never
+/// reads or extends storage. Off-chain monitors typically consume it through the
+/// `("ttl", "alert", key_symbol)` event emitted for any non-[`AlertLevel::Safe`] level.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TTLAlert {
+    /// Caller-chosen label identifying the monitored key (e.g. `symbol_short!("escrow")`).
     pub key_symbol: Symbol,
+    /// Severity bucket derived from `remaining_ledgers`.
     pub level: AlertLevel,
+    /// Ledgers left before the entry expires, saturating at `0`.
     pub remaining_ledgers: u32,
+    /// Warning window used for the assessment; always [`WARNING_THRESHOLD_LEDGERS`].
     pub warning_threshold: u32,
+    /// `true` iff `remaining_ledgers == 0` (equivalently, `level == AlertLevel::Expired`).
     pub is_expired: bool,
 }
 
