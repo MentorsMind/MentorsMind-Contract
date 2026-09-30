@@ -8,8 +8,8 @@ use shared::events::{
 };
 use shared::{Pagination, MAX_PAGE_SIZE};
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, Address, Bytes, BytesN, Env,
-    Symbol, Val, Vec,
+    contract, contractimpl, contracterror, contracttype, panic_with_error, Address, Bytes,
+    BytesN, Env, Symbol, Val, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
 
@@ -41,6 +41,8 @@ pub enum Error {
     VetoPeriodActive = 12,
     /// Guardian action has been vetoed by community.
     ActionVetoed = 13,
+    /// Operation was not executed within `OPERATION_EXPIRY_SECS` of `ready_at`.
+    OperationExpired = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +346,7 @@ impl TimelockController {
             .checked_add(OPERATION_EXPIRY_SECS)
             .expect("timestamp overflow");
         if now >= expiry {
-            panic!("operation expired");
+            panic_with_error!(&env, Error::OperationExpired);
         }
 
         env.invoke_contract::<Val>(&op.target, &op.function, op.args.clone());
