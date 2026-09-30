@@ -9,6 +9,17 @@
     "version": "u32 — schema version (currently 1)",
     "event_type": "Symbol — identifies the specific event within the contract"
   },
+  "format": {
+    "description": "How to read and extend this file. It is checked in CI by scripts/check_events_schema.py (.github/workflows/events-schema-check.yml).",
+    "contracts": "Object keyed by contract symbol (topic[0]) — must match the Symbol returned by the contract_* helper in contracts/shared/src/events.rs.",
+    "events": "contracts.<contract>.events is an object keyed by event_type symbol (topic[2]).",
+    "event_entry": {
+      "description": "Required. Non-empty human-readable summary of when the event is emitted.",
+      "version": "Optional integer. Schema version the entry applies to; defaults to schema_version.",
+      "fields": "Optional list of { \"name\": string, \"type\": string } describing the event data payload."
+    },
+    "ci_rule": "Every evt_* helper in contracts/shared/src/events.rs must have an entry here under the contract named by its '// --- <contract> ---' section header, otherwise CI fails."
+  },
   "contracts": {
     "escrow": {
       "events": {
@@ -53,7 +64,9 @@
       "events": {
         "staked": { "description": "Tokens staked" },
         "unstaked": { "description": "Tokens unstaked" },
-        "admin_prop": { "description": "Admin change proposed" }
+        "admin_prop": { "description": "Admin change proposed" },
+        "admin_acc": { "description": "Admin change accepted" },
+        "admin_cancel": { "description": "Pending admin change cancelled" }
       }
     },
     "timelock": {
@@ -94,7 +107,19 @@
       "events": {
         "registered": { "description": "Referral registered" },
         "reward": { "description": "Referral reward distributed" },
-        "admin_prop": { "description": "Admin change proposed" }
+        "admin_prop": { "description": "Admin change proposed" },
+        "velocity_alert": {
+          "description": "Referral reward mint deferred by token velocity protection (topics: Referral, VelocityAlert, referrer)",
+          "version": 1,
+          "fields": [
+            { "name": "amount", "type": "i128" },
+            { "name": "window_minted", "type": "i128" },
+            { "name": "velocity_bps", "type": "u32" },
+            { "name": "concentration_bps", "type": "u32" },
+            { "name": "health_score", "type": "u32" },
+            { "name": "retry_after", "type": "u64" }
+          ]
+        }
       }
     },
     "verify": {
@@ -140,7 +165,21 @@
         "sched_dist": { "description": "Scheduled distribution" },
         "distrib_exec": { "description": "Distribution executed" },
         "buyback_ok": { "description": "Buyback succeeded" },
-        "buyback_fail": { "description": "Buyback failed" }
+        "buyback_fail": { "description": "Buyback failed" },
+        "buyback_def": {
+          "description": "Buyback deferred by token velocity protection (topics: buyback, deferred)",
+          "version": 1,
+          "fields": [
+            { "name": "xlm_amount", "type": "i128" },
+            { "name": "min_mnt_out", "type": "i128" },
+            { "name": "window_volume", "type": "i128" },
+            { "name": "velocity_bps", "type": "u32" },
+            { "name": "concentration_bps", "type": "u32" },
+            { "name": "health_score", "type": "u32" },
+            { "name": "deferred_at", "type": "u64" },
+            { "name": "retry_after", "type": "u64" }
+          ]
+        }
       }
     },
     "subscript": {

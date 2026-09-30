@@ -29,10 +29,16 @@
 ///
 /// # Adding New Events
 ///
-/// 1. Add a variant to the appropriate `*Event` enum below.
-/// 2. Implement the `event_type_symbol` arm in `impl EventType`.
-/// 3. Add an entry to `events_schema.json` at the workspace root.
-/// 4. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
+/// 1. Add an `evt_*` helper under the matching `// --- <contract> ---`
+///    section below. The first word of the section header must be the
+///    contract symbol (the key used under `contracts` in the schema).
+/// 2. Add an entry to `events_schema.json` at the workspace root under
+///    `contracts.<contract>.events.<event_type>`.
+/// 3. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
+///
+/// CI (`.github/workflows/events-schema-check.yml`) runs
+/// `scripts/check_events_schema.py`, which fails if any `evt_*` symbol
+/// here is missing from `events_schema.json`.
 #[allow(dead_code)]
 
 use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
@@ -342,7 +348,7 @@ pub fn evt_anomaly_hold_placed(env: &Env)    -> Symbol { Symbol::new(env, "hold_
 pub fn evt_anomaly_detected(env: &Env)       -> Symbol { Symbol::new(env, "detected") }
 pub fn evt_anomaly_hold_cleared(env: &Env)   -> Symbol { Symbol::new(env, "hold_cleared") }
 
-// --- verification ---
+// --- verify (verification) ---
 pub fn evt_verify_ok(env: &Env)     -> Symbol { Symbol::new(env, "verified") }
 pub fn evt_verify_revoke(env: &Env) -> Symbol { Symbol::new(env, "revoked") }
 
@@ -367,24 +373,24 @@ pub fn evt_treasury_deposited(env: &Env)    -> Symbol { Symbol::new(env, "deposi
 pub fn evt_treasury_allocated(env: &Env)    -> Symbol { Symbol::new(env, "allocated") }
 pub fn evt_treasury_distributed(env: &Env)  -> Symbol { Symbol::new(env, "distributed") }
 
-// --- subscription ---
+// --- subscript (subscription) ---
 pub fn evt_sub_subscribed(env: &Env)  -> Symbol { Symbol::new(env, "subscribed") }
 pub fn evt_sub_expired(env: &Env)     -> Symbol { Symbol::new(env, "expired") }
 pub fn evt_sub_renewed(env: &Env)     -> Symbol { Symbol::new(env, "renewed") }
 pub fn evt_sub_cancelled(env: &Env)   -> Symbol { Symbol::new(env, "cancelled") }
 pub fn evt_sub_paused(env: &Env)      -> Symbol { Symbol::new(env, "paused") }
 
-// --- streak rewards ---
+// --- streak (streak rewards) ---
 pub fn evt_streak_broken(env: &Env)   -> Symbol { Symbol::new(env, "broken") }
 pub fn evt_streak_updated(env: &Env)  -> Symbol { Symbol::new(env, "updated") }
 pub fn evt_streak_rewarded(env: &Env) -> Symbol { Symbol::new(env, "rewarded") }
 
-// --- velocity limits ---
+// --- velocity (velocity limits) ---
 pub fn evt_vel_exceeded(env: &Env)    -> Symbol { Symbol::new(env, "exceeded") }
 pub fn evt_vel_checked(env: &Env)     -> Symbol { Symbol::new(env, "checked") }
 pub fn evt_vel_daily_reset(env: &Env) -> Symbol { Symbol::new(env, "daily_reset") }
 
-// --- upgrade registry ---
+// --- upgrade (upgrade registry) ---
 pub fn evt_upgrade_proposed(env: &Env)   -> Symbol { Symbol::new(env, "proposed") }
 pub fn evt_upgrade_applied(env: &Env)    -> Symbol { Symbol::new(env, "applied") }
 pub fn evt_upgrade_signers(env: &Env)    -> Symbol { Symbol::new(env, "signers_upd") }
@@ -393,14 +399,14 @@ pub fn evt_upgrade_registered(env: &Env) -> Symbol { Symbol::new(env, "registere
 pub fn evt_upgrade_sub_added(env: &Env)  -> Symbol { Symbol::new(env, "sub_added") }
 pub fn evt_upgrade_sub_removed(env: &Env)-> Symbol { Symbol::new(env, "sub_removed") }
 
-// --- treasury analytics ---
+// --- trs_anlyt (treasury analytics) ---
 pub fn evt_trs_fee_revenue(env: &Env)      -> Symbol { Symbol::new(env, "fee_revenue") }
 pub fn evt_trs_referral_payout(env: &Env)  -> Symbol { Symbol::new(env, "ref_payout") }
 pub fn evt_trs_ins_reserve(env: &Env)      -> Symbol { Symbol::new(env, "ins_reserve") }
 pub fn evt_trs_metrics(env: &Env)          -> Symbol { Symbol::new(env, "metrics") }
 pub fn evt_trs_report_gen(env: &Env)       -> Symbol { Symbol::new(env, "report_gen") }
 
-// --- subscription analytics ---
+// --- sub_anlyt (subscription analytics) ---
 pub fn evt_sub_anlyt_metrics(env: &Env) -> Symbol { Symbol::new(env, "metrics") }
 
 // --- referral ---
@@ -412,14 +418,14 @@ pub fn evt_del_delegated(env: &Env)       -> Symbol { Symbol::new(env, "delegate
 pub fn evt_del_undelegated(env: &Env)     -> Symbol { Symbol::new(env, "undelegated") }
 pub fn evt_del_suspended(env: &Env)       -> Symbol { Symbol::new(env, "suspended") }
 
-// --- escrow_factory ---
+// --- esc_factory (escrow_factory) ---
 pub fn evt_ef_admin_proposed(env: &Env)   -> Symbol { Symbol::new(env, "admin_prop") }
 pub fn evt_ef_admin_accepted(env: &Env)   -> Symbol { Symbol::new(env, "admin_acc") }
 pub fn evt_ef_deployed(env: &Env)         -> Symbol { Symbol::new(env, "deployed") }
 pub fn evt_ef_impl_upgraded(env: &Env)    -> Symbol { Symbol::new(env, "impl_upg") }
 pub fn evt_ef_anomaly_warn(env: &Env)     -> Symbol { Symbol::new(env, "anom_warn") }
 
-// --- endorsements ---
+// --- endorsmnt (endorsements) ---
 pub fn evt_end_endorsed(env: &Env)        -> Symbol { Symbol::new(env, "endorsed") }
 pub fn evt_end_removed(env: &Env)         -> Symbol { Symbol::new(env, "removed") }
 pub fn evt_end_reendorsed(env: &Env)      -> Symbol { Symbol::new(env, "re_endorsed") }
@@ -432,12 +438,12 @@ pub fn evt_isa_payment_recorded(env: &Env)-> Symbol { Symbol::new(env, "payment_
 pub fn evt_isa_payment_missed(env: &Env)  -> Symbol { Symbol::new(env, "payment_missed") }
 pub fn evt_isa_defaulted(env: &Env)       -> Symbol { Symbol::new(env, "defaulted") }
 
-// --- rate_limiter ---
+// --- rate_limit (rate_limiter) ---
 pub fn evt_rl_exceeded(env: &Env)         -> Symbol { Symbol::new(env, "exceeded") }
 pub fn evt_rl_whitelist_added(env: &Env)  -> Symbol { Symbol::new(env, "wl_added") }
 pub fn evt_rl_whitelist_removed(env: &Env)-> Symbol { Symbol::new(env, "wl_removed") }
 
-// --- subscription analytics ---
+// --- sub_anlyt (subscription analytics) ---
 pub fn evt_sub_anlyt_metrics_updated(env: &Env) -> Symbol { Symbol::new(env, "metrics_upd") }
 
 // ---------------------------------------------------------------------------

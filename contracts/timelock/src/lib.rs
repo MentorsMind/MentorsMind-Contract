@@ -8,8 +8,8 @@ use shared::events::{
 };
 use shared::{Pagination, MAX_PAGE_SIZE};
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, Address, Bytes, BytesN, Env,
-    Symbol, Val, Vec,
+    contract, contractimpl, contracterror, contracttype, panic_with_error, Address, Bytes,
+    BytesN, Env, Symbol, Val, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
 
@@ -41,6 +41,8 @@ pub enum Error {
     VetoPeriodActive = 12,
     /// Guardian action has been vetoed by community.
     ActionVetoed = 13,
+    /// Operation was not executed within `OPERATION_EXPIRY_SECS` of `ready_at`.
+    OperationExpired = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +346,7 @@ impl TimelockController {
             .checked_add(OPERATION_EXPIRY_SECS)
             .expect("timestamp overflow");
         if now >= expiry {
-            panic!("operation expired");
+            panic_with_error!(&env, Error::OperationExpired);
         }
 
         env.invoke_contract::<Val>(&op.target, &op.function, op.args.clone());
@@ -856,16 +858,78 @@ mod tests {
         client.execute(&op_id);
     }
 
-    #[test]
-    #[should_panic(expected = "operation expired")]
-    fn test_execute_after_expiry_panics() {
-        let (env, admin, client) = setup();
-        let op_id = schedule_op(&env, &client, &admin);
+    /// Schedules a `MockTarget::set_fee` call so that `execute` has a real
+    /// contract function to invoke.
+    fn schedule_executable_op(
+        env: &Env,
+        client: &TimelockControllerClient,
+        caller: &Address,
+    ) -> BytesN<32> {
+        let target = env.register_contract(None, MockTarget);
+        let function = Symbol::new(env, "set_fee");
+        let mut args = Vec::new(env);
+        args.push_back(25u32.into_val(env));
+        let salt = BytesN::from_array(env, &[7u8; 32]);
+        client.schedule(caller, &target, &function, &args, &MIN_DELAY, &salt)
+    }
 
-        // Advance past ready_at + OPERATION_EXPIRY_SECS.
+    #[test]
+    fn test_execute_after_expiry_returns_operation_expired() {
+        let (env, admin, client) = setup();
+        let op_id = schedule_executable_op(&env, &client, &admin);
+
+        // Advance 14 days + 1 second past ready_at.
         env.ledger()
             .with_mut(|li| li.timestamp += MIN_DELAY + OPERATION_EXPIRY_SECS + 1);
+
+        assert!(client.is_operation_expired(&op_id));
+        assert_eq!(
+            client.try_execute(&op_id),
+            Err(Ok(Error::OperationExpired))
+        );
+        assert!(!client.is_operation_done(&op_id));
+    }
+
+    #[test]
+    fn test_execute_exactly_at_expiry_returns_operation_expired() {
+        let (env, admin, client) = setup();
+        let op_id = schedule_executable_op(&env, &client, &admin);
+
+        // Expiry is exclusive: now == ready_at + OPERATION_EXPIRY_SECS is expired.
+        env.ledger()
+            .with_mut(|li| li.timestamp += MIN_DELAY + OPERATION_EXPIRY_SECS);
+
+        assert_eq!(
+            client.try_execute(&op_id),
+            Err(Ok(Error::OperationExpired))
+        );
+    }
+
+    #[test]
+    fn test_execute_after_delay_within_expiry_succeeds() {
+        let (env, admin, client) = setup();
+        let op_id = schedule_executable_op(&env, &client, &admin);
+
+        // Last second before the 14-day expiry window closes.
+        env.ledger()
+            .with_mut(|li| li.timestamp += MIN_DELAY + OPERATION_EXPIRY_SECS - 1);
+
+        assert!(!client.is_operation_expired(&op_id));
         client.execute(&op_id);
+        assert!(client.is_operation_done(&op_id));
+    }
+
+    #[test]
+    fn test_execute_just_after_delay_succeeds() {
+        let (env, admin, client) = setup();
+        let op_id = schedule_executable_op(&env, &client, &admin);
+
+        // Delay (plus readiness tolerance) has elapsed; well inside 14 days.
+        env.ledger()
+            .with_mut(|li| li.timestamp += MIN_DELAY + TIMESTAMP_TOLERANCE_SECS);
+
+        client.execute(&op_id);
+        assert!(client.is_operation_done(&op_id));
     }
 
     #[test]
