@@ -153,7 +153,21 @@
         "sched_dist": { "description": "Scheduled distribution" },
         "distrib_exec": { "description": "Distribution executed" },
         "buyback_ok": { "description": "Buyback succeeded" },
-        "buyback_fail": { "description": "Buyback failed" }
+        "buyback_fail": { "description": "Buyback failed" },
+        "buyback_def": {
+          "description": "Buyback deferred by token velocity protection (topics: buyback, deferred)",
+          "version": 1,
+          "fields": [
+            { "name": "xlm_amount", "type": "i128" },
+            { "name": "min_mnt_out", "type": "i128" },
+            { "name": "window_volume", "type": "i128" },
+            { "name": "velocity_bps", "type": "u32" },
+            { "name": "concentration_bps", "type": "u32" },
+            { "name": "health_score", "type": "u32" },
+            { "name": "deferred_at", "type": "u64" },
+            { "name": "retry_after", "type": "u64" }
+          ]
+        }
       }
     },
     "subscript": {
