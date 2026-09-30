@@ -242,3 +242,11 @@ See `CONTRIBUTING.md` for workflow guidelines.
 ## 13. License
 
 MIT License (see `LICENSE` if present in the repository).
+
+## Handsoff notes
+
+<!-- handsoff-issue-1029 -->
+- #1029: Add OperationBudget usage to  lib.rs  proposal iteration loops
+
+<!-- handsoff-issue-1030 -->
+- #1030: Add get_schedule_page paginated view to  lib.rs
