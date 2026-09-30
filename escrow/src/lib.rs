@@ -103,13 +103,19 @@ use shared::{
     EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval,
     EmergencyFundLock, PaymentAuditEntry,
 };
+use shared::session_uniqueness::{
+    validate_session_nonce, detect_temporal_replay, MAX_SESSION_TIME_DRIFT_SECS,
+};
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
     SessionAuthFailed = 1,
+    DuplicateEntry = 2,
 }
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,6 +443,9 @@ pub enum DataKey {
     InvalidStateRecord(u64),
     /// ATOMIC STATE TRANSITIONS: Cross-contract state verification
     CrossContractStateCheck(u64),
+    /// Session nonce tracking for replay protection (#1121).
+    UsedSessionNonce(BytesN<32>),
+
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
@@ -4469,12 +4478,30 @@ impl EscrowContract {
             panic!("Insufficient token balance");
         }
 
-        // --- Session uniqueness ---
+        // --- Session uniqueness & replay protection (#1121) ---
+        let session_bytes: BytesN<32> = env.crypto().sha256(&session_id.to_xdr(&env)).into();
+        let nonce_key = DataKey::UsedSessionNonce(session_bytes);
+        let is_used = env.storage().persistent().has(&nonce_key);
+        if !validate_session_nonce(1, 1, is_used) {
+            panic_with_error!(&env, Error::DuplicateEntry);
+        }
+
+        let now = env.ledger().timestamp();
+        if session_end_time > 0 && now > session_end_time {
+            let replay_res = detect_temporal_replay(session_end_time, now, MAX_SESSION_TIME_DRIFT_SECS);
+            if replay_res.is_replay && (now - session_end_time) > MAX_SESSION_TIME_DRIFT_SECS {
+                panic!("Session timestamp too old");
+            }
+        }
+
+        env.storage().persistent().set(&nonce_key, &true);
+
         let session_key = (SESSION_KEY, session_id.clone());
         if env.storage().persistent().has(&session_key) {
             panic!("Session already exists");
         }
         env.storage().persistent().set(&session_key, &true);
+
 
         // --- Auto-release delay ---
         let auto_release_delay: u64 = env
