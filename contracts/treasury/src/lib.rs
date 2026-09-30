@@ -15,6 +15,8 @@ use shared::{
     detect_fee_evasion, PenaltyTier,
     // dynamic fees
     calculate_dynamic_fee, detect_fee_gaming,
+    // economic velocity protection
+    assess_token_velocity, EconomicVelocityReport,
 };
 use shared::economic_verification::{
     validate_fund_conservation, validate_reward_distribution, record_invariant_check,
@@ -103,6 +105,23 @@ pub struct BuybackSucceeded {
     pub xlm_spent: i128,
     pub mnt_burned: i128,
     pub timestamp: u64,
+}
+
+/// Emitted (and stored as the latest deferral) when `buyback_and_burn` is
+/// skipped because the rolling buyback velocity requires stabilization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuybackDeferred {
+    pub xlm_amount: i128,
+    pub min_mnt_out: i128,
+    /// Rolling-window buyback volume including this request.
+    pub window_volume: i128,
+    pub velocity_bps: u32,
+    pub concentration_bps: u32,
+    pub health_score: u32,
+    pub deferred_at: u64,
+    /// Earliest time the current velocity window resets.
+    pub retry_after: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +249,10 @@ const MAX_PER_TX_ALLOCATE: i128 = 100_000_000_000_000;
 const MAX_PER_TX_DISTRIBUTE: i128 = 500_000_000_000_000;
 const MAX_PER_TX_BUYBACK: i128 = 200_000_000_000_000;
 
+/// Rolling window over which buyback volume is accumulated for the
+/// `assess_token_velocity` check in `buyback_and_burn`.
+pub const BUYBACK_VELOCITY_WINDOW_SECS: u64 = 24 * 60 * 60; // 1 day
+
 // ---------------------------------------------------------------------------
 // Snapshot-coordination / distribution-timing constants.
 //
@@ -337,6 +360,15 @@ pub enum DataKey {
     TokenFlowRecord(u64),
     /// Fairness audit result for a distribution.
     FairnessAuditRecord(u64),
+    // ── Buyback velocity protection (#1074) ────────────────────────────────
+    /// Start timestamp of the current rolling buyback velocity window.
+    BuybackWindowStart,
+    /// XLM spent on successful buybacks within the current window.
+    BuybackWindowVolume,
+    /// XLM spent on all successful buybacks since deployment.
+    BuybackLifetimeVolume,
+    /// Most recent deferred buyback request.
+    LastDeferredBuyback,
 }
 
 /// Maximum length of the rolling per-token price log kept for coordination scoring.
@@ -1878,6 +1910,13 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
+    /// Swap treasury XLM for MNT on `dex_contract` and burn the proceeds.
+    ///
+    /// Before the swap, the request is scored with `assess_token_velocity`
+    /// against the treasury's rolling buyback log. If the report requires
+    /// stabilization, the swap is skipped, a `BuybackDeferred` event is
+    /// emitted, the request is stored (see `get_last_deferred_buyback`) and
+    /// the call returns `Ok(())` so the deferral is recorded on-chain.
     pub fn buyback_and_burn(
         env: Env,
         xlm_token: Address,
@@ -1989,6 +2028,48 @@ impl TreasuryContract {
             );
             return Err(Error::InsufficientBalance);
         }
+
+        // Velocity protection: defer large or rapid buybacks that could be
+        // used to manipulate the MNT price.
+        let velocity = Self::_assess_buyback_velocity(&env, xlm_amount, xlm_balance_before);
+        if velocity.stabilization_required {
+            let now = env.ledger().timestamp();
+            let window_end = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u64>(&DataKey::BuybackWindowStart)
+                .map(|s| s.saturating_add(BUYBACK_VELOCITY_WINDOW_SECS))
+                .filter(|end| *end > now)
+                .unwrap_or(now.saturating_add(BUYBACK_VELOCITY_WINDOW_SECS));
+            let deferred = BuybackDeferred {
+                xlm_amount,
+                min_mnt_out,
+                window_volume: velocity.observed_volume,
+                velocity_bps: velocity.velocity_bps,
+                concentration_bps: velocity.concentration_bps,
+                health_score: velocity.health_score,
+                deferred_at: now,
+                retry_after: window_end,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::LastDeferredBuyback, &deferred);
+            Self::_log_operation(
+                &env,
+                Symbol::new(&env, "buyback_def"),
+                timelock.clone(),
+                xlm_token.clone(),
+                xlm_amount,
+                None,
+                false,
+            );
+            env.events().publish(
+                (symbol_short!("buyback"), symbol_short!("deferred")),
+                deferred,
+            );
+            return Ok(());
+        }
+
         let mnt_balance_before = mnt_client.balance(&treasury_addr);
 
         let expiration_ledger = env.ledger().sequence() + 1;
@@ -2094,6 +2175,8 @@ impl TreasuryContract {
 
         pre_snapshot.assert_valid();
 
+        Self::_record_buyback_volume(&env, xlm_amount);
+
         Self::_log_operation(
             &env,
             Symbol::new(&env, "buyback"),
@@ -2114,6 +2197,86 @@ impl TreasuryContract {
         );
 
         Ok(())
+    }
+
+    /// Most recent buyback deferred by velocity protection, if any.
+    pub fn get_last_deferred_buyback(env: Env) -> Option<BuybackDeferred> {
+        env.storage().persistent().get(&DataKey::LastDeferredBuyback)
+    }
+
+    /// XLM spent on successful buybacks in the current velocity window.
+    pub fn get_buyback_window_volume(env: Env) -> i128 {
+        Self::_current_buyback_window_volume(&env)
+    }
+
+    fn _current_buyback_window_volume(env: &Env) -> i128 {
+        let start: Option<u64> = env.storage().persistent().get(&DataKey::BuybackWindowStart);
+        match start {
+            Some(s) if env.ledger().timestamp() < s.saturating_add(BUYBACK_VELOCITY_WINDOW_SECS) => env
+                .storage()
+                .persistent()
+                .get(&DataKey::BuybackWindowVolume)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Score a prospective buyback with `assess_token_velocity`.
+    ///
+    /// * circulating supply — the treasury's XLM reserve before the swap.
+    /// * observed volume    — window buyback volume including this request.
+    /// * concentration      — share of lifetime buyback volume that falls in
+    ///   the current window; a burst with little history scores high.
+    fn _assess_buyback_velocity(
+        env: &Env,
+        xlm_amount: i128,
+        xlm_reserve: i128,
+    ) -> EconomicVelocityReport {
+        let window_volume = Self::_current_buyback_window_volume(env).saturating_add(xlm_amount);
+        let lifetime_volume = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::BuybackLifetimeVolume)
+            .unwrap_or(0)
+            .saturating_add(xlm_amount);
+        let concentration_bps = if lifetime_volume > 0 && window_volume > 0 {
+            ((window_volume as u128).saturating_mul(10_000) / (lifetime_volume as u128))
+                .min(10_000) as u32
+        } else {
+            0
+        };
+        assess_token_velocity(xlm_reserve, window_volume, concentration_bps)
+    }
+
+    /// Add a successful buyback to the rolling window and lifetime totals,
+    /// starting a new window if the previous one has elapsed.
+    fn _record_buyback_volume(env: &Env, xlm_amount: i128) {
+        let now = env.ledger().timestamp();
+        let start: Option<u64> = env.storage().persistent().get(&DataKey::BuybackWindowStart);
+        let (window_start, window_volume) = match start {
+            Some(s) if now < s.saturating_add(BUYBACK_VELOCITY_WINDOW_SECS) => (
+                s,
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::BuybackWindowVolume)
+                    .unwrap_or(0),
+            ),
+            _ => (now, 0),
+        };
+        let lifetime_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuybackLifetimeVolume)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BuybackWindowStart, &window_start);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BuybackWindowVolume, &window_volume.saturating_add(xlm_amount));
+        env.storage()
+            .persistent()
+            .set(&DataKey::BuybackLifetimeVolume, &lifetime_volume.saturating_add(xlm_amount));
     }
 
     // -----------------------------------------------------------------------
