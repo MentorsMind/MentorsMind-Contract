@@ -29,6 +29,11 @@ use shared::mev_protection::{
     record_mev_monitoring, MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
     MEV_ARBITRAGE_RISK_THRESHOLD,
 };
+use shared::pricing_protection::{
+    compute_pricing_intervention as compute_market_protection_intervention,
+    validate_market_rate, PriceCoordinationFlag, MarketRateValidation, DemandAuthenticity,
+    PricingInterventionRecord as MarketProtectionRecord,
+};
 
 // ---------------------------------------------------------------------------
 // Storage key constants
@@ -399,6 +404,37 @@ impl OracleContract {
             .get::<_, TwapState>(&twap_key)
         {
             if twap_state.twap > 0 {
+                let market_val = validate_market_rate(price, twap_state.twap, cb_threshold as u32);
+                let coordination = PriceCoordinationFlag {
+                    suspicious: false,
+                    risk_score: 0,
+                    matching_price_count: 0,
+                    clustered_timing_count: 0,
+                };
+                let demand = DemandAuthenticity {
+                    genuine: true,
+                    distinct_requester_bps: 10_000,
+                    artificial_risk_score: 0,
+                    burst_count: 0,
+                };
+                let floor = twap_state.twap.saturating_div(2);
+                let ceiling = twap_state.twap.saturating_mul(2);
+                let intervention = compute_market_protection_intervention(
+                    &env,
+                    coordination,
+                    market_val,
+                    demand,
+                    twap_state.twap,
+                    floor,
+                    ceiling,
+                );
+
+                if intervention.intervene {
+                    let prot_key = (symbol_short!("MKT_PROT"), asset.clone());
+                    env.storage().persistent().set(&prot_key, &intervention);
+                    panic!("MarketProtectionTriggered");
+                }
+
                 let diff = if price > twap_state.twap {
                     price - twap_state.twap
                 } else {
@@ -417,6 +453,7 @@ impl OracleContract {
                 }
             }
         }
+
 
         // Store the reading in per-asset vec (one entry per submission; capped at MAX_POINTS).
         let key = (symbol_short!("PRICES"), asset.clone());
@@ -451,6 +488,12 @@ impl OracleContract {
 
         let _ = cb_trips_this_submission;
     }
+
+    pub fn get_market_protection_record(env: Env, asset: Symbol) -> Option<MarketProtectionRecord> {
+        let prot_key = (symbol_short!("MKT_PROT"), asset);
+        env.storage().persistent().get(&prot_key)
+    }
+
 
     // -----------------------------------------------------------------------
     // Price query (#614: heartbeat filter + outlier rejection + min_feeders)
@@ -1467,4 +1510,23 @@ mod tests {
         let result = client.verify_calendar_availability(&mentor, &5_000u64, &expected);
         assert!(!result.valid);
     }
+
+    #[test]
+    #[should_panic(expected = "MarketProtectionTriggered")]
+    fn test_market_protection_intervention_blocks_price_submission() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 3);
+        let asset = Symbol::new(&env, "USDC");
+
+        // Submit initial prices to establish a TWAP benchmark around 100
+        submit(&env, &client, &feeders.get(0).unwrap(), asset.clone(), 100, 100);
+        submit(&env, &client, &feeders.get(1).unwrap(), asset.clone(), 100, 100);
+        submit(&env, &client, &feeders.get(2).unwrap(), asset.clone(), 100, 100);
+
+        // Submit an excessively distorted price (e.g., 200, which is +100% deviation > 50% max deviation threshold)
+        // This must trigger MarketProtectionTriggered intervention
+        client.submit_price(&feeders.get(0).unwrap(), &asset, &200, &200);
+    }
 }
+
