@@ -257,7 +257,7 @@ pub fn distribute_sessions_fairly(
             // Calculate fairness score (lower workload = higher score)
             let capacity_remaining = MAX_CONCURRENT_SESSIONS - workload.active_sessions;
             let hours_remaining = MAX_WEEKLY_HOURS - workload.weekly_hours;
-            let difficulty_weight = DIFFICULTY_WEIGHTS[request.difficulty.clone() as u32 as usize];
+            let _difficulty_weight = DIFFICULTY_WEIGHTS[request.difficulty.clone() as u32 as usize];
             let weighted_load_factor = if workload.weekly_weighted_load > 0 {
                 10000 - (workload.weekly_weighted_load * 10000 / (MAX_WEEKLY_HOURS * 3)).min(10000)
             } else {

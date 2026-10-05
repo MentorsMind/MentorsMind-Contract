@@ -11,7 +11,7 @@ use shared::pause_guard::require_not_paused;
 use shared::{
     action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
     compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
-    correlate_attack_vectors, detect_coordinated_timing, detect_suspicious_pattern,
+    correlate_attack_vectors, detect_suspicious_pattern,
     exceeds_extraction_rate, push_snapshot_index, validate_amount_limits, CollusionDetection,
     EconomicVelocityReport, GameTheoryState, IncentiveCompatibilityResult, MultiVectorThreatReport,
     Pagination, PenaltyCalculation, ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath,
@@ -85,15 +85,6 @@ pub struct PendingAdminChange {
     pub effective_at: u64,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminChangeProposedEvent {
-    pub contract: Address,
-    pub old_admin: Address,
-    pub new_admin: Address,
-    pub effective_at: u64,
-}
-
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 
 /// Economic sanity ceiling for a single stake or reward-distribution
@@ -125,6 +116,7 @@ const MAX_EXTRACTION_RATE_BPS: u32 = 500; // 5% per epoch
 const MIN_SUSTAINABILITY_RATIO: u32 = 150; // 1.5x coverage required
 
 /// Maximum trading volume variance to detect coordination
+#[allow(dead_code)]
 const MAX_TRADING_VARIANCE_BPS: u32 = 750; // 7.5% deviation threshold
 
 /// Minimum time between large stake positions for coordination detection
@@ -3139,7 +3131,7 @@ impl StakingContract {
     pub fn detect_trading_coordination(
         env: Env,
         staker: Address,
-        amount: i128,
+        _amount: i128,
     ) -> Result<bool, Error> {
         let action_log: Vec<StakingActionRecord> = env
             .storage()
@@ -3180,10 +3172,10 @@ impl StakingContract {
 
         if let Some(stake_record) = staker_stake {
             let accumulation_bps = if total_staked > 0 {
-                ((stake_record.amount as u128)
+                (stake_record.amount as u128)
                     .checked_mul(10000)
                     .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
-                    .unwrap_or(10000))
+                    .unwrap_or(10000)
             } else {
                 0
             };
@@ -3332,10 +3324,10 @@ impl StakingContract {
         }
 
         let gini_bps = if total_staked > 0 {
-            ((top_10_pct as u128)
+            (top_10_pct as u128)
                 .checked_mul(10000)
                 .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
-                .unwrap_or(10000))
+                .unwrap_or(10000)
         } else {
             0
         };

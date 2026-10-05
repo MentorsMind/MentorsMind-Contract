@@ -142,7 +142,7 @@ pub fn calculate_grade_distribution(
     let mut variance_sum: u64 = 0;
     for grade in grades.iter() {
         let diff = if grade > mean { grade - mean } else { mean - grade };
-        variance_sum = variance_sum.saturating_add((diff as u64 * diff as u64));
+        variance_sum = variance_sum.saturating_add(diff as u64 * diff as u64);
     }
     let variance = if count > 1 { variance_sum / (count - 1) as u64 } else { 0 };
     let std_dev = integer_sqrt(variance) as u32;

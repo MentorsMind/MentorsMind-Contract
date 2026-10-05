@@ -4,7 +4,7 @@
 //! can use them before committing a state transition and persist the returned
 //! result for continuous monitoring.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
 
 pub const BPS_DENOMINATOR: i128 = 10_000;
 pub const MAX_REWARD_ROUNDING_ERROR: i128 = 1;

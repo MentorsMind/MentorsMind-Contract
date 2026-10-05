@@ -1,5 +1,5 @@
 
-use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, BytesN, contracterror};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, contracterror};
 
 /// Assessment Security Error Types
 #[contracterror]
@@ -77,10 +77,10 @@ impl AssessmentSecurity {
     /// Detect gaming patterns in learner assessment behavior
     pub fn detect_gaming_patterns(
         env: &Env,
-        learner: &Address,
-        assessment_id: Symbol,
-        completion_time: u64,
-        score: u32,
+        _learner: &Address,
+        _assessment_id: Symbol,
+        _completion_time: u64,
+        _score: u32,
         historical_data: &Vec<AssessmentRecord>,
     ) -> GamingDetectionResult {
         let mut flags: Vec<u32> = Vec::new(env);
@@ -162,11 +162,11 @@ impl AssessmentSecurity {
 
     /// Detect coordination patterns among learners
     pub fn detect_learner_coordination(
-        env: &Env,
-        learner1: &Address,
-        learner2: &Address,
-        shared_assessment: Symbol,
-        time_window_secs: u64,
+        _env: &Env,
+        _learner1: &Address,
+        _learner2: &Address,
+        _shared_assessment: Symbol,
+        _time_window_secs: u64,
     ) -> bool {
         // Check if completion times are suspiciously close
         // This would be implemented with actual assessment completion data
@@ -176,8 +176,8 @@ impl AssessmentSecurity {
 
     /// Verify integrity of assessment metrics
     pub fn verify_assessment_integrity(
-        env: &Env,
-        assessment_id: Symbol,
+        _env: &Env,
+        _assessment_id: Symbol,
         metrics: &AssessmentMetrics,
     ) -> bool {
         // Validate that metrics sum correctly
@@ -200,10 +200,10 @@ impl AssessmentSecurity {
 
     /// Automatically correct detected manipulations
     pub fn apply_correction_for_manipulation(
-        env: &Env,
-        learner: &Address,
-        assessment_id: Symbol,
-        correction_type: u32,
+        _env: &Env,
+        _learner: &Address,
+        _assessment_id: Symbol,
+        _correction_type: u32,
     ) -> bool {
         // Implementation depends on correction strategy
         // Could include: score adjustments, retry allowances, temporal delays, etc.
@@ -224,11 +224,11 @@ impl AssessmentSecurity {
         avg_interval < 3600
     }
 
-    fn count_recent_attempts(env: &Env, historical_data: &Vec<AssessmentRecord>) -> u32 {
+    fn count_recent_attempts(_env: &Env, historical_data: &Vec<AssessmentRecord>) -> u32 {
         historical_data.len() as u32
     }
 
-    fn has_suspicious_perfect_scores(env: &Env, historical_data: &Vec<AssessmentRecord>) -> bool {
+    fn has_suspicious_perfect_scores(_env: &Env, historical_data: &Vec<AssessmentRecord>) -> bool {
         if historical_data.len() < 3 {
             return false;
         }
@@ -244,7 +244,7 @@ impl AssessmentSecurity {
         perfect_count > (historical_data.len() as u32 / 2)
     }
 
-    fn detect_temporal_clustering(env: &Env, historical_data: &Vec<AssessmentRecord>) -> bool {
+    fn detect_temporal_clustering(_env: &Env, historical_data: &Vec<AssessmentRecord>) -> bool {
         if historical_data.len() < 3 {
             return false;
         }
@@ -254,12 +254,12 @@ impl AssessmentSecurity {
         true // Simplified implementation
     }
 
-    fn detect_anomalous_patterns(env: &Env, historical_data: &Vec<AssessmentRecord>) -> bool {
+    fn detect_anomalous_patterns(_env: &Env, _historical_data: &Vec<AssessmentRecord>) -> bool {
         // Check for patterns inconsistent with typical learning curves
         false // Simplified implementation
     }
 
-    fn calculate_average_interval(env: &Env, historical_data: &Vec<AssessmentRecord>) -> u64 {
+    fn calculate_average_interval(_env: &Env, historical_data: &Vec<AssessmentRecord>) -> u64 {
         if historical_data.len() < 2 {
             return 0;
         }
@@ -312,7 +312,7 @@ impl AssessmentSecurity {
     }
 
     fn verify_authentic_progression_logic(
-        env: &Env,
+        _env: &Env,
         sequence: &Vec<Symbol>,
         times: &Vec<u64>,
         scores: &Vec<u32>,
@@ -344,7 +344,7 @@ impl AssessmentSecurity {
         true
     }
 
-    fn calculate_authenticity_score(env: &Env, is_authentic: bool, scores: &Vec<u32>) -> u32 {
+    fn calculate_authenticity_score(_env: &Env, is_authentic: bool, scores: &Vec<u32>) -> u32 {
         if !is_authentic {
             return 20;
         }

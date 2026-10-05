@@ -952,7 +952,7 @@ impl EscrowContract {
                 let multiplier = Self::_price_multiplier_bps(price);
                 schedule
                     .tier0_bps
-                    .safe_mul(&env, multiplier as i128)
+                    .safe_mul(&env, multiplier)
                     .safe_div(&env, 10_000) as u32
             }
             None => Self::_legacy_fee_from_price(price),
@@ -1446,8 +1446,8 @@ impl EscrowContract {
 
             let multiplier = Self::_price_multiplier_bps(price);
             let scaled = tier_base
-                .safe_mul(env, multiplier as i128)
-                .safe_div(env, 10_000) as u32;
+                .safe_mul(env, multiplier)
+                .safe_div(env, 10_000);
             scaled.min(MAX_FEE_BPS)
         } else {
             tier_base
@@ -2201,8 +2201,8 @@ impl EscrowContract {
             let result = InsuranceClient::new(env, &insurance)
                 .try_get_coverage_ratio();
             let ok = match result {
-                Ok(ratio) => ratio > 0, // Coverage is available if ratio > 0
-                Err(_) => false,
+                Ok(Ok(ratio)) => ratio > 0, // Coverage is available if ratio > 0
+                _ => false,
             };
             if !ok {
                 return false;
@@ -3773,7 +3773,7 @@ impl EscrowContract {
         let mut result = Vec::new(&env);
 
         let count_u32 = count.min(u32::MAX as u64) as u32;
-        let (start, end) = Pagination::new(offset, limit).bounds(count_u32);
+        let (start, end) = Pagination::bounds(count_u32, offset, limit);
 
         // Escrow ids are 1-indexed; `start`/`end` are 0-indexed offsets
         // into the id space [1, count].
@@ -4479,7 +4479,7 @@ impl EscrowContract {
         }
 
         // --- Session uniqueness & replay protection (#1121) ---
-        let session_bytes: BytesN<32> = env.crypto().sha256(&session_id.to_xdr(&env)).into();
+        let session_bytes: BytesN<32> = env.crypto().sha256(&session_id.clone().to_xdr(&env)).into();
         let nonce_key = DataKey::UsedSessionNonce(session_bytes);
         let is_used = env.storage().persistent().has(&nonce_key);
         if !validate_session_nonce(1, 1, is_used) {
@@ -5862,7 +5862,7 @@ impl EscrowContract {
     /// Attempt automatic recovery for invalid states
     fn attempt_invalid_state_recovery(env: &Env, escrow_id: u64) -> Result<bool, &'static str> {
         let key = (symbol_short!("ESCROW"), escrow_id);
-        let mut escrow: Escrow = env.storage().persistent()
+        let escrow: Escrow = env.storage().persistent()
             .get(&key)
             .ok_or("Escrow not found")?;
         

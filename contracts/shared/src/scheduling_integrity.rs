@@ -11,7 +11,7 @@
 //! over data the caller already has on hand.
 
 use soroban_sdk::{
-    contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val, Vec,
+    contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 //! Protects against users importing fake credentials from other platforms,
 //! creating false cross-platform identities, or exploiting reputation bridging mechanisms.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
 
 /// Minimum reliability score (basis points) required for an external platform
 pub const MIN_PLATFORM_RELIABILITY_BPS: u32 = 6000; // 60%

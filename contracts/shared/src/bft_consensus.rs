@@ -1,8 +1,4 @@
-#![no_std]
-
-use soroban_sdk::{contracterror, contracttype, BytesN, Env, Symbol, Vec};
-
-use crate::vrf::{EpochInfo, VrfOutput};
+use soroban_sdk::{contracterror, contracttype, BytesN, Env, Vec};
 
 // ---------------------------------------------------------------------------
 // Practical Byzantine Fault Tolerant (pBFT) Consensus
@@ -186,7 +182,7 @@ pub fn start_round(
 pub fn cast_prepare(
     env: &Env,
     round: &mut ConsensusRound,
-    voter: &soroban_sdk::Address,
+    _voter: &soroban_sdk::Address,
     block_hash: &BytesN<32>,
 ) -> Result<(), ConsensusError> {
     if round.phase != ConsensusPhase::PrePrepare {
@@ -214,7 +210,7 @@ pub fn cast_prepare(
 pub fn cast_commit(
     env: &Env,
     round: &mut ConsensusRound,
-    voter: &soroban_sdk::Address,
+    _voter: &soroban_sdk::Address,
     block_hash: &BytesN<32>,
 ) -> Result<(), ConsensusError> {
     if round.phase != ConsensusPhase::Prepare {
@@ -281,7 +277,7 @@ pub fn is_round_expired(env: &Env, round: &ConsensusRound) -> bool {
 
 /// Verify that a quorum certificate is valid.
 pub fn verify_quorum_certificate(
-    env: &Env,
+    _env: &Env,
     qc: &QuorumCertificate,
     expected_block_hash: &BytesN<32>,
     expected_round: u64,

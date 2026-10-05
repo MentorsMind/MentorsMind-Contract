@@ -265,7 +265,7 @@ impl TransferSecurity {
     /// Monitor cross-platform fraud patterns
     pub fn monitor_fraud_patterns(
         env: &Env,
-        user: &Address,
+        _user: &Address,
         recent_transfers: &Vec<CredentialTransfer>,
         time_window_secs: u64,
     ) -> Vec<FraudDetectionResult> {
@@ -289,7 +289,7 @@ impl TransferSecurity {
     /// Apply transfer validation and corrections
     pub fn apply_transfer_validation(
         env: &Env,
-        transfer: &CredentialTransfer,
+        _transfer: &CredentialTransfer,
         validation_result: &TransferIntegrityResult,
     ) -> bool {
         if !validation_result.is_valid {
@@ -309,9 +309,9 @@ impl TransferSecurity {
 
     /// Restore integrity after fraud detection
     pub fn restore_transfer_integrity(
-        env: &Env,
-        affected_credential: Symbol,
-        fraud_type: u32,
+        _env: &Env,
+        _affected_credential: Symbol,
+        _fraud_type: u32,
     ) -> bool {
         // Implementations could include:
         // - Reverting fraudulent transfers
@@ -324,7 +324,7 @@ impl TransferSecurity {
 
     // Helper functions
 
-    fn detect_duplicate_transfers(env: &Env, credential_id: &Symbol) -> bool {
+    fn detect_duplicate_transfers(_env: &Env, _credential_id: &Symbol) -> bool {
         // Check if credential has been transferred multiple times
         false
     }
@@ -335,30 +335,30 @@ impl TransferSecurity {
         timestamp <= current
     }
 
-    fn verify_issuer_legitimacy(env: &Env, issuer: &Address) -> bool {
+    fn verify_issuer_legitimacy(_env: &Env, _issuer: &Address) -> bool {
         // Check if issuer is in registry of legitimate issuers
         true
     }
 
-    fn verify_holder_custody(env: &Env, credential_id: &Symbol, holder: &Address) -> bool {
+    fn verify_holder_custody(_env: &Env, _credential_id: &Symbol, _holder: &Address) -> bool {
         // Verify holder is legitimate last holder
         true
     }
 
-    fn detect_credential_anomalies(env: &Env, credential_id: &Symbol) -> bool {
+    fn detect_credential_anomalies(_env: &Env, _credential_id: &Symbol) -> bool {
         false
     }
 
-    fn verify_platform_credential(env: &Env, credential_id: &Symbol, platform: &Symbol) -> bool {
+    fn verify_platform_credential(_env: &Env, _credential_id: &Symbol, _platform: &Symbol) -> bool {
         true
     }
 
-    fn verify_cross_platform_consistency(env: &Env, credential_id: &Symbol) -> bool {
+    fn verify_cross_platform_consistency(_env: &Env, _credential_id: &Symbol) -> bool {
         true
     }
 
     fn detect_credit_inflation(
-        env: &Env,
+        _env: &Env,
         transfer: &CredentialTransfer,
         historical: &Vec<CredentialTransfer>,
     ) -> bool {
@@ -374,7 +374,7 @@ impl TransferSecurity {
     }
 
     fn verify_temporal_consistency(
-        env: &Env,
+        _env: &Env,
         transfer: &CredentialTransfer,
         historical: &Vec<CredentialTransfer>,
     ) -> bool {
@@ -390,27 +390,27 @@ impl TransferSecurity {
     }
 
     fn verify_platform_compatibility(
-        env: &Env,
-        source_platform: &Symbol,
-        destination_platform: &Symbol,
+        _env: &Env,
+        _source_platform: &Symbol,
+        _destination_platform: &Symbol,
     ) -> bool {
         // Check if platforms are compatible for transfers
         true
     }
 
-    fn verify_user_legitimacy(env: &Env, from_user: &Address, to_user: &Address) -> bool {
+    fn verify_user_legitimacy(_env: &Env, _from_user: &Address, _to_user: &Address) -> bool {
         // Check if users are not suspicious accounts
         true
     }
 
-    fn detect_coordination_patterns(env: &Env, user1: &Address, user2: &Address) -> bool {
+    fn detect_coordination_patterns(_env: &Env, _user1: &Address, _user2: &Address) -> bool {
         // Check for coordinated fraudulent activity between users
         false
     }
 
     fn analyze_transfer_for_fraud(
-        env: &Env,
-        transfer: &CredentialTransfer,
+        _env: &Env,
+        _transfer: &CredentialTransfer,
     ) -> FraudDetectionResult {
         // Analyze single transfer for fraud
         FraudDetectionResult {

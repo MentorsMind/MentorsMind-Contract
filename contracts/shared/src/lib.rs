@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 pub mod privacy;
 use soroban_sdk::contracterror;
@@ -79,6 +80,7 @@ pub mod bft_consensus;
 pub mod payment_integrity;
 pub mod threat_intelligence;
 pub mod tokenomics_protection;
+pub mod market_control_protection;
 
 // Content protection modules 
 pub mod content_protection;

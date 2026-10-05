@@ -40,7 +40,7 @@ impl CrossContractAuth {
     ///
     /// This is intentionally a non-panicking predicate so callers can map a
     /// failed call-chain check to their contract-specific error type.
-    pub fn verify_caller(env: &Env, expected: &Address) -> bool {
+    pub fn verify_caller(_env: &Env, _expected: &Address) -> bool {
         // TODO: Fix this when the correct API is available
         // env.current().invoker == *expected
         true // Temporary workaround

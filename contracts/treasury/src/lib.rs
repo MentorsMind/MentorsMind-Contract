@@ -241,6 +241,7 @@ pub struct TreasuryOperationLog {
     pub success: bool,
 }
 
+#[allow(dead_code)]
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 
 const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;

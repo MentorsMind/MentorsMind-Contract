@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Symbol, Vec};
+use soroban_sdk::{contracttype, Vec};
 
 /// Maximum number of detection events retained per session.
 pub const DETECTION_LOG_CAP: u32 = 20;
