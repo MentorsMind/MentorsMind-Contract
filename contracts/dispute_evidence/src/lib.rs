@@ -69,15 +69,7 @@ const APPEAL_PERIOD_SECS: u64 = 72 * 3600;
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowStatus {
-    Active,
-    Released,
-    Disputed,
-    Refunded,
-    Resolved,
-}
+pub use shared::EscrowStatus;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
