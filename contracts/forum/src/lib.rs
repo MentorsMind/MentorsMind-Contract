@@ -102,6 +102,15 @@ pub struct UserReputation {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForumStats {
+    pub total_posts: u32,
+    pub total_replies: u32,
+    pub active_posts: u32,
+    pub total_staked_mnt: i128,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
@@ -116,6 +125,10 @@ pub enum DataKey {
     CategoryPost(u32, u32), // category_id, post_id
     UserPost(Address, u32),
     UserReply(Address, u32),
+    TotalPosts,
+    TotalReplies,
+    ActivePosts,
+    TotalStakedMnt,
 }
 
 #[contract]
@@ -160,6 +173,10 @@ impl ForumContract {
             .set(&MODERATION_THRESHOLD, &mod_threshold);
         env.storage().persistent().set(&POST_COUNT, &0u32);
         env.storage().persistent().set(&CATEGORY_COUNT, &0u32);
+        env.storage().instance().set(&DataKey::TotalPosts, &0u32);
+        env.storage().instance().set(&DataKey::TotalReplies, &0u32);
+        env.storage().instance().set(&DataKey::ActivePosts, &0u32);
+        env.storage().instance().set(&DataKey::TotalStakedMnt, &0i128);
 
         // Create default categories
         Self::create_default_categories(&env);
@@ -257,6 +274,16 @@ impl ForumContract {
         // Update category post count
         Self::update_category_post_count(&env, category_id, 1);
 
+        // Update forum stats
+        let total_posts: u32 = env.storage().instance().get(&DataKey::TotalPosts).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalPosts, &(total_posts.saturating_add(1)));
+
+        let active_posts: u32 = env.storage().instance().get(&DataKey::ActivePosts).unwrap_or(0);
+        env.storage().instance().set(&DataKey::ActivePosts, &(active_posts.saturating_add(1)));
+
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStakedMnt).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStakedMnt, &(total_staked.saturating_add(stake_amount)));
+
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("POST_CR"), count),
             (author, post_type_clone, category_id, stake_amount),
@@ -331,6 +358,13 @@ impl ForumContract {
             replies_created: rep.replies_created + 1,
             ..rep
         });
+
+        // Update forum stats
+        let total_replies: u32 = env.storage().instance().get(&DataKey::TotalReplies).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalReplies, &(total_replies.saturating_add(1)));
+
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStakedMnt).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStakedMnt, &(total_staked.saturating_add(stake_amount)));
 
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("REPLY_CR"), reply_id),
@@ -560,12 +594,30 @@ impl ForumContract {
                 .expect("moderation count overflow");
 
             match action {
-                ModerationAction::Hide => post.status = PostStatus::Hidden,
+                ModerationAction::Hide => {
+                    if post.status == PostStatus::Active {
+                        let active: u32 = env.storage().instance().get(&DataKey::ActivePosts).unwrap_or(0);
+                        if active > 0 {
+                            env.storage().instance().set(&DataKey::ActivePosts, &(active - 1));
+                        }
+                    }
+                    post.status = PostStatus::Hidden;
+                }
                 ModerationAction::Lock => post.status = PostStatus::Locked,
                 ModerationAction::Delete => {
+                    if post.status == PostStatus::Active {
+                        let active: u32 = env.storage().instance().get(&DataKey::ActivePosts).unwrap_or(0);
+                        if active > 0 {
+                            env.storage().instance().set(&DataKey::ActivePosts, &(active - 1));
+                        }
+                    }
                     post.status = PostStatus::Deleted;
                     // Refund stakes proportionally
                     let refund_amount = post.stake_amount / 2;
+                    let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStakedMnt).unwrap_or(0);
+                    let new_staked = (total_staked - refund_amount).max(0);
+                    env.storage().instance().set(&DataKey::TotalStakedMnt, &new_staked);
+
                     Self::transfer_tokens(
                         &env,
                         &env.current_contract_address(),
@@ -630,6 +682,20 @@ impl ForumContract {
     }
 
     // View functions
+    pub fn get_forum_stats(env: Env) -> ForumStats {
+        let total_posts: u32 = env.storage().instance().get(&DataKey::TotalPosts).unwrap_or(0);
+        let total_replies: u32 = env.storage().instance().get(&DataKey::TotalReplies).unwrap_or(0);
+        let active_posts: u32 = env.storage().instance().get(&DataKey::ActivePosts).unwrap_or(0);
+        let total_staked_mnt: i128 = env.storage().instance().get(&DataKey::TotalStakedMnt).unwrap_or(0);
+
+        ForumStats {
+            total_posts,
+            total_replies,
+            active_posts,
+            total_staked_mnt,
+        }
+    }
+
     pub fn get_post(env: Env, id: u32) -> Post {
         env.storage()
             .persistent()
@@ -1013,4 +1079,117 @@ mod tests {
         let responder_rep = forum.get_user_reputation(&responder);
         assert_eq!(responder_rep.reputation, 50); // Best answer bonus
     }
+
+    #[test]
+    fn test_forum_stats_tracking() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author1 = Address::generate(&env);
+        let author2 = Address::generate(&env);
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
+
+        // Initial stats must be zero
+        let initial_stats = forum.get_forum_stats();
+        assert_eq!(initial_stats.total_posts, 0);
+        assert_eq!(initial_stats.total_replies, 0);
+        assert_eq!(initial_stats.active_posts, 0);
+        assert_eq!(initial_stats.total_staked_mnt, 0);
+
+        token.mint(&author1, &10_000_000i128);
+        token.mint(&author2, &10_000_000i128);
+
+        // Post 1: stake 1_000_000
+        let title1 = Bytes::from_slice(&env, b"Post 1");
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let post1_id = forum.create_post(
+            &author1,
+            &title1,
+            &hash1,
+            &PostType::Discussion,
+            &1,
+            &1_000_000i128,
+        );
+
+        let stats_post1 = forum.get_forum_stats();
+        assert_eq!(stats_post1.total_posts, 1);
+        assert_eq!(stats_post1.active_posts, 1);
+        assert_eq!(stats_post1.total_replies, 0);
+        assert_eq!(stats_post1.total_staked_mnt, 1_000_000i128);
+
+        // Post 2: stake 2_000_000
+        let title2 = Bytes::from_slice(&env, b"Post 2");
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        forum.create_post(
+            &author2,
+            &title2,
+            &hash2,
+            &PostType::Question,
+            &1,
+            &2_000_000i128,
+        );
+
+        let stats_post2 = forum.get_forum_stats();
+        assert_eq!(stats_post2.total_posts, 2);
+        assert_eq!(stats_post2.active_posts, 2);
+        assert_eq!(stats_post2.total_replies, 0);
+        assert_eq!(stats_post2.total_staked_mnt, 3_000_000i128);
+
+        // Reply to Post 1: stake 1_000_000
+        let reply_hash = BytesN::from_array(&env, &[3u8; 32]);
+        forum.create_reply(&author2, &post1_id, &reply_hash, &1_000_000i128);
+
+        let stats_reply = forum.get_forum_stats();
+        assert_eq!(stats_reply.total_posts, 2);
+        assert_eq!(stats_reply.active_posts, 2);
+        assert_eq!(stats_reply.total_replies, 1);
+        assert_eq!(stats_reply.total_staked_mnt, 4_000_000i128);
+
+        // Give admin enough reputation for moderation
+        let user_rep_key = DataKey::UserReputation(admin.clone());
+        env.as_contract(&forum_id, || {
+            env.storage().persistent().set(
+                &user_rep_key,
+                &UserReputation {
+                    address: admin.clone(),
+                    reputation: 100,
+                    posts_created: 0,
+                    replies_created: 0,
+                    upvotes_received: 0,
+                    downvotes_received: 0,
+                    moderation_actions: 0,
+                },
+            );
+        });
+
+        // Moderate post 1 to Delete -> active posts should decrement to 1, stake refunded by half (500_000)
+        let reason = Bytes::from_slice(&env, b"violation");
+        forum.moderate_content(
+            &admin,
+            &post1_id,
+            &false,
+            &ModerationAction::Delete,
+            &reason,
+        );
+
+        let stats_moderated = forum.get_forum_stats();
+        assert_eq!(stats_moderated.total_posts, 2); // total historical posts unchanged
+        assert_eq!(stats_moderated.active_posts, 1); // active posts decremented
+        assert_eq!(stats_moderated.total_replies, 1);
+        assert_eq!(stats_moderated.total_staked_mnt, 3_500_000i128);
+    }
 }
+
