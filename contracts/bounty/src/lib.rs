@@ -5,9 +5,10 @@ use shared::events::{
     evt_bounty_refunded, evt_bounty_verified,
 };
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::pause_guard::require_not_paused;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Val, Vec,
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol, Val,
+    Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,8 @@ pub enum DataKey {
     BountyLock(u32),
     /// Address of the health dashboard for metric reporting.
     HealthDashboard,
+    /// Pause guardian contract for circuit-breaker functionality (#1288).
+    PauseGuardian,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +201,30 @@ impl BountyContract {
         env.storage()
             .persistent()
             .set(&DataKey::HealthDashboard, &health_dashboard);
+    }
+
+    /// Set or update the pause guardian address for circuit breaker. Admin only (#1288).
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized: not admin");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseGuardian, &guardian);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PauseGuardian, TTL_THRESHOLD, TTL_BUMP);
+    }
+
+    /// Retrieve the current pause guardian address if configured (#1288).
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PauseGuardian)
     }
 
     /// Post a new bounty with milestones. Transfers `reward` tokens from poster to this contract.
@@ -408,6 +435,14 @@ impl BountyContract {
         learner: Address,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let lock_key = DataKey::BountyLock(bounty_id);
         if env.storage().persistent().get(&lock_key).unwrap_or(false) {
             panic!("Bounty is locked");
@@ -523,6 +558,18 @@ impl BountyContract {
         );
     }
 
+    /// Verify a learner claim and distribute remaining reward.
+    /// Alias for verify_completion to satisfy the verify_claim interface (#1288).
+    pub fn verify_claim(
+        env: Env,
+        mentor: Address,
+        bounty_id: u32,
+        learner: Address,
+        reviewer_notes_hash: BytesN<32>,
+    ) {
+        Self::verify_completion(env, mentor, bounty_id, learner, reviewer_notes_hash);
+    }
+
     /// Verify a single milestone for a learner, releasing the proportional reward.
     /// Different learners can complete different milestones (collaborative bounties).
     pub fn verify_milestone(
@@ -533,6 +580,14 @@ impl BountyContract {
         milestone_index: u32,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let lock_key = DataKey::BountyLock(bounty_id);
         if env.storage().persistent().get(&lock_key).unwrap_or(false) {
             panic!("Bounty is locked");
@@ -924,7 +979,35 @@ mod test {
     }
 
     use mock_token::{MockToken, MockTokenClient};
-    use mock_verification::{MockVerification, MockVerificationClient};
+    use mock_verification::MockVerification;
+
+    mod mock_guardian {
+        use soroban_sdk::{contract, contractimpl, contracttype, Env};
+
+        #[contracttype]
+        pub enum GuardianKey {
+            Paused,
+        }
+
+        #[contract]
+        pub struct MockGuardian;
+
+        #[contractimpl]
+        impl MockGuardian {
+            pub fn is_paused(env: Env) -> bool {
+                env.storage()
+                    .instance()
+                    .get(&GuardianKey::Paused)
+                    .unwrap_or(false)
+            }
+
+            pub fn set_paused(env: Env, paused: bool) {
+                env.storage().instance().set(&GuardianKey::Paused, &paused);
+            }
+        }
+    }
+
+    use mock_guardian::{MockGuardian, MockGuardianClient};
 
     struct TestFixture {
         env: Env,
@@ -945,7 +1028,7 @@ mod test {
             // Set a base timestamp
             env.ledger().set(LedgerInfo {
                 timestamp: 1_000_000,
-                protocol_version: 21,
+                protocol_version: 25,
                 sequence_number: 100,
                 network_id: Default::default(),
                 base_reserve: 10,
@@ -994,6 +1077,10 @@ mod test {
             self.env.ledger().timestamp() + 7 * 24 * 60 * 60 // 1 week
         }
 
+        fn dummy_hash(&self) -> BytesN<32> {
+            BytesN::from_array(&self.env, &[42u8; 32])
+        }
+
         fn default_milestones(&self) -> Vec<Milestone> {
             let mut ms = Vec::new(&self.env);
             ms.push_back(Milestone {
@@ -1040,7 +1127,7 @@ mod test {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
 
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
 
         let bounty = f.client().get_bounty(&id);
         assert_eq!(bounty.status, BountyStatus::Claimed);
@@ -1053,8 +1140,8 @@ mod test {
     fn test_verify_completion_releases_reward() {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
-        f.client().claim_bounty(&f.learner, &id);
-        f.client().verify_completion(&f.mentor, &id, &f.learner);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+        f.client().verify_completion(&f.mentor, &id, &f.learner, &f.dummy_hash());
 
         let bounty = f.client().get_bounty(&id);
         assert_eq!(bounty.status, BountyStatus::Verified);
@@ -1071,11 +1158,11 @@ mod test {
         let id = f.post_default_bounty();
 
         let learner2 = Address::generate(&f.env);
-        f.client().claim_bounty(&f.learner, &id);
-        f.client().claim_bounty(&learner2, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+        f.client().claim_bounty(&learner2, &id, &f.dummy_hash(), &f.dummy_hash());
 
         // Verify first learner
-        f.client().verify_completion(&f.mentor, &id, &f.learner);
+        f.client().verify_completion(&f.mentor, &id, &f.learner, &f.dummy_hash());
 
         let bounty = f.client().get_bounty(&id);
         assert_eq!(bounty.winner, Some(f.learner.clone()));
@@ -1087,17 +1174,17 @@ mod test {
     fn test_verify_twice_panics() {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
-        f.client().claim_bounty(&f.learner, &id);
-        f.client().verify_completion(&f.mentor, &id, &f.learner);
-        f.client().verify_completion(&f.mentor, &id, &f.learner);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+        f.client().verify_completion(&f.mentor, &id, &f.learner, &f.dummy_hash());
+        f.client().verify_completion(&f.mentor, &id, &f.learner, &f.dummy_hash());
     }
 
     #[test]
     fn test_dispute_completion() {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
-        f.client().claim_bounty(&f.learner, &id);
-        f.client().dispute_completion(&id, &f.learner);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+        f.client().dispute_completion(&id, &f.learner, &f.dummy_hash());
 
         let bounty = f.client().get_bounty(&id);
         assert_eq!(bounty.status, BountyStatus::Disputed);
@@ -1111,12 +1198,12 @@ mod test {
     fn test_dispute_after_window_panics() {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
 
         // Advance time past 48h dispute window; keep sequence within TTL_BUMP range
         f.env.ledger().set(LedgerInfo {
             timestamp: f.env.ledger().timestamp() + DISPUTE_WINDOW + 1,
-            protocol_version: 21,
+            protocol_version: 25,
             sequence_number: 200,
             network_id: Default::default(),
             base_reserve: 10,
@@ -1125,7 +1212,7 @@ mod test {
             max_entry_ttl: 10_000_000,
         });
 
-        f.client().dispute_completion(&id, &f.learner);
+        f.client().dispute_completion(&id, &f.learner, &f.dummy_hash());
     }
 
     #[test]
@@ -1150,7 +1237,7 @@ mod test {
         // Advance time past deadline; keep sequence within TTL_BUMP range
         f.env.ledger().set(LedgerInfo {
             timestamp: f.deadline() + 1,
-            protocol_version: 21,
+            protocol_version: 25,
             sequence_number: 200,
             network_id: Default::default(),
             base_reserve: 10,
@@ -1185,7 +1272,7 @@ mod test {
         // Advance time past deadline; keep sequence within TTL_BUMP range
         f.env.ledger().set(LedgerInfo {
             timestamp: f.deadline() + 1,
-            protocol_version: 21,
+            protocol_version: 25,
             sequence_number: 200,
             network_id: Default::default(),
             base_reserve: 10,
@@ -1194,7 +1281,7 @@ mod test {
             max_entry_ttl: 10_000_000,
         });
 
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
     }
 
     #[test]
@@ -1202,21 +1289,21 @@ mod test {
     fn test_double_claim_panics() {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
-        f.client().claim_bounty(&f.learner, &id);
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
     }
 
     #[test]
     fn test_ttl_renewal_preserves_claim_and_bounty_state() {
         let f = TestFixture::setup();
         let id = f.post_default_bounty();
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
 
         // Jump the ledger sequence substantially; entries should still be
         // available because write operations bump persistent TTL.
         f.env.ledger().set(LedgerInfo {
             timestamp: f.env.ledger().timestamp() + 60,
-            protocol_version: 21,
+            protocol_version: 25,
             sequence_number: 500_100,
             network_id: Default::default(),
             base_reserve: 10,
@@ -1238,7 +1325,7 @@ mod test {
         // Move to a later sequence while staying within configured max TTL.
         f.env.ledger().set(LedgerInfo {
             timestamp: f.env.ledger().timestamp() + 120,
-            protocol_version: 21,
+            protocol_version: 25,
             sequence_number: 700_200,
             network_id: Default::default(),
             base_reserve: 10,
@@ -1351,10 +1438,10 @@ mod test {
             &milestones,
         );
 
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
 
         // Verify first milestone (30% = 30_000)
-        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32, &f.dummy_hash());
         assert_eq!(f.token().balance(&f.learner), 30_000);
         assert_eq!(f.token().balance(&f.bounty_id), 70_000);
 
@@ -1392,15 +1479,15 @@ mod test {
             &milestones,
         );
 
-        f.client().claim_bounty(&f.learner, &id);
-        f.client().claim_bounty(&learner2, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+        f.client().claim_bounty(&learner2, &id, &f.dummy_hash(), &f.dummy_hash());
 
         // Learner1 completes milestone 0 (40% = 40_000)
-        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32, &f.dummy_hash());
         assert_eq!(f.token().balance(&f.learner), 40_000);
 
         // Learner2 completes milestone 1 (60% = 60_000)
-        f.client().verify_milestone(&f.mentor, &id, &learner2, &1u32);
+        f.client().verify_milestone(&f.mentor, &id, &learner2, &1u32, &f.dummy_hash());
         assert_eq!(f.token().balance(&learner2), 60_000);
 
         // Bounty should be fully verified now
@@ -1435,10 +1522,10 @@ mod test {
             &milestones,
         );
 
-        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
 
         // Verify first milestone (30% = 30_000)
-        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32, &f.dummy_hash());
         assert_eq!(f.token().balance(&f.learner), 30_000);
         assert_eq!(f.token().balance(&f.bounty_id), 70_000);
 
@@ -1453,7 +1540,7 @@ mod test {
         // Advance past deadline
         f.env.ledger().set(LedgerInfo {
             timestamp: f.deadline() + 1,
-            protocol_version: 21,
+            protocol_version: 25,
             sequence_number: 200,
             network_id: Default::default(),
             base_reserve: 10,
@@ -1466,6 +1553,125 @@ mod test {
         assert_eq!(f.token().balance(&f.poster), 900_000); // 1M - 100k posted
         f.client().refund_bounty(&id);
         assert_eq!(f.token().balance(&f.poster), 970_000); // 900k + 70k refund
+        assert_eq!(f.token().balance(&f.bounty_id), 0);
+    }
+
+    // ── Pause Guardian tests (#1288) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_set_and_get_pause_guardian() {
+        let f = TestFixture::setup();
+        let guardian = f.env.register_contract(None, MockGuardian);
+
+        assert_eq!(f.client().get_pause_guardian(), None);
+
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        assert_eq!(f.client().get_pause_guardian(), Some(guardian));
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized: not admin")]
+    fn test_set_pause_guardian_non_admin_panics() {
+        let f = TestFixture::setup();
+        let guardian = f.env.register_contract(None, MockGuardian);
+        let non_admin = Address::generate(&f.env);
+
+        f.client().set_pause_guardian(&non_admin, &guardian);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_pause_guardian_blocks_verify_completion() {
+        let f = TestFixture::setup();
+        let guardian = f.env.register_contract(None, MockGuardian);
+        let guardian_client = MockGuardianClient::new(&f.env, &guardian);
+
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        guardian_client.set_paused(&true);
+
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+
+        // Should panic with "Contract is paused"
+        f.client().verify_completion(&f.mentor, &id, &f.learner, &f.dummy_hash());
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_pause_guardian_blocks_verify_milestone() {
+        let f = TestFixture::setup();
+        let guardian = f.env.register_contract(None, MockGuardian);
+        let guardian_client = MockGuardianClient::new(&f.env, &guardian);
+
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        guardian_client.set_paused(&true);
+
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 5000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 5000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "PausedMilestone"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+
+        // Should panic with "Contract is paused"
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32, &f.dummy_hash());
+    }
+
+    #[test]
+    fn test_unpause_restores_reward_distribution() {
+        let f = TestFixture::setup();
+        let guardian = f.env.register_contract(None, MockGuardian);
+        let guardian_client = MockGuardianClient::new(&f.env, &guardian);
+
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        guardian_client.set_paused(&true);
+
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+
+        // Unpause guardian
+        guardian_client.set_paused(&false);
+
+        // Verification and reward distribution succeeds now
+        f.client().verify_completion(&f.mentor, &id, &f.learner, &f.dummy_hash());
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Verified);
+        assert_eq!(f.token().balance(&f.learner), 100_000);
+        assert_eq!(f.token().balance(&f.bounty_id), 0);
+    }
+
+    #[test]
+    fn test_verify_claim_alias_works() {
+        let f = TestFixture::setup();
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id, &f.dummy_hash(), &f.dummy_hash());
+
+        // verify_claim calls verify_completion internally
+        f.client().verify_claim(&f.mentor, &id, &f.learner, &f.dummy_hash());
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Verified);
+        assert_eq!(f.token().balance(&f.learner), 100_000);
         assert_eq!(f.token().balance(&f.bounty_id), 0);
     }
 }
