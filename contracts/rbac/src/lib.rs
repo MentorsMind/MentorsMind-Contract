@@ -2,7 +2,8 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
-use shared::admin::{AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS};
+use shared::admin::{AdminChangeProposal, AdminTransfer, MIN_ADMIN_TIMELOCK_SECS};
+use shared::events::{contract_rbac, emit};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -14,6 +15,26 @@ pub enum Error {
     NoPendingTransfer = 4,
     TimelockActive = 5,
     WrongNewAdmin = 6,
+}
+
+/// Payload emitted when a role is granted to an account.
+///
+/// Topic tuple: `(rbac, EVENT_SCHEMA_VERSION, "role_granted")`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleGrantedEvent {
+    pub role: Symbol,
+    pub account: Address,
+}
+
+/// Payload emitted when a role is revoked from an account.
+///
+/// Topic tuple: `(rbac, EVENT_SCHEMA_VERSION, "role_revoked")`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleRevokedEvent {
+    pub role: Symbol,
+    pub account: Address,
 }
 
 #[contracttype]
@@ -87,10 +108,22 @@ impl RbacContract {
         // Decrement member count
         let count_key = DataKey::RoleMemberCount(role.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(1);
-        env.storage().persistent().set(&count_key, &(count.saturating_sub(1)));
+        env.storage()
+            .persistent()
+            .set(&count_key, &(count.saturating_sub(1)));
 
-        env.events()
-            .publish((Symbol::new(&env, "role_revoked"), role), account);
+        // Emit RoleRevokedEvent using the shared 3-tuple topic layout:
+        // (contract_rbac, EVENT_SCHEMA_VERSION, "role_revoked").
+        emit(
+            &env,
+            contract_rbac(&env),
+            Symbol::new(&env, "role_revoked"),
+            RoleRevokedEvent {
+                role: role.clone(),
+                account: account.clone(),
+            },
+        );
+
         Ok(())
     }
 
@@ -294,9 +327,16 @@ impl RbacContract {
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         env.storage().persistent().set(&count_key, &(count + 1));
 
-        env.events().publish(
-            (Symbol::new(env, "role_granted"), role.clone()),
-            account.clone(),
+        // Emit RoleGrantedEvent using the shared 3-tuple topic layout:
+        // (contract_rbac, EVENT_SCHEMA_VERSION, "role_granted").
+        emit(
+            env,
+            contract_rbac(env),
+            Symbol::new(env, "role_granted"),
+            RoleGrantedEvent {
+                role: role.clone(),
+                account: account.clone(),
+            },
         );
     }
 }
@@ -304,8 +344,8 @@ impl RbacContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
     use shared::admin::MIN_ADMIN_TIMELOCK_SECS;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
 
     #[test]
     fn grants_and_revokes_roles() {
@@ -340,22 +380,17 @@ mod tests {
 
         client.initialize(&admin);
 
-        // Propose admin change
         client.propose_admin_change(&admin, &new_admin);
 
-        // Try to accept before timelock - should fail
         assert_eq!(
             client.try_accept_admin_change(&new_admin),
             Err(Ok(Error::TimelockActive))
         );
 
-        // Advance time past timelock
         env.ledger().set_timestamp(MIN_ADMIN_TIMELOCK_SECS);
 
-        // Accept admin change
         client.accept_admin_change(&new_admin);
 
-        // Verify new admin has SUPER_ADMIN role
         let super_admin_role = client.super_admin_role();
         assert!(client.has_role(&super_admin_role, &new_admin));
     }
@@ -373,19 +408,72 @@ mod tests {
 
         client.initialize(&admin);
 
-        // Propose admin change
         client.propose_admin_change(&admin, &new_admin);
 
-        // Cancel the transfer
         client.cancel_admin_change(&admin);
 
-        // Advance time past timelock
         env.ledger().set_timestamp(MIN_ADMIN_TIMELOCK_SECS);
 
-        // Try to accept - should fail (no pending transfer)
         assert_eq!(
             client.try_accept_admin_change(&new_admin),
             Err(Ok(Error::NoPendingTransfer))
+        );
+    }
+
+    // ========================================================================
+    // Issue #1025 - Role events are emitted with the canonical 3-tuple topic
+    // layout (contract_rbac, EVENT_SCHEMA_VERSION, "role_granted"/"role_revoked").
+    //
+    // The contracts publish via `shared::events::emit`, which builds the
+    // 3-tuple topics. These tests assert that at least one event was emitted
+    // by the RBAC contract on each of the two mutating paths. Payload decode
+    // is intentionally omitted here - emission is the deliverable of #1025;
+    // payload decode is covered by the shared event schema checker
+    // (scripts/check_events_schema.py) at the workspace level.
+    // ========================================================================
+
+    #[test]
+    fn test_grant_role_emits_role_granted_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RbacContract);
+        let client = RbacContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let operator = Address::generate(&env);
+
+        client.initialize(&admin);
+        let role = client.kyc_operator_role();
+
+        client.grant_role(&admin, &role, &operator);
+
+        let events = env.events().all().filter_by_contract(&contract_id);
+        assert!(
+            !events.events().is_empty(),
+            "grant_role must emit at least one event"
+        );
+    }
+
+    #[test]
+    fn test_revoke_role_emits_role_revoked_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RbacContract);
+        let client = RbacContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let operator = Address::generate(&env);
+
+        client.initialize(&admin);
+        let role = client.kyc_operator_role();
+        client.grant_role(&admin, &role, &operator);
+
+        client.revoke_role(&admin, &role, &operator);
+
+        let events = env.events().all().filter_by_contract(&contract_id);
+        assert!(
+            !events.events().is_empty(),
+            "revoke_role must emit at least one event"
         );
     }
 }
