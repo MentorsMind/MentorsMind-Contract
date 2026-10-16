@@ -108,15 +108,13 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 // ---------------------------------------------------------------------------
 
 #[contractevent]
-#[derive(Clone)]
-struct ScoreUpdatedEvent {
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreUpdatedEvent {
     #[topic]
-    category: Symbol,
-    #[topic]
-    action: Symbol,
-    #[topic]
-    user: Address,
-    score: u32,
+    pub address: Address,
+    pub old_score: u32,
+    pub new_score: u32,
+    pub reason: Symbol,
 }
 
 #[contract]
@@ -172,6 +170,7 @@ impl CreditScoreContract {
             panic!("Unauthorized");
         }
 
+        let old_score = Self::get_score(env.clone(), user.clone());
         let clamped = score.clamp(MIN_SCORE, MAX_SCORE);
         env.storage()
             .persistent()
@@ -180,12 +179,12 @@ impl CreditScoreContract {
         Self::append_history(&env, user.clone(), clamped, reason.clone());
 
         ScoreUpdatedEvent {
-            category: symbol_short!("score"),
-            action: symbol_short!("set"),
-            user,
-            score: clamped,
+            address: user,
+            old_score,
+            new_score: clamped,
+            reason,
         }
-        .publish(env);
+        .publish(&env);
     }
 
     pub fn refresh_score(env: Env, user: Address) {
@@ -198,6 +197,7 @@ impl CreditScoreContract {
             panic!("Rate limited: once per day");
         }
 
+        let old_score = Self::get_score(env.clone(), user.clone());
         let (score, breakdown) = Self::do_compute(env.clone(), user.clone());
 
         env.storage()
@@ -220,10 +220,10 @@ impl CreditScoreContract {
         Self::append_history(&env, user.clone(), score, symbol_short!("refresh"));
 
         ScoreUpdatedEvent {
-            category: symbol_short!("score"),
-            action: symbol_short!("updated"),
-            user,
-            score,
+            address: user,
+            old_score,
+            new_score: score,
+            reason: symbol_short!("refresh"),
         }
         .publish(&env);
     }
@@ -420,13 +420,13 @@ impl CreditScoreContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
 
     #[contract]
     pub struct MockEscrow;
     #[contractimpl]
     impl MockEscrow {
-        pub fn mentor(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
+        pub fn get_escrows_by_mentor(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
             let mut v = Vec::new(&env);
             v.push_back(Escrow {
                 id: 1,
@@ -435,7 +435,7 @@ mod test {
                 amount: 1000,
                 session_id: symbol_short!("S1"),
                 status: EscrowStatus::Released,
-                created_at: env.ledger().timestamp() - (100 * 86400),
+                created_at: env.ledger().timestamp().saturating_sub(100 * 86400),
                 token_address: Address::generate(&env),
                 platform_fee: 0,
                 net_amount: 1000,
@@ -452,8 +452,14 @@ mod test {
             });
             v
         }
-        pub fn learner(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
+        pub fn get_escrows_by_learner(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
             Vec::new(&env)
+        }
+        pub fn mentor(env: Env, u: Address, p: u32, ps: u32) -> Vec<Escrow> {
+            Self::get_escrows_by_mentor(env, u, p, ps)
+        }
+        pub fn learner(env: Env, u: Address, p: u32, ps: u32) -> Vec<Escrow> {
+            Self::get_escrows_by_learner(env, u, p, ps)
         }
     }
 
@@ -475,7 +481,7 @@ mod test {
     #[test]
     fn test_perfect_flow() {
         let env = Env::default();
-        env.ledger().set_timestamp(1_000_000);
+        env.ledger().set_timestamp(20_000_000);
         let admin = Address::generate(&env);
         let escrow = env.register_contract(None, MockEscrow);
         let staking = env.register_contract(None, MockStaking);
@@ -493,6 +499,53 @@ mod test {
         let breakdown = client.get_score_breakdown(&user);
         assert_eq!(breakdown.staking_amount, 55);
         assert_eq!(breakdown.session_completion, 165);
+    }
+
+    #[test]
+    fn test_score_updated_events_emitted() {
+        let env = Env::default();
+        env.ledger().set_timestamp(20_000_000);
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        let reason = Symbol::new(&env, "kyc_verify");
+        client.set_score(&admin, &user, &650, &reason);
+
+        // Inspect emitted events
+        let contract_events = env.events().all().filter_by_contract(&cid);
+        assert!(!contract_events.events().is_empty(), "Events should be emitted");
+        let last_event = contract_events.events().last().unwrap();
+
+        match &last_event.body {
+            soroban_sdk::xdr::ContractEventBody::V0(v0) => {
+                assert_eq!(v0.topics.len(), 2);
+                if let soroban_sdk::xdr::ScVal::Map(Some(entries)) = &v0.data {
+                    let mut found_old = false;
+                    let mut found_new = false;
+                    let mut found_reason = false;
+                    for entry in entries.0.iter() {
+                        if let soroban_sdk::xdr::ScVal::Symbol(k) = &entry.key {
+                            if k.to_utf8_string().unwrap() == "old_score" {
+                                assert_eq!(entry.val, soroban_sdk::xdr::ScVal::U32(300));
+                                found_old = true;
+                            } else if k.to_utf8_string().unwrap() == "new_score" {
+                                assert_eq!(entry.val, soroban_sdk::xdr::ScVal::U32(650));
+                                found_new = true;
+                            } else if k.to_utf8_string().unwrap() == "reason" {
+                                if let soroban_sdk::xdr::ScVal::Symbol(r) = &entry.val {
+                                    assert_eq!(r.to_utf8_string().unwrap(), "kyc_verify");
+                                    found_reason = true;
+                                }
+                            }
+                        }
+                    }
+                    assert!(found_old && found_new && found_reason, "All event fields must be present");
+                } else {
+                    panic!("expected Map for event data");
+                }
+            }
+        }
     }
 
     #[test]
