@@ -8,6 +8,7 @@ use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_min_bond, key_cooldown_days,
     DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
+    Pagination,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,18 +82,14 @@ pub enum DataKey {
     Bond(Address),
     SlashHistory(Address),
     PerfectSessionsCount(Address),
+    SlashCount(Address),
+    SlashIndex(Address, u32),
 }
 
 // ---------------------------------------------------------------------------
 // Compile-time fallbacks (used when governance hasn't acted)
 // ---------------------------------------------------------------------------
 const COOLDOWN_SECONDS_DEFAULT: u64 = (DEFAULT_COOLDOWN_DAYS as u64) * 86_400;
-
-// Slash amounts (with 7 decimals)
-#[allow(dead_code)]
-const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
-#[allow(dead_code)]
-const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -265,16 +262,32 @@ impl PerformanceBondContract {
             .get(&DataKey::SlashHistory(mentor.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        history.push_back(SlashEvent {
+        let event = SlashEvent {
             amount,
             reason: reason.clone(),
             timestamp: env.ledger().timestamp(),
             slash_count_at_time: record.slash_count,
-        });
+        };
+
+        history.push_back(event.clone());
 
         env.storage()
             .persistent()
             .set(&DataKey::SlashHistory(mentor.clone()), &history);
+
+        // Maintain sequential index for bounded pagination (#1272)
+        let slash_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashCount(mentor.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashIndex(mentor.clone(), slash_count), &event);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashCount(mentor.clone()), &(slash_count + 1));
+
         env.storage()
             .persistent()
             .set(&DataKey::PerfectSessionsCount(mentor.clone()), &0u32);
@@ -308,6 +321,38 @@ impl PerformanceBondContract {
             .persistent()
             .get(&DataKey::SlashHistory(mentor))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return total number of slashes recorded for a mentor (#1272).
+    pub fn get_slash_count(env: Env, mentor: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashCount(mentor))
+            .unwrap_or(0)
+    }
+
+    /// Return a paginated page of a mentor's slash history (#1272).
+    ///
+    /// The page window is resolved via `Pagination::bounds` and clamped to `MAX_PAGE_SIZE`.
+    pub fn get_slash_history_page(
+        env: Env,
+        mentor: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<SlashEvent> {
+        let total = Self::get_slash_count(env.clone(), mentor.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut page = Vec::new(&env);
+        for idx in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, SlashEvent>(&DataKey::SlashIndex(mentor.clone(), idx))
+            {
+                page.push_back(event);
+            }
+        }
+        page
     }
 
     /// Record a perfect 5-star session for mentor recovery.
@@ -593,5 +638,99 @@ mod test {
 
         // Now bonded
         assert!(f.client().is_bonded(&mentor));
+    }
+
+    #[test]
+    fn test_slash_history_accumulation_and_count() {
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 500_000_000);
+        f.client().post_bond(&mentor, &500_000_000);
+
+        // Initially zero slashes
+        assert_eq!(f.client().get_slash_count(&mentor), 0);
+        assert_eq!(f.client().get_slash_history_page(&mentor, &0, &10).len(), 0);
+
+        // Slash 1: 10 MNT
+        f.client()
+            .slash_bond(&mentor, &10_000_000, &symbol_short!("no_show"));
+        assert_eq!(f.client().get_slash_count(&mentor), 1);
+
+        // Slash 2: 50 MNT
+        f.client()
+            .slash_bond(&mentor, &50_000_000, &symbol_short!("dispute"));
+        assert_eq!(f.client().get_slash_count(&mentor), 2);
+
+        // Slash 3: 20 MNT
+        f.client()
+            .slash_bond(&mentor, &20_000_000, &symbol_short!("breach"));
+        assert_eq!(f.client().get_slash_count(&mentor), 3);
+
+        // Verify full history matches sequential index count
+        let history = f.client().get_slash_history(&mentor);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.get(0).unwrap().amount, 10_000_000);
+        assert_eq!(history.get(1).unwrap().amount, 50_000_000);
+        assert_eq!(history.get(2).unwrap().amount, 20_000_000);
+    }
+
+    #[test]
+    fn test_slash_history_pagination() {
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 500_000_000);
+        f.client().post_bond(&mentor, &500_000_000);
+
+        // Slash 3 times
+        f.client()
+            .slash_bond(&mentor, &10_000_000, &symbol_short!("slash1"));
+        f.client()
+            .slash_bond(&mentor, &20_000_000, &symbol_short!("slash2"));
+        f.client()
+            .slash_bond(&mentor, &30_000_000, &symbol_short!("slash3"));
+
+        // Page 1: offset=0, limit=2 -> should return first 2
+        let p1 = f.client().get_slash_history_page(&mentor, &0, &2);
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1.get(0).unwrap().amount, 10_000_000);
+        assert_eq!(p1.get(1).unwrap().amount, 20_000_000);
+
+        // Page 2: offset=2, limit=2 -> should return 3rd item only
+        let p2 = f.client().get_slash_history_page(&mentor, &2, &2);
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2.get(0).unwrap().amount, 30_000_000);
+
+        // Page past end: offset=3, limit=2 -> empty
+        let p3 = f.client().get_slash_history_page(&mentor, &3, &2);
+        assert_eq!(p3.len(), 0);
+
+        // Huge offset: offset=50, limit=10 -> empty
+        let p4 = f.client().get_slash_history_page(&mentor, &50, &10);
+        assert_eq!(p4.len(), 0);
+
+        // Limit clamped to MAX_PAGE_SIZE: limit=1000 with offset=0 -> returns all 3
+        let p_all = f.client().get_slash_history_page(&mentor, &0, &1000);
+        assert_eq!(p_all.len(), 3);
+    }
+
+    #[test]
+    fn test_slash_history_preserved_after_full_slash() {
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 100_000_000);
+        f.client().post_bond(&mentor, &100_000_000);
+
+        f.client()
+            .slash_bond(&mentor, &100_000_000, &symbol_short!("fraud"));
+
+        // Bond is removed
+        assert!(!f.client().is_bonded(&mentor));
+
+        // But slash history and pagination remain accessible for governance review
+        assert_eq!(f.client().get_slash_count(&mentor), 1);
+        let p = f.client().get_slash_history_page(&mentor, &0, &10);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.get(0).unwrap().amount, 100_000_000);
+        assert_eq!(p.get(0).unwrap().reason, symbol_short!("fraud"));
     }
 }
