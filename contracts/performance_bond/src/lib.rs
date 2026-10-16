@@ -8,6 +8,7 @@ use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_min_bond, key_cooldown_days,
     DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
+    ReentrancyGuard,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,12 +88,6 @@ pub enum DataKey {
 // Compile-time fallbacks (used when governance hasn't acted)
 // ---------------------------------------------------------------------------
 const COOLDOWN_SECONDS_DEFAULT: u64 = (DEFAULT_COOLDOWN_DAYS as u64) * 86_400;
-
-// Slash amounts (with 7 decimals)
-#[allow(dead_code)]
-const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
-#[allow(dead_code)]
-const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -249,7 +244,8 @@ impl PerformanceBondContract {
             .get(&DataKey::MntToken)
             .ok_or(Error::NotInitialized)?;
 
-        // Transfer slashed amount to insurance pool
+        // Transfer slashed amount to insurance pool with ReentrancyGuard (#1275)
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOND"));
         let token_client = token::Client::new(&env, &mnt_token);
         token_client.transfer(&env.current_contract_address(), &insurance_pool, &amount);
 
@@ -362,7 +358,8 @@ impl PerformanceBondContract {
             .get(&DataKey::MntToken)
             .ok_or(Error::NotInitialized)?;
 
-        // Transfer bond back to mentor
+        // Transfer bond back to mentor with ReentrancyGuard (#1275)
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOND"));
         let token_client = token::Client::new(&env, &mnt_token);
         token_client.transfer(&env.current_contract_address(), &mentor, &record.amount);
 
@@ -381,6 +378,21 @@ impl PerformanceBondContract {
         );
 
         Ok(())
+    }
+
+    /// Alias for `slash_bond` (#1275).
+    pub fn slash(
+        env: Env,
+        mentor: Address,
+        amount: i128,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        Self::slash_bond(env, mentor, amount, reason)
+    }
+
+    /// Alias for `release_bond` (#1275).
+    pub fn withdraw(env: Env, mentor: Address) -> Result<(), Error> {
+        Self::release_bond(env, mentor)
     }
 
     /// Get bond record for a mentor.
@@ -593,5 +605,51 @@ mod test {
 
         // Now bonded
         assert!(f.client().is_bonded(&mentor));
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract re-entry is not allowed")]
+    fn test_slash_reentrancy_blocked() {
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 200_000_000);
+        f.client().post_bond(&mentor, &200_000_000);
+
+        f.env.as_contract(&f.bond_id, || {
+            let _guard = shared::ReentrancyGuard::enter(&f.env, symbol_short!("BOND"));
+            f.client().slash(&mentor, &10_000_000, &symbol_short!("no_show"));
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract re-entry is not allowed")]
+    fn test_withdraw_reentrancy_blocked() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(0);
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 100_000_000);
+        f.client().post_bond(&mentor, &100_000_000);
+        f.env.ledger().set_timestamp(31 * 86_400);
+
+        f.env.as_contract(&f.bond_id, || {
+            let _guard = shared::ReentrancyGuard::enter(&f.env, symbol_short!("BOND"));
+            f.client().withdraw(&mentor);
+        });
+    }
+
+    #[test]
+    fn test_slash_and_withdraw_aliases_work() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(0);
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 200_000_000);
+        f.client().post_bond(&mentor, &200_000_000);
+
+        f.client().slash(&mentor, &50_000_000, &symbol_short!("dispute"));
+        assert_eq!(f.client().get_bond(&mentor).amount, 150_000_000);
+
+        f.env.ledger().set_timestamp(31 * 86_400);
+        f.client().withdraw(&mentor);
+        assert!(!f.client().is_bonded(&mentor));
     }
 }
