@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
     compute_checksum, compute_justice_intervention, protect_arbitration_fairness,

@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 pub mod privacy;
 use soroban_sdk::contracterror;

@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::events::{
     emit_staking_event, evt_staking_staked, evt_staking_unstaked, evt_staking_admin_proposed,
