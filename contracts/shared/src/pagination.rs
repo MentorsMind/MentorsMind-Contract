@@ -164,12 +164,48 @@ mod tests {
     }
 
     #[test]
-    fn operation_budget_allows_up_to_max() {
-        let mut budget = OperationBudget::new(3);
-        assert!(budget.consume().is_ok());
-        assert!(budget.consume().is_ok());
-        assert!(budget.consume().is_ok());
+    fn operation_budget_succeeds_exactly_max_times() {
+        let max = 3;
+        let mut budget = OperationBudget::new(max);
+
+        for _ in 0..max {
+            assert_eq!(budget.consume(), Ok(()));
+        }
+
+        assert_eq!(budget.consumed(), max);
+    }
+
+    #[test]
+    fn operation_budget_rejects_max_plus_one_consume() {
+        let max = 3;
+        let mut budget = OperationBudget::new(max);
+
+        for _ in 0..max {
+            budget.consume().unwrap();
+        }
+
         assert_eq!(budget.consume(), Err(BudgetExceeded));
-        assert_eq!(budget.consumed(), 3);
+        assert_eq!(budget.consumed(), max);
+    }
+
+    #[test]
+    fn operation_budget_with_zero_max_fails_immediately() {
+        let mut budget = OperationBudget::new(0);
+
+        assert_eq!(budget.consume(), Err(BudgetExceeded));
+        assert_eq!(budget.consumed(), 0);
+    }
+
+    #[test]
+    fn operation_budget_remaining_decrements_after_consumption() {
+        let mut budget = OperationBudget::new(3);
+
+        assert_eq!(budget.remaining(), 3);
+        budget.consume().unwrap();
+        assert_eq!(budget.remaining(), 2);
+        budget.consume().unwrap();
+        assert_eq!(budget.remaining(), 1);
+        budget.consume().unwrap();
+        assert_eq!(budget.remaining(), 0);
     }
 }
