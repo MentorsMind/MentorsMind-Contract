@@ -89,8 +89,8 @@ pub mod usage_rights_management;
 
 pub use pagination::{BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE};
 pub use pause_guard::{
-    is_paused, is_paused_local, pause, pause_guardian, pause_state, require_not_paused,
-    require_not_paused_local, require_pause_guardian, set_pause_guardian, set_paused, unpause,
+    is_paused, is_paused_local, pause, pause_guard_is_paused, pause_guardian, pause_state, require_not_paused,
+    require_not_paused_local, require_not_paused_locally, require_pause_guardian, set_pause_guardian, set_paused, unpause,
     PauseState,
 };
 

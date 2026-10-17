@@ -629,7 +629,7 @@ mod tests {
         DataDependencyTracker::clear_dependency(&env, op_id.clone(), &sample_key);
         assert!(!DataDependencyTracker::is_dependency_active(
             &env,
-            op_id,
+            op_id.clone(),
             &sample_key
         ));
         assert!(!DataDependencyTracker::is_dependency_active(&env, op_id.clone(), &sample_key));

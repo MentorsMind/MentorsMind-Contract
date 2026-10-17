@@ -249,7 +249,7 @@ mod tests {
     extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::Ledger,
         Env,
     };
 
@@ -289,8 +289,11 @@ mod tests {
     #[test]
     fn test_initial_nonce_is_zero() {
         let env = env_at(1_000);
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
         let signer = Address::generate(&env);
-        assert_eq!(current_nonce(&env, &signer), 0);
+        env.as_contract(&contract_id, || {
+            assert_eq!(current_nonce(&env, &signer), 0);
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -427,8 +430,8 @@ mod tests {
         let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
         let signer = Address::generate(&env);
 
-        env.as_contract(&contract_id, || {
-            for expected_nonce in 0u64..5 {
+        for expected_nonce in 0u64..5 {
+            env.as_contract(&contract_id, || {
                 assert_eq!(current_nonce(&env, &signer), expected_nonce);
                 let payload = make_payload(
                     &env,
@@ -438,7 +441,9 @@ mod tests {
                 );
                 let new_nonce = validate_and_consume_nonce(&env, &signer, &payload);
                 assert_eq!(new_nonce, expected_nonce + 1);
-            }
+            });
+        }
+        env.as_contract(&contract_id, || {
             assert_eq!(current_nonce(&env, &signer), 5);
         });
     }
@@ -499,6 +504,97 @@ mod tests {
         );
 
         env.as_contract(&contract_id, || {
+            validate_and_consume_nonce(&env, &signer, &payload);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1273: validate_and_consume_nonce deadline & replay protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "sig: expired")]
+    fn test_validate_and_consume_nonce_deadline_expired_now_minus_one() {
+        let env = Env::default();
+        let now = 10_000u64;
+        env.ledger().with_mut(|li| li.timestamp = now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        // deadline = now - 1 verifies rejection (already expired)
+        let payload = make_payload(&env, contract_id.clone(), 0, now - 1);
+
+        env.as_contract(&contract_id, || {
+            validate_and_consume_nonce(&env, &signer, &payload);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "sig: deadline too far")]
+    fn test_validate_and_consume_nonce_deadline_too_far_in_future() {
+        let env = Env::default();
+        let now = 10_000u64;
+        env.ledger().with_mut(|li| li.timestamp = now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        // deadline = now + MAX_DEADLINE_SECS + 1 verifies rejection (too far in future)
+        let payload = make_payload(
+            &env,
+            contract_id.clone(),
+            0,
+            now + MAX_DEADLINE_SECS + 1,
+        );
+
+        env.as_contract(&contract_id, || {
+            validate_and_consume_nonce(&env, &signer, &payload);
+        });
+    }
+
+    #[test]
+    fn test_validate_and_consume_nonce_valid_deadline_increments_nonce() {
+        let env = Env::default();
+        let now = 10_000u64;
+        env.ledger().with_mut(|li| li.timestamp = now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        // Valid deadline within tolerance and ceiling
+        let valid_deadline = now + 3_600;
+        let payload = make_payload(&env, contract_id.clone(), 0, valid_deadline);
+
+        env.as_contract(&contract_id, || {
+            assert_eq!(current_nonce(&env, &signer), 0);
+            let next_nonce = validate_and_consume_nonce(&env, &signer, &payload);
+            assert_eq!(next_nonce, 1);
+            assert_eq!(current_nonce(&env, &signer), 1);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "sig: invalid nonce")]
+    fn test_validate_and_consume_nonce_replaying_same_nonce_rejected() {
+        let env = Env::default();
+        let now = 10_000u64;
+        env.ledger().with_mut(|li| li.timestamp = now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        let valid_deadline = now + 3_600;
+        let payload = make_payload(&env, contract_id.clone(), 0, valid_deadline);
+
+        env.as_contract(&contract_id, || {
+            // First submission verifies acceptance
+            validate_and_consume_nonce(&env, &signer, &payload);
+            // Replaying with the same nonce verifies rejection
             validate_and_consume_nonce(&env, &signer, &payload);
         });
     }
@@ -576,19 +672,23 @@ mod tests {
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
 
+        // Alice submits nonce=0
         env.as_contract(&contract_id, || {
-            // Alice submits nonce=0
             let pa = make_payload(&env, contract_id.clone(), 0, 1_000 + 3_600);
             validate_and_consume_nonce(&env, &alice, &pa);
             assert_eq!(current_nonce(&env, &alice), 1);
+        });
 
-            // Bob's nonce is still 0
+        // Bob's nonce is still 0
+        env.as_contract(&contract_id, || {
             assert_eq!(current_nonce(&env, &bob), 0);
             let pb = make_payload(&env, contract_id.clone(), 0, 1_000 + 3_600);
             validate_and_consume_nonce(&env, &bob, &pb);
             assert_eq!(current_nonce(&env, &bob), 1);
+        });
 
-            // Alice can now submit nonce=1
+        // Alice can now submit nonce=1
+        env.as_contract(&contract_id, || {
             let pa2 = make_payload(&env, contract_id.clone(), 1, 1_000 + 3_600);
             validate_and_consume_nonce(&env, &alice, &pa2);
             assert_eq!(current_nonce(&env, &alice), 2);
