@@ -101,17 +101,23 @@ const TTL_BUMP: u32 = 1_000_000;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when trying to initialize the governance contract more than once.
     AlreadyInitialized = 1,
+    /// Returned when an operation is invoked before governance initialization.
     NotInitialized = 2,
+    /// Returned when the caller does not have required administrative or voter authorization.
     Unauthorized = 3,
+    /// Returned when attempting to execute an admin change with no pending change registered.
     NoPendingAdminChange = 4,
+    /// Returned when executing an admin transfer before the required timelock delay has elapsed.
     AdminChangeNotYetEffective = 5,
+    /// Returned when the proposed admin address is invalid or unchanged.
     InvalidAdminChange = 6,
-    /// Arbitrator was previously involved in a dispute between the same parties
+    /// Returned when the selected arbitrator was previously involved in a dispute between the same parties.
     ArbitratorConflict = 7,
-    /// Too many active proposals; cap reached
+    /// Returned when the number of concurrent active proposals reaches the maximum allowed cap.
     TooManyActiveProposals = 8,
-    /// Proposer has not held tokens for the minimum holding period
+    /// Returned when the proposer has not held governance tokens for the required minimum holding period.
     HoldingPeriodNotMet = 9,
 }
 
@@ -919,7 +925,7 @@ impl GovernanceContract {
         );
     }
 
-    /// Heuristic instruction/IO estimate for [`Self::vote`] on `proposal_id`
+    /// Heuristic instruction/IO estimate for `Self::vote` on `proposal_id`
     /// by `voter`, without mutating state. Mirrors `vote`'s actual read/write
     /// pattern (proposal lookup, already-voted check, snapshot-power lookup)
     /// plus one extra read+call if `voter` has a delegate configured

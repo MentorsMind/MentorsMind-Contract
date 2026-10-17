@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::token;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Timestamp security constants
@@ -35,14 +35,23 @@ const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when trying to initialize the vesting contract more than once.
     AlreadyInitialized = 1,
+    /// Returned when an operation is invoked before contract initialization.
     NotInitialized = 2,
+    /// Returned when the caller does not have required authorization.
     Unauthorized = 3,
+    /// Returned when schedule parameters (total, cliff, start, end) are inconsistent or invalid.
     InvalidSchedule = 4,
+    /// Returned when attempting to claim vested tokens but claimable amount is zero (e.g. before cliff).
     NothingToClaim = 5,
+    /// Returned when the queried vesting schedule is not found for the beneficiary.
     ScheduleNotFound = 6,
+    /// Returned when the contract does not hold sufficient token balance to satisfy the claim.
     InsufficientBalance = 7,
+    /// Returned when the vesting schedule has already been fully claimed.
     AlreadyClaimed = 8,
+    /// Returned when a merkle proof for airdrop or allocation verification is invalid.
     InvalidProof = 9,
 }
 

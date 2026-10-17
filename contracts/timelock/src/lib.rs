@@ -21,12 +21,19 @@ use soroban_sdk::xdr::ToXdr;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when trying to initialize the timelock contract more than once.
     AlreadyInitialized = 1,
+    /// Returned when an operation is invoked before timelock initialization.
     NotInitialized = 2,
+    /// Returned when the caller is not the contract administrator.
     NotAdmin = 3,
+    /// Returned when the queried operation hash is not found in the timelock registry.
     OperationNotFound = 4,
+    /// Returned when attempting to execute or modify an operation that has already been executed.
     AlreadyDone = 5,
+    /// Returned when attempting to execute an operation before its timelock delay has expired (`ready_at`).
     NotReady = 6,
+    /// Returned when a requested delay is less than `MIN_DELAY` or greater than `MAX_DELAY`.
     InvalidDelay = 7,
     /// Caller is not the registered guardian multisig (or none is registered).
     NotGuardian = 8,

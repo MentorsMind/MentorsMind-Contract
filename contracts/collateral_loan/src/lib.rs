@@ -4,8 +4,40 @@ use shared::pagination::Pagination;
 use shared::pause_guard;
 use shared::Validator;
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Returned when trying to initialize the collateral loan contract more than once.
+    AlreadyInitialized = 1,
+    /// Returned when an operation is invoked before contract initialization.
+    NotInitialized = 2,
+    /// Returned when the caller does not have required authorization.
+    Unauthorized = 3,
+    /// Returned when attempting to open a loan for a borrower who already has an open position.
+    LoanAlreadyExists = 4,
+    /// Returned when the posted collateral amount is insufficient to meet the minimum collateralization ratio.
+    InsufficientCollateralization = 5,
+    /// Returned when trying to operate on or repay a loan that is already fully repaid or closed.
+    LoanAlreadyRepaid = 6,
+    /// Returned when repayment amount is non-positive or insufficient.
+    InsufficientRepaymentAmount = 7,
+    /// Returned when attempting to liquidate a loan whose collateral ratio is at or above the liquidation threshold.
+    LoanHealthy = 8,
+    /// Returned when the price received from the oracle is non-positive or malformed.
+    InvalidOraclePrice = 9,
+    /// Returned when the oracle price timestamp exceeds the maximum allowed staleness window.
+    OraclePriceStale = 10,
+    /// Returned when configuring an invalid maximum price staleness duration.
+    InvalidStaleness = 11,
+}
 
 const MIN_COLLATERAL_RATIO_BPS: i128 = 15_000; // 150%
 /// Economic sanity ceiling for a single collateral/borrow/repay amount, in

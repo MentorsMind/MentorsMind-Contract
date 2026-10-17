@@ -33,28 +33,51 @@ use soroban_sdk::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when trying to initialize the staking contract more than once.
     AlreadyInitialized = 1,
+    /// Returned when an operation is attempted before the contract has been initialized.
     NotInitialized = 2,
+    /// Returned when a staking, unstaking, or reward amount is zero, negative, or exceeds economic boundaries.
     InvalidAmount = 3,
+    /// Returned when an account attempts to create a new stake while already having an active stake.
     AlreadyStaked = 4,
+    /// Returned when an operation is attempted for an account that has no active stake record.
     NoStakeFound = 5,
+    /// Returned when an unstake is attempted before the lock period has elapsed.
     StillLocked = 6,
+    /// Returned when attempting to execute an admin change with no pending change proposed.
     NoPendingAdminChange = 7,
+    /// Returned when executing an admin change before the required timelock delay has elapsed.
     AdminChangeNotYetEffective = 8,
+    /// Returned when the proposed admin address is invalid or identical to the current admin.
     InvalidAdminChange = 9,
+    /// Returned when the caller lacks required authorization or role permissions.
     Unauthorized = 10,
+    /// Returned when a distribution or reward callback is called by an address other than the configured Treasury.
     CallerNotTreasury = 11,
+    /// Returned when attempting to reprocess a reward distribution that has already been executed.
     DistributionAlreadyProcessed = 12,
+    /// Returned when the contract or stake transition violates state invariants.
     InvalidState = 13,
+    /// Returned when an arithmetic operation overflows or exceeds numeric limits.
     Overflow = 14,
+    /// Returned when inserting an entry that already exists in storage.
     DuplicateEntry = 15,
+    /// Returned when an operation requires an active Treasury contract address that has not been configured.
     TreasuryNotConfigured = 16,
+    /// Returned when post-operation state validation checks detect inconsistent invariants.
     StateValidationFailed = 17,
+    /// Returned when reentrancy guard detects re-entrant invocation or emergency pause.
     ReentrancyGuardPaused = 18,
+    /// Returned when a chosen staking lock duration is less than the protocol minimum duration.
     LockPeriodTooShort = 19,
+    /// Returned when attempting to claim or withdraw rewards before their lock or vesting cliff.
     RewardsStillLocked = 20,
+    /// Returned when attempting to claim rewards but accrued claimable rewards are zero.
     NoClaimableRewards = 21,
+    /// Returned when minimum stake duration has not been reached for the requested operation.
     MinDurationNotReached = 22,
+    /// Returned when a queried stake or voting checkpoint snapshot does not exist.
     SnapshotNotFound = 23,
 }
 
@@ -193,14 +216,14 @@ pub enum DataKey {
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
-    /// Serialised Vec<StakeSnapshot> for DR snapshot `n`.
+    /// Serialised `Vec<StakeSnapshot>` for DR snapshot `n`.
     StakeSnapshot(u32),
     /// SnapshotMeta for DR snapshot `n`.
     StakeSnapshotMeta(u32),
-    /// Ordered Vec<u32> of retained staking DR snapshot IDs.
+    /// Ordered `Vec<u32>` of retained staking DR snapshot IDs.
     StakeSnapshotIndex,
     NextStakeSnapshotId,
-    /// Vec<Address> of up to 7 emergency signers for staking rollback.
+    /// `Vec<Address>` of up to 7 emergency signers for staking rollback.
     StakeEmergencySigners,
     /// RollbackProposal for staking rollback proposal `n`.
     StakeRollbackProposal(u32),
@@ -1648,11 +1671,11 @@ impl StakingContract {
     /// Legacy batch-based distribution kept for existing callers/benchmarks.
     /// Distributes rewards to stakers pro-rata based on their *current*
     /// stake amounts, processing a window of stakers directly into
-    /// `PendingRewards`. Unlike [`distribute_revenue`] this does not use
+    /// `PendingRewards`. Unlike `distribute_revenue` this does not use
     /// epoch snapshots and remains vulnerable to reward dilution if new
     /// stakes occur between successive calls covering different windows —
     /// callers requiring dilution resistance should use
-    /// [`distribute_revenue`] instead.
+    /// `distribute_revenue` instead.
     pub fn distribute_revenue_batch(
         env: Env,
         token: Address,

@@ -112,7 +112,9 @@ use shared::session_uniqueness::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when session authentication or signature authorization fails.
     SessionAuthFailed = 1,
+    /// Returned when attempting to create an entry that already exists in storage.
     DuplicateEntry = 2,
 }
 
@@ -449,13 +451,13 @@ pub enum DataKey {
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
-    /// Serialised Vec<EscrowRecord> for snapshot `n`.
+    /// Serialised `Vec<EscrowRecord>` for snapshot `n`.
     Snapshot(u32),
     /// SnapshotMeta struct for snapshot `n`.
     SnapshotMetadata(u32),
-    /// Ordered Vec<u32> of active snapshot IDs (rolling window, max 3).
+    /// Ordered `Vec<u32>` of active snapshot IDs (rolling window, max 3).
     SnapshotIndex,
-    /// Vec<Address> of up to 7 emergency multi-sig signers.
+    /// `Vec<Address>` of up to 7 emergency multi-sig signers.
     EmergencySigners,
     /// EmergencyMultisig config (signers + threshold).
     EmergencyMultisigConfig,

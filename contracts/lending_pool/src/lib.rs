@@ -106,21 +106,37 @@ pub struct AuctionRecord {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when an operation is invoked before lending pool initialization.
     NotInitialized = 1,
+    /// Returned when trying to initialize the lending pool contract more than once.
     AlreadyInitialized = 2,
+    /// Returned when a user attempts to withdraw or borrow more funds than their deposited balance allows.
     InsufficientBalance = 3,
+    /// Returned when the pool lacks sufficient available token liquidity to fulfill a borrow or withdrawal.
     InsufficientLiquidity = 4,
+    /// Returned when the borrower's credit score is below the minimum required credit threshold.
     LowCreditScore = 5,
+    /// Returned when requested borrow amount exceeds the borrower's total allowed borrow ceiling.
     BorrowLimitExceeded = 6,
+    /// Returned when the requested loan record is not found for the specified borrower.
     LoanNotFound = 7,
+    /// Returned when attempting to repay, liquidate, or auction a loan that is already fully repaid.
     LoanAlreadyRepaid = 8,
+    /// Returned when the caller is not the contract administrator.
     NotAdmin = 9,
+    /// Returned when a deposit, borrow, or repayment amount is zero, negative, or invalid.
     InvalidAmount = 10,
+    /// Returned when a deposit and withdrawal are attempted within the same ledger sequence.
     SameBlockDepositWithdraw = 11,
+    /// Returned when aggregate borrows within a single ledger sequence exceed per-block safety limits.
     PerBlockBorrowLimitExceeded = 12,
+    /// Returned when attempting to liquidate or auction a loan that has not yet reached its due date or default state.
     LoanNotDue = 13,
+    /// Returned when the requested debt auction ID is not found.
     AuctionNotFound = 14,
+    /// Returned when attempting to start an auction for a loan that already has an active auction.
     AuctionAlreadyActive = 15,
+    /// Returned when attempting to bid on or settle an auction that has already been settled.
     AuctionAlreadySettled = 16,
 }
 

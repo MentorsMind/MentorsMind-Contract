@@ -132,31 +132,57 @@ pub struct BuybackDeferred {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Returned when trying to initialize the treasury contract more than once.
     AlreadyInitialized = 1,
+    /// Returned when an operation is invoked before treasury initialization.
     NotInitialized = 2,
+    /// Returned when the caller does not have administrative or authorized permissions.
     Unauthorized = 3,
+    /// Returned when treasury vault lacks sufficient token balance for the requested allocation or payout.
     InsufficientBalance = 4,
+    /// Returned when oracle reports an unhealthy feed, negative confidence, or invalid price.
     OracleUnhealthy = 5,
+    /// Returned when oracle price timestamp exceeds the allowed staleness window.
     OracleStale = 6,
+    /// Returned when attempting an operation with a token that is not on the treasury approved list.
     TokenNotApproved = 7,
+    /// Returned when minimum output amount specified for a swap is negative or zero.
     InvalidMinOut = 8,
+    /// Returned when calculated swap or allocation output is zero.
     ZeroOutput = 9,
+    /// Returned when swap execution returns fewer tokens than the required slippage limit.
     SlippageExceeded = 10,
+    /// Returned when an amount is non-positive, zero, or exceeds max financial boundaries.
     InvalidAmount = 11,
+    /// Returned when attempting to execute an admin change with no pending change registered.
     NoPendingAdminChange = 12,
+    /// Returned when executing an admin transfer before the required timelock delay has elapsed.
     AdminChangeNotYetEffective = 13,
+    /// Returned when the proposed new admin address is invalid or unchanged.
     InvalidAdminChange = 14,
+    /// Returned when the caller is not an authorized distributor or caller for the target operation.
     CallerNotAuthorized = 15,
+    /// Returned when a single allocation or daily budget exceeds configured treasury limits.
     AmountExceedsLimit = 16,
+    /// Returned when a batch distribution or grant tranche has already been executed.
     DistributionAlreadyProcessed = 17,
+    /// Returned when reentrancy guard detects re-entrant invocation or active emergency pause.
     ReentrancyGuardPaused = 18,
+    /// Returned when post-execution state checks detect conservation-of-funds or balance discrepancies.
     StateValidationFailed = 19,
+    /// Returned when the contract is in an inappropriate lifecycle state for the requested operation.
     InvalidState = 20,
+    /// Returned when an entry or recipient already exists in the active registry.
     DuplicateEntry = 21,
+    /// Returned when an arithmetic calculation overflows.
     Overflow = 22,
+    /// Returned when an extreme price deviation triggers the oracle circuit breaker.
     OracleCircuitBreaker = 23,
+    /// Returned when an action is attempted during an active rate-limiting or cooldown window.
     CoolingOffPeriod = 24,
+    /// Returned when attempting an action before the mandatory timelock delay has expired.
     TimelockNotExpired = 25,
+    /// Returned when operations are temporarily suspended during an admin transfer process.
     SuspendedDuringAdminTransfer = 26,
 }
 
@@ -1242,7 +1268,7 @@ impl TreasuryContract {
     /// reverts every transfer already made in this call — the batch either
     /// lands in full or not at all.
     ///
-    /// Unlike [`allocate`](Self::allocate), items above `MultisigThreshold`
+    /// Unlike `allocate`, items above `MultisigThreshold`
     /// are rejected outright rather than queued for approval — batch
     /// requests are for below-threshold, routine payouts; a large transfer
     /// should go through the single-item `allocate` pending-approval path.
