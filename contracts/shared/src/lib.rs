@@ -695,16 +695,18 @@ pub enum SharedError {
     ValidationError = 11,
     /// A cross-contract caller failed interface-registry verification.
     UnauthorizedContract = 12,
+    /// Division by zero attempted.
+    DivisionByZero = 13,
     /// Content access is denied due to insufficient permissions or invalid license.
-    ContentAccessDenied = 13,
+    ContentAccessDenied = 14,
     /// Intellectual property ownership cannot be verified or is disputed.
-    IPOwnershipInvalid = 14,
+    IPOwnershipInvalid = 15,
     /// Usage rights have been violated or exceeded allowed limits.
-    UsageRightsViolation = 15,
+    UsageRightsViolation = 16,
     /// Content encryption/decryption failed.
-    EncryptionError = 16,
+    EncryptionError = 17,
     /// Content piracy or unauthorized distribution detected.
-    PiracyDetected = 17,
+    PiracyDetected = 18,
 }
 
 // ---------------------------------------------------------------------------
