@@ -1,4 +1,5 @@
 #![no_std]
+use shared::Pagination;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol, Vec,
 };
@@ -228,6 +229,65 @@ impl RegulatoryReporting {
 
         env.events().publish((symbol_short!("reviewed"), report_id), report_id);
     }
+
+    /// Total number of large-transaction reports recorded so far.
+    pub fn get_report_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReportCount)
+            .unwrap_or(0)
+    }
+
+    /// Paginated view over every recorded report, regardless of review
+    /// status. `limit` is clamped to `MAX_PAGE_SIZE` so a caller can never
+    /// force a single call to enumerate the whole collection.
+    pub fn get_reports_page(env: Env, offset: u32, limit: u32) -> Vec<ReportTrigger> {
+        let total = Self::get_report_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out: Vec<ReportTrigger> = vec![&env];
+        // Reports are stored 1-indexed (DataKey::Report(1)..=DataKey::Report(total)).
+        for i in start..end {
+            if let Some(report) = env
+                .storage()
+                .persistent()
+                .get::<_, ReportTrigger>(&DataKey::Report(i + 1))
+            {
+                out.push_back(report);
+            }
+        }
+        out
+    }
+
+    /// Paginated view over reports that have not yet been marked reviewed,
+    /// returned alongside their report id so a caller can act on them (e.g.
+    /// via `mark_reviewed`). `limit` is clamped to `MAX_PAGE_SIZE`.
+    pub fn get_unreviewed_reports_page(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<(u32, ReportTrigger)> {
+        let total = Self::get_report_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out: Vec<(u32, ReportTrigger)> = vec![&env];
+        for i in start..end {
+            let report_id = i + 1;
+            let reviewed: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Reviewed(report_id))
+                .unwrap_or(false);
+            if !reviewed {
+                if let Some(report) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, ReportTrigger>(&DataKey::Report(report_id))
+                {
+                    out.push_back((report_id, report));
+                }
+            }
+        }
+        out
+    }
 }
 
 fn ts_to_year_month(ts: u64) -> (u32, u32) {
@@ -368,5 +428,104 @@ mod test {
 
         let records = c.get_all_records(&sender);
         assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn test_get_report_count_and_reports_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RegulatoryReporting);
+        let c = RegulatoryReportingClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        c.initialize(&admin, &escrow);
+
+        assert_eq!(c.get_report_count(), 0);
+
+        for i in 0..5u32 {
+            let trigger = ReportTrigger {
+                contract: symbol_short!("treasury"),
+                function: symbol_short!("transfer"),
+                address: Address::generate(&env),
+                amount_usd: 20_000i128 + i as i128,
+                timestamp: env.ledger().timestamp(),
+            };
+            c.record_large_tx(&trigger);
+        }
+
+        assert_eq!(c.get_report_count(), 5);
+
+        let page = c.get_reports_page(&0, &3);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.get(0).unwrap().amount_usd, 20_000i128);
+        assert_eq!(page.get(2).unwrap().amount_usd, 20_002i128);
+
+        let page2 = c.get_reports_page(&3, &3);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().amount_usd, 20_003i128);
+
+        // Out-of-range offset returns an empty page rather than panicking.
+        let empty = c.get_reports_page(&10, &3);
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn test_get_unreviewed_reports_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RegulatoryReporting);
+        let c = RegulatoryReportingClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        c.initialize(&admin, &escrow);
+
+        for i in 0..4u32 {
+            let trigger = ReportTrigger {
+                contract: symbol_short!("treasury"),
+                function: symbol_short!("transfer"),
+                address: Address::generate(&env),
+                amount_usd: 20_000i128 + i as i128,
+                timestamp: env.ledger().timestamp(),
+            };
+            c.record_large_tx(&trigger);
+        }
+
+        // Mark report id 2 (the second recorded report) reviewed.
+        c.mark_reviewed(&2u32);
+
+        let page = c.get_unreviewed_reports_page(&0, &10);
+        assert_eq!(page.len(), 3);
+        for (id, _report) in page.iter() {
+            assert_ne!(id, 2u32);
+        }
+    }
+
+    #[test]
+    fn test_reports_page_limit_clamped_to_max_page_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RegulatoryReporting);
+        let c = RegulatoryReportingClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        c.initialize(&admin, &escrow);
+
+        for _ in 0..60u32 {
+            let trigger = ReportTrigger {
+                contract: symbol_short!("treasury"),
+                function: symbol_short!("transfer"),
+                address: Address::generate(&env),
+                amount_usd: 20_000i128,
+                timestamp: env.ledger().timestamp(),
+            };
+            c.record_large_tx(&trigger);
+        }
+
+        // Requesting more than MAX_PAGE_SIZE (50) must be clamped.
+        let page = c.get_reports_page(&0, &1_000u32);
+        assert_eq!(page.len(), 50);
     }
 }
