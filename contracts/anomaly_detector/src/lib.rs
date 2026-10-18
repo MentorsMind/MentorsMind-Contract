@@ -1,10 +1,7 @@
 #![no_std]
 
-use shared::events::{
-    emit_anomaly_event, evt_anomaly_detected, evt_anomaly_hold_cleared, evt_anomaly_hold_placed,
-};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contractclient, contractevent, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +103,45 @@ const PERSISTENT_LIFETIME_THRESHOLD: u32 = 34560;  // ~14 days in ledgers
 const PERSISTENT_BUMP_AMOUNT: u32 = 7200;          // ~3 days in ledgers
 const HOLD_TTL: u32 = 864000;                       // Maximum TTL for hold flags
 const MAX_PAGE_SIZE: u32 = 100;                     // Maximum items per pagination page
+
+// ---------------------------------------------------------------------------
+// Events (#1241): typed `#[contractevent]`s replacing the deprecated
+// `env.events().publish()` calls previously routed through
+// `shared::events::emit_anomaly_event`.
+// ---------------------------------------------------------------------------
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldPlacedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    user: Address,
+    timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyDetectedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    user: Address,
+    timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldClearedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    user: Address,
+    timestamp: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Contract Client (#1263)
@@ -251,9 +287,21 @@ impl AnomalyDetectorContract {
         if result == AnomalyResult::Hold {
             env.storage().persistent().set(&DataKey::Hold(user.clone()), &true);
             env.storage().persistent().extend_ttl(&DataKey::Hold(user.clone()), PERSISTENT_LIFETIME_THRESHOLD, HOLD_TTL);
-            emit_anomaly_event(&env, evt_anomaly_hold_placed(&env), (user.clone(), env.ledger().timestamp()));
+            AnomalyHoldPlacedEvent {
+                category: symbol_short!("anomaly"),
+                action: Symbol::new(&env, "hold_placed"),
+                user: user.clone(),
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
         } else if result == AnomalyResult::Warning {
-            emit_anomaly_event(&env, evt_anomaly_detected(&env), (user.clone(), env.ledger().timestamp()));
+            AnomalyDetectedEvent {
+                category: symbol_short!("anomaly"),
+                action: Symbol::new(&env, "detected"),
+                user: user.clone(),
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(&env);
         }
 
         Ok(result)
@@ -268,7 +316,13 @@ impl AnomalyDetectorContract {
 
         env.storage().persistent().remove(&DataKey::Hold(user.clone()));
 
-        emit_anomaly_event(&env, evt_anomaly_hold_cleared(&env), (user.clone(), env.ledger().timestamp()));
+        AnomalyHoldClearedEvent {
+            category: symbol_short!("anomaly"),
+            action: Symbol::new(&env, "hold_cleared"),
+            user: user.clone(),
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -476,6 +530,42 @@ mod tests {
             .client()
             .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
         assert_eq!(result, AnomalyResult::Hold);
+    }
+
+    #[test]
+    fn test_hold_placed_event_is_typed_and_emitted() {
+        let f = Fixture::setup();
+        f.client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+
+        let events = f.env.events().all().filter_by_contract(&f.contract);
+        assert!(!events.events().is_empty(), "hold_placed event must be emitted");
+    }
+
+    #[test]
+    fn test_detected_event_is_typed_and_emitted() {
+        let f = Fixture::setup();
+        for _ in 0..10 {
+            f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        }
+        // 11th crosses the warn threshold and must emit a `detected` event.
+        f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+
+        let events = f.env.events().all().filter_by_contract(&f.contract);
+        assert!(!events.events().is_empty(), "detected event must be emitted");
+    }
+
+    #[test]
+    fn test_hold_cleared_event_is_typed_and_emitted() {
+        let f = Fixture::setup();
+        f.client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+        assert!(f.client().is_on_hold(&f.user));
+
+        f.client().clear_hold(&f.user);
+
+        let events = f.env.events().all().filter_by_contract(&f.contract);
+        assert!(!events.events().is_empty(), "hold_cleared event must be emitted");
     }
 
     #[test]
