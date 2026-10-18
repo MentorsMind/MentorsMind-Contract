@@ -967,6 +967,15 @@ impl OracleContract {
             panic!("unauthorized feeder");
         }
 
+        // Reject replay of a proof hash that has already been accepted.
+        // Without this, a single oracle-attested calendar-busy hash could be
+        // reused verbatim to "prove" availability for unrelated slots.
+        let used_key = (symbol_short!("CAL_USED"), proof_hash.clone());
+        if env.storage().persistent().has(&used_key) {
+            panic!("duplicate calendar proof");
+        }
+        env.storage().persistent().set(&used_key, &true);
+
         let key = (symbol_short!("CAL_PRF"), mentor, slot_start);
         env.storage()
             .persistent()
@@ -1498,6 +1507,46 @@ mod tests {
 
         let result = client.verify_calendar_availability(&mentor, &slot_start, &other_hash);
         assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_calendar_proof_rejects_stale_timestamp() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+        let mentor = Address::generate(&env);
+        let slot_start = 5_000u64;
+        let proof_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &proof_hash);
+
+        // Move the ledger clock past MAX_CONFLICT_PROOF_AGE_SECS (24h) after
+        // the proof was issued; it is still hash-correct but must now be
+        // rejected as stale.
+        env.ledger()
+            .set_timestamp(1_000 + shared::MAX_CONFLICT_PROOF_AGE_SECS + 1);
+
+        let result = client.verify_calendar_availability(&mentor, &slot_start, &proof_hash);
+        assert!(!result.within_freshness_window);
+        assert!(!result.valid);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate calendar proof")]
+    fn test_calendar_proof_rejects_duplicate_hash() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let proof_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor_a, &5_000u64, &proof_hash);
+        // Re-using the exact same proof hash for a different mentor/slot is a
+        // replay attempt and must be rejected.
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor_b, &6_000u64, &proof_hash);
     }
 
     #[test]
