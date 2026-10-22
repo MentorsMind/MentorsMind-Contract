@@ -362,11 +362,26 @@ impl AssessmentSecurity {
             variance += (diff * diff) as u64;
         }
 
-        let std_dev = ((variance / scores.len() as u64) as f64).sqrt();
+        let std_dev = isqrt(variance / scores.len() as u64);
 
         // Authentic learning shows variance; return higher scores for diverse results
-        (std_dev as u32).min(100)
+        std_dev.min(100) as u32
     }
+}
+
+/// Integer square root (Newton's method) — avoids `f64::sqrt`, which is not
+/// available on the no_std wasm target.
+fn isqrt(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 /// Assessment record structure

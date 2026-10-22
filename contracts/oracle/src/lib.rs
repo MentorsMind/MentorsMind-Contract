@@ -1577,5 +1577,87 @@ mod tests {
         // This must trigger MarketProtectionTriggered intervention
         client.submit_price(&feeders.get(0).unwrap(), &asset, &200, &200);
     }
+
+    // -----------------------------------------------------------------------
+    // validate_conflict_proof tests (#1239)
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a deterministic 32-byte hash from a seed byte.
+    fn make_hash(env: &Env, seed: u8) -> BytesN<32> {
+        let mut arr = [0u8; 32];
+        arr[0] = seed;
+        BytesN::from_array(env, &arr)
+    }
+
+    #[test]
+    fn test_conflict_proof_valid_accepted() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+
+        let mentor     = Address::generate(&env);
+        let slot_start = 1_000u64;
+        let hash       = make_hash(&env, 0xAB);
+
+        // Set timestamp so issued_at is within freshness window
+        env.ledger().set_timestamp(1_000);
+
+        // Advance past reorg-safe depth
+        env.ledger().with_mut(|l| l.sequence_number = ORACLE_REORG_SAFE_DEPTH + 1);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &hash);
+
+        // Verify within freshness window (same timestamp → age = 0)
+        let proof = client.verify_calendar_availability(&mentor, &slot_start, &hash);
+        assert!(proof.valid, "matching hash within freshness window must be valid");
+        assert!(proof.within_freshness_window, "must report within_freshness_window = true");
+    }
+
+    #[test]
+    fn test_conflict_proof_stale_timestamp_rejected() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+
+        let mentor     = Address::generate(&env);
+        let slot_start = 2_000u64;
+        let hash       = make_hash(&env, 0xCD);
+
+        // Submit the proof when ledger time == 0
+        env.ledger().set_timestamp(0);
+        env.ledger().with_mut(|l| l.sequence_number = ORACLE_REORG_SAFE_DEPTH + 1);
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &hash);
+
+        // Advance ledger past MAX_CONFLICT_PROOF_AGE_SECS (24 h = 86400 s)
+        let stale_ts = shared::MAX_CONFLICT_PROOF_AGE_SECS + 1;
+        env.ledger().set_timestamp(stale_ts);
+
+        let proof = client.verify_calendar_availability(&mentor, &slot_start, &hash);
+        assert!(!proof.valid, "proof outside freshness window must not be valid");
+        assert!(!proof.within_freshness_window, "must report within_freshness_window = false");
+    }
+
+    #[test]
+    fn test_conflict_proof_wrong_hash_rejected() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+
+        let mentor     = Address::generate(&env);
+        let slot_start = 3_000u64;
+        let stored_hash   = make_hash(&env, 0x01);
+        let different_hash = make_hash(&env, 0x02);
+
+        env.ledger().set_timestamp(1_000);
+        env.ledger().with_mut(|l| l.sequence_number = ORACLE_REORG_SAFE_DEPTH + 1);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &stored_hash);
+
+        // Verify with a different expected hash — should be rejected even though fresh
+        let proof = client.verify_calendar_availability(&mentor, &slot_start, &different_hash);
+        assert!(!proof.valid, "proof with mismatched hash must not be valid");
+        // The proof is still within the freshness window even if the hash differs
+        assert!(proof.within_freshness_window, "freshness window check is independent of hash match");
+    }
 }
 

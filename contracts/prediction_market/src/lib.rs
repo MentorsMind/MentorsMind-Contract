@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
+use shared::safe_math::SafeMath;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -25,6 +26,7 @@ pub enum Error {
     ProofRequired = 11,
     InsufficientOracleSignatures = 12,
     OracleAlreadyVoted = 13,
+    Overflow = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +78,7 @@ pub enum DataKey {
     ResolutionOracle(u32), // Stores the oracle address for a market
     ResolutionProof(u32),  // Stores the cryptographic proof for market resolution
     OracleVote(u32, Address), // Tracks oracle votes for multi-oracle consensus (market_id, oracle_address)
+    PauseGuardian,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +97,7 @@ const DEFAULT_LIQUIDITY_PARAMETER: i128 = 100_000_000_000_000_000; // 0.1 * SCAL
 /// x is in fixed-point format (scaled by 10^18).
 /// Accurate to ~0.01% for x in [-5, 5].
 /// Returns result in fixed-point format.
-fn exp_fixed_point(x: i128) -> i128 {
+fn exp_fixed_point(env: &Env, x: i128) -> i128 {
     if x == 0 {
         return FIXED_POINT_SCALE;
     }
@@ -114,14 +117,14 @@ fn exp_fixed_point(x: i128) -> i128 {
     // Taylor series: e^x = 1 + x + x^2/2! + x^3/3! + ... (10 terms)
     for n in 1..=10 {
         // term = x^n / n!
-        term = (x_power / (n as i128)) / FIXED_POINT_SCALE;
+        term = x_power.safe_div(env, n as i128).safe_div(env, FIXED_POINT_SCALE);
         if term == 0 {
             break;
         }
-        result = result + term;
+        result = result.safe_add(env, term);
 
         // Prepare next term: x_power = x^(n+1)
-        x_power = x_power * x / FIXED_POINT_SCALE;
+        x_power = x_power.safe_mul(env, x).safe_div(env, FIXED_POINT_SCALE);
     }
 
     result
@@ -129,7 +132,7 @@ fn exp_fixed_point(x: i128) -> i128 {
 
 /// Compute ln(x) in fixed-point format using Newton's method.
 /// x is in fixed-point format. Accurate for x > 0.
-fn ln_fixed_point(x: i128) -> i128 {
+fn ln_fixed_point(env: &Env, x: i128) -> i128 {
     if x <= 0 {
         panic!("ln of non-positive number");
     }
@@ -148,9 +151,9 @@ fn ln_fixed_point(x: i128) -> i128 {
             break;
         }
         prev_y = y;
-        let exp_y = exp_fixed_point(y);
-        let delta = (x - exp_y) / exp_y;
-        y = y + delta;
+        let exp_y = exp_fixed_point(env, y);
+        let delta = (x - exp_y).safe_div(env, exp_y);
+        y = y.safe_add(env, delta);
     }
 
     y
@@ -159,36 +162,36 @@ fn ln_fixed_point(x: i128) -> i128 {
 /// LMSR cost function: C(q_yes, q_no) = b * ln(e^(q_yes/b) + e^(q_no/b))
 /// where b is the liquidity parameter.
 /// Returns cost in fixed-point format.
-fn lmsr_cost(q_yes: i128, q_no: i128, b: i128) -> i128 {
-    let q_yes_scaled = q_yes * FIXED_POINT_SCALE / b;
-    let q_no_scaled = q_no * FIXED_POINT_SCALE / b;
+fn lmsr_cost(env: &Env, q_yes: i128, q_no: i128, b: i128) -> i128 {
+    let q_yes_scaled = q_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
+    let q_no_scaled = q_no.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
 
-    let exp_yes = exp_fixed_point(q_yes_scaled);
-    let exp_no = exp_fixed_point(q_no_scaled);
-    let sum = exp_yes + exp_no;
+    let exp_yes = exp_fixed_point(env, q_yes_scaled);
+    let exp_no = exp_fixed_point(env, q_no_scaled);
+    let sum = exp_yes.safe_add(env, exp_no);
 
-    let ln_sum = ln_fixed_point(sum);
-    b * ln_sum / FIXED_POINT_SCALE
+    let ln_sum = ln_fixed_point(env, sum);
+    b.safe_mul(env, ln_sum).safe_div(env, FIXED_POINT_SCALE)
 }
 
 /// Get current price for yes outcome as basis points (0-10000).
 /// price_yes = e^(q_yes/b) / (e^(q_yes/b) + e^(q_no/b))
-fn get_yes_price_bps(q_yes: i128, q_no: i128, b: i128) -> u32 {
-    let q_yes_scaled = q_yes * FIXED_POINT_SCALE / b;
-    let q_no_scaled = q_no * FIXED_POINT_SCALE / b;
+fn get_yes_price_bps(env: &Env, q_yes: i128, q_no: i128, b: i128) -> u32 {
+    let q_yes_scaled = q_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
+    let q_no_scaled = q_no.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
 
-    let exp_yes = exp_fixed_point(q_yes_scaled);
-    let exp_no = exp_fixed_point(q_no_scaled);
-    let sum = exp_yes + exp_no;
+    let exp_yes = exp_fixed_point(env, q_yes_scaled);
+    let exp_no = exp_fixed_point(env, q_no_scaled);
+    let sum = exp_yes.safe_add(env, exp_no);
 
     let price = if sum == 0 {
         FIXED_POINT_SCALE / 2 // Default to 50/50
     } else {
-        exp_yes * FIXED_POINT_SCALE / sum
+        exp_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, sum)
     };
 
     // Convert to basis points: [0, 10000]
-    let bps = price * 10000 / FIXED_POINT_SCALE;
+    let bps = price.safe_mul(env, 10000).safe_div(env, FIXED_POINT_SCALE);
     (bps as u32).min(10000)
 }
 
@@ -208,6 +211,26 @@ impl PredictionMarket {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MarketCount, &0u32);
+    }
+
+    /// Admin-only: set or update the pause-guardian contract address.
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PauseGuardian)
     }
 
     /// Create a new prediction market with LMSR AMM.
@@ -275,9 +298,15 @@ impl PredictionMarket {
 
     /// Place a bet on market outcome using LMSR pricing.
     /// Cost = C(new_state) - C(old_state) where C is LMSR cost function.
-    pub fn place_bet(env: Env, bettor: Address, market_id: u32, outcome: bool, amount: i128) {
+    pub fn place_bet(
+        env: Env,
+        bettor: Address,
+        market_id: u32,
+        outcome: bool,
+        amount: i128,
+    ) -> Result<(), Error> {
         if amount <= 0 {
-            panic!("invalid amount");
+            return Err(Error::InvalidAmount);
         }
 
         bettor.require_auth();
@@ -297,17 +326,30 @@ impl PredictionMarket {
             panic!("market resolution date passed");
         }
 
-        // Calculate cost using LMSR
-        let old_cost = lmsr_cost(market.yes_pool, market.no_pool, market.liquidity_parameter);
-
-        // Update pools for cost calculation
+        // Update pools for cost calculation, checking for overflow
         let (new_yes_pool, new_no_pool) = if outcome {
-            (market.yes_pool + amount, market.no_pool)
+            let next = match market.yes_pool.checked_add(amount) {
+                Some(v) => v,
+                None => return Err(Error::Overflow),
+            };
+            (next, market.no_pool)
         } else {
-            (market.yes_pool, market.no_pool + amount)
+            let next = match market.no_pool.checked_add(amount) {
+                Some(v) => v,
+                None => return Err(Error::Overflow),
+            };
+            (market.yes_pool, next)
         };
 
-        let new_cost = lmsr_cost(new_yes_pool, new_no_pool, market.liquidity_parameter);
+        if new_yes_pool.checked_mul(FIXED_POINT_SCALE).is_none()
+            || new_no_pool.checked_mul(FIXED_POINT_SCALE).is_none()
+        {
+            return Err(Error::Overflow);
+        }
+
+        // Calculate cost using LMSR with SafeMath
+        let old_cost = lmsr_cost(&env, market.yes_pool, market.no_pool, market.liquidity_parameter);
+        let new_cost = lmsr_cost(&env, new_yes_pool, new_no_pool, market.liquidity_parameter);
 
         // Cost to bettor
         let cost = if new_cost >= old_cost {
@@ -349,11 +391,21 @@ impl PredictionMarket {
             (symbol_short!("bet_pl"),),
             (bettor, market_id, outcome, amount),
         );
+
+        Ok(())
     }
 
     /// Resolve market with outcome and cryptographic proof (oracle only)
     /// outcome_proof: BytesN<32> hash of evidence supporting the resolution
     pub fn resolve_market(env: Env, market_id: u32, outcome: bool, outcome_proof: BytesN<32>) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let mut market: MarketRecord = env
             .storage()
             .instance()
@@ -493,10 +545,10 @@ impl PredictionMarket {
             market.no_pool
         };
 
-        let platform_fee = (losing_pool * PLATFORM_FEE_BPS) / 10_000;
-        let net_winnings = losing_pool - platform_fee;
-        let share = (net_winnings * bet.amount) / winning_pool;
-        let total_payout = bet.amount + share;
+        let platform_fee = losing_pool.safe_mul(&env, PLATFORM_FEE_BPS).safe_div(&env, 10_000);
+        let net_winnings = losing_pool.safe_sub(&env, platform_fee);
+        let share = net_winnings.safe_mul(&env, bet.amount).safe_div(&env, winning_pool);
+        let total_payout = bet.amount.safe_add(&env, share);
 
         // Transfer winnings to bettor
         let token_client = token::Client::new(&env, &market.token);
@@ -581,7 +633,7 @@ impl PredictionMarket {
             .expect("market not found");
 
         let yes_bps =
-            get_yes_price_bps(market.yes_pool, market.no_pool, market.liquidity_parameter);
+            get_yes_price_bps(&env, market.yes_pool, market.no_pool, market.liquidity_parameter);
         let no_bps = 10000u32.saturating_sub(yes_bps);
 
         (yes_bps, no_bps)
@@ -846,5 +898,40 @@ mod tests {
         client.initialize(&admin);
 
         client.create_market(&creator, &learner, &hash, &0, &token, &None, &oracle, &false);
+    }
+
+    #[test]
+    fn test_near_max_pool_overflow_protection() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let bettor = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        let market_id = client.create_market(
+            &creator,
+            &learner,
+            &hash,
+            &1000,
+            &token,
+            &None,
+            &oracle,
+            &false,
+        );
+
+        // Near-max amount that would cause overflow
+        let near_max_amount = i128::MAX;
+        let res = client.try_place_bet(&bettor, &market_id, &true, &near_max_amount);
+        assert!(res.is_err());
+        assert_eq!(res, Err(Ok(Error::Overflow)));
     }
 }

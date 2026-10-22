@@ -1,8 +1,43 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contractclient, contractevent, contractimpl, contracterror, contracttype,
+    symbol_short, Address, Env, Symbol, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Typed contract events (#1241)
+// ---------------------------------------------------------------------------
+
+/// Emitted when anomalous activity is detected but a hold is not yet placed.
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyDetectedEvent {
+    #[topic]
+    pub action: Symbol,
+    pub user: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a hold is placed on a user due to severe anomalous activity.
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldPlacedEvent {
+    #[topic]
+    pub action: Symbol,
+    pub user: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when an admin clears an existing hold from a user.
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldClearedEvent {
+    #[topic]
+    pub action: Symbol,
+    pub user: Address,
+    pub timestamp: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -288,20 +323,16 @@ impl AnomalyDetectorContract {
             env.storage().persistent().set(&DataKey::Hold(user.clone()), &true);
             env.storage().persistent().extend_ttl(&DataKey::Hold(user.clone()), PERSISTENT_LIFETIME_THRESHOLD, HOLD_TTL);
             AnomalyHoldPlacedEvent {
-                category: symbol_short!("anomaly"),
-                action: Symbol::new(&env, "hold_placed"),
-                user: user.clone(),
+                action:    symbol_short!("hold_plcd"),
+                user:      user.clone(),
                 timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
+            }.publish(&env);
         } else if result == AnomalyResult::Warning {
             AnomalyDetectedEvent {
-                category: symbol_short!("anomaly"),
-                action: Symbol::new(&env, "detected"),
-                user: user.clone(),
+                action:    symbol_short!("detected"),
+                user:      user.clone(),
                 timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
+            }.publish(&env);
         }
 
         Ok(result)
@@ -317,12 +348,10 @@ impl AnomalyDetectorContract {
         env.storage().persistent().remove(&DataKey::Hold(user.clone()));
 
         AnomalyHoldClearedEvent {
-            category: symbol_short!("anomaly"),
-            action: Symbol::new(&env, "hold_cleared"),
-            user: user.clone(),
+            action:    symbol_short!("hold_clrd"),
+            user:      user.clone(),
             timestamp: env.ledger().timestamp(),
-        }
-        .publish(&env);
+        }.publish(&env);
 
         Ok(())
     }
@@ -530,6 +559,56 @@ mod tests {
             .client()
             .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
         assert_eq!(result, AnomalyResult::Hold);
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed #[contractevent] emission tests (#1241)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anomaly_detected_event_emitted() {
+        let f = Fixture::setup();
+        // Trigger enough escrow creates to produce a Warning (11th call)
+        for _ in 0..10 {
+            f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        }
+        // 11th triggers AnomalyDetectedEvent
+        let result = f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        assert_eq!(result, AnomalyResult::Warning);
+
+        // Verify that at least one event was recorded by the environment
+        let events = f.env.events().all();
+        assert!(!events.is_empty(), "AnomalyDetectedEvent must have been published");
+    }
+
+    #[test]
+    fn test_anomaly_hold_placed_event_emitted() {
+        let f = Fixture::setup();
+        // Trigger a hold via LargeTransfer
+        let result = f
+            .client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+        assert_eq!(result, AnomalyResult::Hold);
+
+        let events = f.env.events().all();
+        assert!(!events.is_empty(), "AnomalyHoldPlacedEvent must have been published");
+    }
+
+    #[test]
+    fn test_anomaly_hold_cleared_event_emitted() {
+        let f = Fixture::setup();
+        // Place a hold first
+        f.client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+        assert!(f.client().is_on_hold(&f.user));
+
+        // Clear it and verify event
+        f.client().clear_hold(&f.user);
+        assert!(!f.client().is_on_hold(&f.user));
+
+        let events = f.env.events().all();
+        // There should be at least two events: one for placing, one for clearing
+        assert!(events.len() >= 2, "AnomalyHoldClearedEvent must have been published");
     }
 
     #[test]

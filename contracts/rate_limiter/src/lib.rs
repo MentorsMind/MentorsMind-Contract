@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contracterror, contractclient, contractimpl, contracttype, symbol_short, Address,
+    Env, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,25 @@ pub enum DataKey {
     CallCount(Address, Symbol),
     WindowStart(Address, Symbol),
     Whitelist(Address),
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "RateLimiterClient")]
+pub trait RateLimiterTrait {
+    fn check_rate_limit(
+        env: Env,
+        caller: Address,
+        action: Symbol,
+        max_calls: u32,
+        window_seconds: u32,
+    ) -> bool;
+
+    fn add_to_whitelist(env: Env, address: Address) -> Result<(), Error>;
+
+    fn remove_from_whitelist(env: Env, address: Address) -> Result<(), Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,5 +356,27 @@ mod test {
 
         client.remove_from_whitelist(&address);
         assert!(!client.is_whitelisted(&address));
+    }
+
+    #[test]
+    fn test_typed_client_invokes_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, RateLimiterContract);
+        RateLimiterContractClient::new(&env, &contract_id).initialize(&admin);
+        let typed = RateLimiterClient::new(&env, &contract_id);
+
+        let caller = Address::generate(&env);
+        let action = symbol_short!("transfer");
+
+        assert!(typed.check_rate_limit(&caller, &action, &1, &60));
+        assert!(!typed.check_rate_limit(&caller, &action, &1, &60));
+
+        typed.add_to_whitelist(&caller);
+        assert!(typed.check_rate_limit(&caller, &action, &1, &60));
+
+        typed.remove_from_whitelist(&caller);
     }
 }

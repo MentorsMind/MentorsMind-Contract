@@ -34,6 +34,7 @@ mentorminds-rbac = { path = "../contracts/rbac", features = ["testutils"] }
 mentorminds-performance-bond = { path = "../contracts/performance_bond", features = ["testutils"] }
 mentorminds-subscription = { path = "../contracts/subscription", features = ["testutils"] }
 mentorminds-escrow-factory = { path = "../contracts/escrow_factory", features = ["testutils"] }
+mentorminds-delegation = { path = "../contracts/delegation", features = ["testutils"] }
 
 [dev-dependencies]
 

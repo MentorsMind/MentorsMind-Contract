@@ -2,9 +2,13 @@
 
 use shared::pagination::Pagination;
 use shared::pause_guard;
-use shared::Validator;
+use shared::{
+    action_stake, action_unstake, detect_suspicious_pattern, push_snapshot_index, SnapshotMeta,
+    StakingActionRecord, StateSnapshot, SuspiciousPatternFlag, Validator, MAX_SNAPSHOTS,
+    PATTERN_DETECTION_WINDOW,
+};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
 };
 
 const MIN_COLLATERAL_RATIO_BPS: i128 = 15_000; // 150%
@@ -67,6 +71,15 @@ pub enum DataKey {
     TotalBadDebt,
     MaxPriceStaleness,
     HealthWatchList,
+    /// Ring-buffer of a liquidator's recent liquidation cycles, fed to the
+    /// shared suspicious-pattern detector (#1246).
+    LiquidatorActivity(Address),
+    /// Rolling window of retained collateral-loan snapshot IDs (#1248).
+    CollateralSnapshotIndex,
+    /// Monotonic counter for the next collateral-loan snapshot ID (#1248).
+    NextCollateralSnapshotId,
+    /// Metadata for collateral-loan snapshot `n` (#1248).
+    CollateralSnapshotMeta(u32),
 }
 
 #[contractclient(name = "OracleClient")]
@@ -106,9 +119,7 @@ impl CollateralLoanContract {
         env.storage()
             .instance()
             .set(&DataKey::AccruedInterestVault, &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalBadDebt, &0i128);
+        env.storage().instance().set(&DataKey::TotalBadDebt, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::MaxPriceStaleness, &MAX_PRICE_STALENESS_SECS);
@@ -188,6 +199,10 @@ impl CollateralLoanContract {
             panic!("insufficient collateralization");
         }
 
+        // #1247: capture structural invariants before the token movements and
+        // re-validate once they complete.
+        let pre_snapshot = StateSnapshot::capture(&env);
+
         let mnt = Self::mnt_token(&env);
         let usdc = Self::usdc_token(&env);
 
@@ -200,6 +215,8 @@ impl CollateralLoanContract {
 
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(&env.current_contract_address(), &borrower, &borrow_amount);
+
+        pre_snapshot.assert_valid();
 
         let interest_rate_bps: u32 = env
             .storage()
@@ -215,6 +232,9 @@ impl CollateralLoanContract {
         };
         env.storage().persistent().set(&loan_key, &loan);
         Self::index_position(&env, &borrower);
+
+        // #1248: index this state change for disaster recovery.
+        Self::record_snapshot_index(&env);
 
         env.events().publish(
             (Symbol::new(&env, "loan_opened"), borrower),
@@ -282,14 +302,9 @@ impl CollateralLoanContract {
         } else {
             env.storage().persistent().set(&loan_key, &loan);
         }
-        let mnt = Self::mnt_token(&env);
-        let mnt_client = token::Client::new(&env, &mnt);
-        mnt_client.transfer(
-            &env.current_contract_address(),
-            &borrower,
-            &loan.collateral_amount,
-        );
-        env.storage().persistent().remove(&loan_key);
+
+        // #1248: index the cleared-loan state change for disaster recovery.
+        Self::record_snapshot_index(&env);
 
         env.events().publish(
             (Symbol::new(&env, "repaid"), borrower),
@@ -317,7 +332,10 @@ impl CollateralLoanContract {
         let mnt_client = token::Client::new(&env, &mnt);
         mnt_client.transfer(&borrower, &env.current_contract_address(), &amount);
 
-        loan.collateral_amount = loan.collateral_amount.checked_add(amount).expect("overflow");
+        loan.collateral_amount = loan
+            .collateral_amount
+            .checked_add(amount)
+            .expect("overflow");
         env.storage().persistent().set(&loan_key, &loan);
 
         env.events().publish(
@@ -354,6 +372,10 @@ impl CollateralLoanContract {
             .checked_sub(protocol_fee)
             .expect("fee exceeds collateral");
 
+        // #1247: capture structural invariants before the token movements and
+        // re-validate once they complete.
+        let pre_snapshot = StateSnapshot::capture(&env);
+
         let usdc = Self::usdc_token(&env);
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(&liquidator, &env.current_contract_address(), &current_debt);
@@ -371,8 +393,37 @@ impl CollateralLoanContract {
             mnt_client.transfer(&env.current_contract_address(), &admin, &protocol_fee);
         }
 
+        pre_snapshot.assert_valid();
+
         env.storage().persistent().remove(&loan_key);
         Self::deindex_position(&env, &borrower);
+
+        // #1248: index the liquidation state change for disaster recovery.
+        Self::record_snapshot_index(&env);
+
+        // #1246: advisory surge detection. Record this liquidation as a
+        // complete cycle and flag bursts originating from one liquidator. The
+        // alert is never blocking.
+        Self::record_liquidator_activity(&env, &liquidator, current_debt);
+        let activity = Self::load_liquidator_activity(&env, &liquidator);
+        let flag = detect_suspicious_pattern(
+            &env,
+            &activity,
+            current_debt,
+            0,
+            None,
+            env.ledger().timestamp(),
+        );
+        if flag != SuspiciousPatternFlag::None {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "LiquidationSurgeAlert"),
+                    borrower.clone(),
+                    liquidator.clone(),
+                ),
+                (flag as u32, activity.len()),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "liquidated"), borrower, liquidator),
@@ -385,13 +436,14 @@ impl CollateralLoanContract {
         );
     }
 
-    pub fn get_liquidation_preview(
-        env: Env,
-        borrower: Address,
-    ) -> (i128, i128, i128) {
+    pub fn get_liquidation_preview(env: Env, borrower: Address) -> (i128, i128, i128) {
         Self::require_initialized(&env);
 
-        let loan: Loan = match env.storage().persistent().get(&DataKey::Loan(borrower)) {
+        let loan: Loan = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(borrower.clone()))
+        {
             Some(l) => l,
             None => return (0, 0, 0),
         };
@@ -402,10 +454,7 @@ impl CollateralLoanContract {
 
         let debt_to_pay = Self::get_current_debt(env, borrower);
         let bonus = (loan.collateral_amount * LIQUIDATOR_BONUS_BPS) / BPS_DENOMINATOR;
-        let collateral_to_receive = loan
-            .collateral_amount
-            .checked_sub(bonus)
-            .unwrap_or(0);
+        let collateral_to_receive = loan.collateral_amount.checked_sub(bonus).unwrap_or(0);
 
         (collateral_to_receive, debt_to_pay, bonus)
     }
@@ -421,7 +470,11 @@ impl CollateralLoanContract {
     pub fn get_health_factor(env: Env, borrower: Address) -> u32 {
         Self::require_initialized(&env);
 
-        let loan: Loan = match env.storage().persistent().get(&DataKey::Loan(borrower.clone())) {
+        let loan: Loan = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(borrower.clone()))
+        {
             Some(l) => l,
             None => return 0,
         };
@@ -588,6 +641,19 @@ impl CollateralLoanContract {
         page
     }
 
+    /// Convenience wrapper around `get_undercollateralized_page` that uses the
+    /// `AT_RISK_THRESHOLD_BPS` (140%) to find positions approaching liquidation.
+    ///
+    /// Returns positions where the collateralisation ratio is <= 140%, computed
+    /// against the current oracle price. Liquidation bots use this to identify
+    /// positions that need immediate attention.
+    ///
+    /// `offset` and `limit` address the raw index window (same pagination semantics
+    /// as `get_undercollateralized_page`).
+    pub fn get_at_risk_positions_page(env: Env, offset: u32, limit: u32) -> Vec<CollateralPosition> {
+        Self::get_undercollateralized_page(env, AT_RISK_THRESHOLD_BPS as u32, offset, limit)
+    }
+
     /// Appends `owner` to the dense position index.
     fn index_position(env: &Env, owner: &Address) {
         let count: u32 = env
@@ -734,7 +800,11 @@ impl CollateralLoanContract {
         watchlist.len()
     }
 
-    pub fn check_at_risk_positions(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<(Address, u32)> {
+    pub fn check_at_risk_positions(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<(Address, u32)> {
         Self::require_initialized(&env);
         let watchlist: soroban_sdk::Vec<Address> = env
             .storage()
@@ -746,10 +816,9 @@ impl CollateralLoanContract {
         let end = (offset.saturating_add(limit)).min(watchlist.len());
         for i in offset..end {
             if let Some(borrower) = watchlist.get(i) {
-                if let Ok(health) = Self::get_health_factor(env.clone(), borrower.clone()) {
-                    if (health as i128) < AT_RISK_THRESHOLD_BPS {
-                        at_risk.push_back((borrower, health));
-                    }
+                let health = Self::get_health_factor(env.clone(), borrower.clone());
+                if (health as i128) < AT_RISK_THRESHOLD_BPS {
+                    at_risk.push_back((borrower, health));
                 }
             }
         }
@@ -777,6 +846,95 @@ impl CollateralLoanContract {
             .unwrap_or(MAX_PRICE_STALENESS_SECS);
         let now = env.ledger().timestamp();
         now.saturating_sub(last_update) <= max_staleness
+    }
+
+    /// #1246: append a liquidation to the liquidator's activity ring buffer.
+    ///
+    /// A liquidation is a complete enter/exit cycle, so both legs are recorded
+    /// at the same instant. The shared detector then counts repeated
+    /// zero-duration cycles as a coordination signal.
+    fn record_liquidator_activity(env: &Env, liquidator: &Address, amount: i128) {
+        let key = DataKey::LiquidatorActivity(liquidator.clone());
+        let mut log: Vec<StakingActionRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+        let now = env.ledger().timestamp();
+        log.push_back(StakingActionRecord {
+            action: action_stake(env),
+            timestamp: now,
+            amount,
+            epoch_id: 0,
+        });
+        log.push_back(StakingActionRecord {
+            action: action_unstake(env),
+            timestamp: now,
+            amount,
+            epoch_id: 0,
+        });
+        while log.len() > PATTERN_DETECTION_WINDOW {
+            log.pop_front_unchecked();
+        }
+        env.storage().persistent().set(&key, &log);
+    }
+
+    fn load_liquidator_activity(env: &Env, liquidator: &Address) -> Vec<StakingActionRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidatorActivity(liquidator.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// #1248: append a new entry to the rolling disaster-recovery snapshot
+    /// index after a successful state-changing operation.
+    fn record_snapshot_index(env: &Env) {
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextCollateralSnapshotId)
+            .unwrap_or(0);
+        let next = current.checked_add(1).expect("snapshot index overflow");
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CollateralSnapshotIndex)
+            .unwrap_or(Vec::new(env));
+        let snapshot_pos = index.len() as u32;
+        let evicted = push_snapshot_index(&mut index, next);
+        if let Some(old_id) = evicted {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CollateralSnapshotMeta(old_id));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::CollateralSnapshotIndex, &index);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextCollateralSnapshotId, &next);
+
+        let mut checksum_input = soroban_sdk::Bytes::new(env);
+        for b in next.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        for b in snapshot_pos.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        let checksum = shared::compute_checksum(env, &checksum_input);
+
+        let meta = SnapshotMeta {
+            created_at: env.ledger().timestamp(),
+            block_height: env.ledger().sequence(),
+            contract_version: BytesN::from_array(env, &[0; 32]),
+            admin: Self::admin(env),
+            checksum,
+            record_count: index.len() as u64,
+            snapshot_index: snapshot_pos.min(MAX_SNAPSHOTS - 1),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CollateralSnapshotMeta(next), &meta);
     }
 
     fn require_initialized(env: &Env) {
@@ -826,8 +984,8 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{contract, contractimpl, symbol_short};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{contract, contractimpl, symbol_short, IntoVal};
 
     #[contracttype]
     #[derive(Clone)]
@@ -1153,10 +1311,7 @@ mod tests {
         let contract = f.contract();
 
         // No loan → zero preview.
-        assert_eq!(
-            contract.get_liquidation_preview(&f.borrower),
-            (0, 0, 0)
-        );
+        assert_eq!(contract.get_liquidation_preview(&f.borrower), (0, 0, 0));
 
         contract.open_loan(&f.borrower, &100, &120);
 
@@ -1194,9 +1349,9 @@ mod tests {
 
         assert!(!contract.is_oracle_fresh());
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             contract.open_loan(&f.borrower, &100, &120);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1229,9 +1384,9 @@ mod tests {
 
         assert!(!contract.is_oracle_fresh());
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             contract.liquidate(&f.borrower, &f.liquidator);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1248,9 +1403,9 @@ mod tests {
 
         assert!(!contract.is_oracle_fresh());
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             contract.open_loan(&f.borrower, &100, &120);
-        });
+        }));
         assert!(result.is_err());
 
         f.env.ledger().set_timestamp(600);
@@ -1269,9 +1424,9 @@ mod tests {
 
         f.env.ledger().set_timestamp(3601);
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             contract.get_health_factor(&f.borrower);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1589,5 +1744,112 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn test_liquidation_surge_alert_fires_on_repeated_rapid_liquidations() {
+        let f = Fixture::setup();
+        let contract = f.contract();
+
+        // Two weak positions (100 MNT collateral, 120 USDC debt) that fall
+        // below the liquidation threshold once the price halves.
+        contract.open_loan(&f.borrower, &100, &120);
+        let second = f.add_borrower();
+        contract.open_loan(&second, &100, &120);
+        f.oracle().set_price(&symbol_short!("MNT"), &10_000);
+
+        contract.liquidate(&f.borrower, &f.liquidator);
+        contract.liquidate(&second, &f.liquidator);
+
+        // `events().all()` reports the most recent invocation: the second
+        // liquidation. Because it is the second rapid cycle from the same
+        // liquidator, the advisory surge alert is emitted alongside the
+        // standard `liquidated` event.
+        let alert_topics: Vec<soroban_sdk::Val> = (
+            Symbol::new(&f.env, "LiquidationSurgeAlert"),
+            second.clone(),
+            f.liquidator.clone(),
+        )
+            .into_val(&f.env);
+        let alert_data: soroban_sdk::Val =
+            (SuspiciousPatternFlag::RepeatedShortCycle as u32, 4u32).into_val(&f.env);
+
+        let liquidated_topics: Vec<soroban_sdk::Val> = (
+            Symbol::new(&f.env, "liquidated"),
+            second.clone(),
+            f.liquidator.clone(),
+        )
+            .into_val(&f.env);
+        let liquidated_data: soroban_sdk::Val = (100i128, 120i128, 5i128, 95i128).into_val(&f.env);
+
+        let expected: Vec<(Address, Vec<soroban_sdk::Val>, soroban_sdk::Val)> = Vec::from_array(
+            &f.env,
+            [
+                (f.contract_id.clone(), alert_topics, alert_data),
+                (f.contract_id.clone(), liquidated_topics, liquidated_data),
+            ],
+        );
+        assert_eq!(f.env.events().all(), expected);
+    }
+
+    #[test]
+    fn test_state_snapshot_detects_ledger_regression() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(1_000);
+
+        let snapshot = StateSnapshot::capture(&f.env);
+
+        // Forward ledger progress is valid.
+        f.env.ledger().set_timestamp(1_001);
+        snapshot.assert_valid();
+
+        // A mid-execution regression must be caught after the token moves.
+        f.env.ledger().set_timestamp(999);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            snapshot.assert_valid();
+        }));
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn test_snapshot_index_grows_after_each_operation() {
+        let f = Fixture::setup();
+        let contract = f.contract();
+
+        let index_state = |f: &Fixture| -> (u32, u32) {
+            f.env.as_contract(&f.contract_id, || {
+                let index: Vec<u32> = f
+                    .env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::CollateralSnapshotIndex)
+                    .unwrap_or(Vec::new(&f.env));
+                let next: u32 = f
+                    .env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::NextCollateralSnapshotId)
+                    .unwrap_or(0);
+                (index.len(), next)
+            })
+        };
+
+        assert_eq!(index_state(&f), (0, 0));
+
+        contract.open_loan(&f.borrower, &100, &120);
+        assert_eq!(index_state(&f), (1, 1));
+
+        let second = f.add_borrower();
+        contract.open_loan(&second, &100, &120);
+        assert_eq!(index_state(&f), (2, 2));
+
+        contract.repay_loan(&f.borrower, &120);
+        assert_eq!(index_state(&f), (3, 3));
+
+        // A fourth operation keeps the rolling window at its cap while the
+        // monotonic snapshot id continues to advance.
+        f.oracle().set_price(&symbol_short!("MNT"), &10_000);
+        contract.liquidate(&second, &f.liquidator);
+        assert_eq!(index_state(&f), (MAX_SNAPSHOTS, 4));
     }
 }
