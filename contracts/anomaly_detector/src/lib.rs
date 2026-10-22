@@ -140,6 +140,45 @@ const HOLD_TTL: u32 = 864000;                       // Maximum TTL for hold flag
 const MAX_PAGE_SIZE: u32 = 100;                     // Maximum items per pagination page
 
 // ---------------------------------------------------------------------------
+// Events (#1241): typed `#[contractevent]`s replacing the deprecated
+// `env.events().publish()` calls previously routed through
+// `shared::events::emit_anomaly_event`.
+// ---------------------------------------------------------------------------
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldPlacedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    user: Address,
+    timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyDetectedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    user: Address,
+    timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldClearedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    user: Address,
+    timestamp: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Contract Client (#1263)
 // ---------------------------------------------------------------------------
 
@@ -570,6 +609,42 @@ mod tests {
         let events = f.env.events().all();
         // There should be at least two events: one for placing, one for clearing
         assert!(events.len() >= 2, "AnomalyHoldClearedEvent must have been published");
+    }
+
+    #[test]
+    fn test_hold_placed_event_is_typed_and_emitted() {
+        let f = Fixture::setup();
+        f.client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+
+        let events = f.env.events().all().filter_by_contract(&f.contract);
+        assert!(!events.events().is_empty(), "hold_placed event must be emitted");
+    }
+
+    #[test]
+    fn test_detected_event_is_typed_and_emitted() {
+        let f = Fixture::setup();
+        for _ in 0..10 {
+            f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        }
+        // 11th crosses the warn threshold and must emit a `detected` event.
+        f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+
+        let events = f.env.events().all().filter_by_contract(&f.contract);
+        assert!(!events.events().is_empty(), "detected event must be emitted");
+    }
+
+    #[test]
+    fn test_hold_cleared_event_is_typed_and_emitted() {
+        let f = Fixture::setup();
+        f.client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+        assert!(f.client().is_on_hold(&f.user));
+
+        f.client().clear_hold(&f.user);
+
+        let events = f.env.events().all().filter_by_contract(&f.contract);
+        assert!(!events.events().is_empty(), "hold_cleared event must be emitted");
     }
 
     #[test]

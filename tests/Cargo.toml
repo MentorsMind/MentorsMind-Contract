@@ -97,3 +97,7 @@ path = "protocol_params_integration.rs"
 [[test]]
 name = "gas_estimation_accuracy_tests"
 path = "gas_estimation_accuracy_tests.rs"
+
+[[test]]
+name = "delegation_governance"
+path = "delegation_governance.rs"

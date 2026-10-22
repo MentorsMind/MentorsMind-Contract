@@ -1,4 +1,5 @@
 #![no_std]
+use shared::Pagination;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol, Vec,
 };
@@ -305,6 +306,65 @@ impl RegulatoryReporting {
             .set(&DataKey::Reviewed(report_id), &true);
 
         env.events().publish((symbol_short!("reviewed"), report_id), report_id);
+    }
+
+    /// Total number of large-transaction reports recorded so far.
+    pub fn get_report_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReportCount)
+            .unwrap_or(0)
+    }
+
+    /// Paginated view over every recorded report, regardless of review
+    /// status. `limit` is clamped to `MAX_PAGE_SIZE` so a caller can never
+    /// force a single call to enumerate the whole collection.
+    pub fn get_reports_page(env: Env, offset: u32, limit: u32) -> Vec<ReportTrigger> {
+        let total = Self::get_report_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out: Vec<ReportTrigger> = vec![&env];
+        // Reports are stored 1-indexed (DataKey::Report(1)..=DataKey::Report(total)).
+        for i in start..end {
+            if let Some(report) = env
+                .storage()
+                .persistent()
+                .get::<_, ReportTrigger>(&DataKey::Report(i + 1))
+            {
+                out.push_back(report);
+            }
+        }
+        out
+    }
+
+    /// Paginated view over reports that have not yet been marked reviewed,
+    /// returned alongside their report id so a caller can act on them (e.g.
+    /// via `mark_reviewed`). `limit` is clamped to `MAX_PAGE_SIZE`.
+    pub fn get_unreviewed_reports_page(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<(u32, ReportTrigger)> {
+        let total = Self::get_report_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out: Vec<(u32, ReportTrigger)> = vec![&env];
+        for i in start..end {
+            let report_id = i + 1;
+            let reviewed: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Reviewed(report_id))
+                .unwrap_or(false);
+            if !reviewed {
+                if let Some(report) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, ReportTrigger>(&DataKey::Report(report_id))
+                {
+                    out.push_back((report_id, report));
+                }
+            }
+        }
+        out
     }
 }
 
