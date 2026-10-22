@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::events::{
     emit_governance_event, evt_gov_appeal_resolved, evt_gov_appeal_submitted,

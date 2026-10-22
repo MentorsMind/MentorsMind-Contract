@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 #![allow(unexpected_cfgs)] // kani proofs use #[cfg(kani)] injected by the cargo-kani driver
 use multisig_admin::MultisigAdminContractClient;
 use shared::events::{

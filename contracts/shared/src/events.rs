@@ -41,7 +41,7 @@
 /// here is missing from `events_schema.json`.
 #[allow(dead_code)]
 
-use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{contractevent, contracttype, Address, Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.
@@ -51,21 +51,38 @@ use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
-// Internal emit helper
+// Internal emit helper using the new #[contractevent] pattern
 // ---------------------------------------------------------------------------
+
+/// Generic event wrapper that provides the standardized 3-element topic layout.
+/// The #[contractevent] macro generates a `publish()` method for this struct.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractEvent<D: IntoVal<Env, Val>> {
+    pub contract: Symbol,
+    pub version: u32,
+    pub event_type: Symbol,
+    pub data: D,
+}
 
 /// Low-level emit — all typed helpers delegate here.
 ///
-/// Emits `(contract, version, event_type)` as the topic tuple.
+/// Emits `(contract, version, event_type)` as the topic tuple using the new
+/// #[contractevent] macro-generated publish method.
 #[inline]
-pub fn emit<D: IntoVal<Env, Val>>(
+pub fn emit<D: IntoVal<Env, Val> + Clone>(
     env: &Env,
     contract: Symbol,
     event_type: Symbol,
     data: D,
 ) {
-    env.events()
-        .publish((contract, EVENT_SCHEMA_VERSION, event_type), data);
+    ContractEvent {
+        contract,
+        version: EVENT_SCHEMA_VERSION,
+        event_type,
+        data,
+    }
+    .publish(env);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +127,7 @@ pub fn emit<D: IntoVal<Env, Val>>(
 
 /// Admin change proposal event, emitted by contracts that support admin transfer.
 /// Deduplicates the identical struct previously defined in 5+ contracts.
+#[contractevent]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminChangeProposedEvent {
@@ -120,6 +138,7 @@ pub struct AdminChangeProposedEvent {
 }
 
 /// Admin change accepted event.
+#[contractevent]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminChangeAcceptedEvent {
@@ -129,6 +148,7 @@ pub struct AdminChangeAcceptedEvent {
 }
 
 /// Admin change cancelled event.
+#[contractevent]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminChangeCancelledEvent {
@@ -138,6 +158,7 @@ pub struct AdminChangeCancelledEvent {
 }
 
 /// Proposal cancelled with cooldown event (governance).
+#[contractevent]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalCancelledWithCooldown {

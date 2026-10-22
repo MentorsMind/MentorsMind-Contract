@@ -23,7 +23,6 @@
 //! cryptographic verification, selective redaction, consent management,
 //! and role-based access control.
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
     compute_justice_intervention, ensure_dispute_independence as shared_ensure_dispute_independence,

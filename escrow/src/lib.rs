@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)]
 #![allow(dead_code, unused_assignments)]
 
 //! # Escrow Contract
