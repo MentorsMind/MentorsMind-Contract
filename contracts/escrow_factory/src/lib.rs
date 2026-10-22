@@ -13,6 +13,7 @@ use shared::health_reporter::{report_metric, MetricCategory};
 use shared::atomic_state::{StateTransitionContext, STATE_TRANSITION_TIMEOUT_SECS};
 use shared::CrossContractAuth;
 use shared::platform_authenticity::{detect_fee_evasion, PenaltyTier};
+use shared::{Pagination, MAX_PAGE_SIZE};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -660,7 +661,7 @@ impl EscrowFactory {
             .unwrap_or(0)
     }
 
-    /// Get all escrows with pagination
+    /// Get all escrows with pagination (legacy 1-indexed API, retained for compatibility)
     pub fn get_all_escrows(env: Env, page: u32, page_size: u32) -> Vec<EscrowInfo> {
         if page == 0 || page_size == 0 {
             panic!("Invalid pagination parameters");
@@ -684,6 +685,31 @@ impl EscrowFactory {
             );
         }
 
+        result
+    }
+
+    /// Get paginated escrows using standard 0-indexed offset/limit pattern.
+    /// Limit is capped at MAX_PAGE_SIZE.
+    pub fn get_escrows_page(env: Env, offset: u32, limit: u32) -> Vec<EscrowInfo> {
+        let count = Self::get_escrow_count(&env);
+        let count_u32 = if count > u32::MAX as u64 { u32::MAX } else { count as u32 };
+        let (start, end) = Pagination::bounds(count_u32, offset, limit);
+        
+        let mut result = Vec::new(&env);
+        
+        for i in start..end {
+            // Storage uses 1-based indexing
+            let list_key = (ESCROW_LIST, (i as u64) + 1);
+            if let Some(escrow_info) = env.storage().persistent().get::<_, EscrowInfo>(&list_key) {
+                result.push_back(escrow_info);
+            }
+            env.storage().persistent().extend_ttl(
+                &list_key,
+                FACTORY_TTL_THRESHOLD,
+                FACTORY_TTL_BUMP,
+            );
+        }
+        
         result
     }
 

@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
     compute_checksum, compute_justice_intervention, protect_arbitration_fairness,
@@ -19,10 +18,47 @@ use shared::{
 };
 use shared::ttl_utils::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
+    contract, contractimpl, contracterror, contractevent, contracttype, symbol_short, Address, Bytes, BytesN,
     Env, Symbol, TryIntoVal, Val, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
+
+// ---------------------------------------------------------------------------
+// Contract Events
+// ---------------------------------------------------------------------------
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProposalCreatedEvent {
+    pub proposal_id: u32,
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub expiry: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProposalSignedEvent {
+    pub proposal_id: u32,
+    pub signer: Address,
+    pub approval_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProposalExecutedEvent {
+    pub proposal_id: u32,
+    pub target: Address,
+    pub function: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProposalCancelledEvent {
+    pub proposal_id: u32,
+    pub cancelled_by: Address,
+}
 
 
 // ---------------------------------------------------------------------------
@@ -255,7 +291,13 @@ impl MultisigAdminContract {
         );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("proposed"), new_id),
-            (proposer, expiry),
+            ProposalCreatedEvent {
+                proposal_id: new_id,
+                proposer,
+                target,
+                function,
+                expiry,
+            },
         );
         Ok(new_id)
     }
@@ -299,7 +341,11 @@ impl MultisigAdminContract {
         );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("signed"), action_id),
-            (signer, proposal.approval_count),
+            ProposalSignedEvent {
+                proposal_id: action_id,
+                signer,
+                approval_count: proposal.approval_count,
+            },
         );
         Ok(())
     }
@@ -377,7 +423,11 @@ impl MultisigAdminContract {
 
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("executed"), action_id),
-            (action_id, event_target, event_function),
+            ProposalExecutedEvent {
+                proposal_id: action_id,
+                target: event_target,
+                function: event_function,
+            },
         );
         Ok(())
     }
@@ -409,7 +459,10 @@ impl MultisigAdminContract {
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("cancelled"), action_id),
-            caller,
+            ProposalCancelledEvent {
+                proposal_id: action_id,
+                cancelled_by: caller,
+            },
         );
         Ok(())
     }
@@ -1688,5 +1741,103 @@ mod test {
         f.client().sign_action(&f.signers[2], &pid);
         let result = f.client().try_execute_action(&pid);
         assert_ne!(result, Err(Ok(Error::BelowThreshold)));
+    }
+}
+
+
+    // ======================================================================
+    // Contract Event Tests
+    // ======================================================================
+
+    #[test]
+    fn test_proposal_created_event_emitted() {
+        let f = Fixture::setup();
+        let proposer = Address::generate(&f.env);
+        f.client().as_contract(&f.admin, || {
+            f.client().client().initialize(&vec![&f.env, &proposer], &2u32).unwrap();
+        });
+
+        let target = Address::generate(&f.env);
+        f.env.mock_all_auths();
+        f.client().propose_action(&proposer, &target, &Symbol::new(&f.env, "test"), &Vec::new(&f.env)).unwrap();
+
+        let events = f.env.events();
+        let events_obj = events.all();
+        let mut found = false;
+        for event in events_obj.iter() {
+            if let Ok((topics, data)) = event.parsed::<(Vec<Symbol>, ProposalCreatedEvent)>() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "ProposalCreatedEvent not found");
+    }
+
+    #[test]
+    fn test_proposal_signed_event_emitted() {
+        let f = Fixture::setup();
+        let id = f.propose("test", &Address::generate(&f.env));
+        
+        let signer = Address::generate(&f.env);
+        f.client().as_contract(&f.admin, || {
+            f.client().client().initialize(&vec![&f.env, &signer], &1u32).unwrap();
+        });
+
+        f.env.mock_all_auths();
+        f.client().sign_action(&signer, &id).unwrap();
+
+        let events = f.env.events();
+        let events_obj = events.all();
+        let mut found = false;
+        for event in events_obj.iter() {
+            if let Ok((topics, data)) = event.parsed::<(Vec<Symbol>, ProposalSignedEvent)>() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "ProposalSignedEvent not found");
+    }
+
+    #[test]
+    fn test_proposal_executed_event_emitted() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let proposal_id = f.propose(&format!("proposal"), &target);
+        
+        f.sign_n(proposal_id, 2);
+
+        f.env.mock_all_auths();
+        f.client().execute_action(&proposal_id).unwrap();
+
+        let events = f.env.events();
+        let events_obj = events.all();
+        let mut found = false;
+        for event in events_obj.iter() {
+            if let Ok((topics, data)) = event.parsed::<(Vec<Symbol>, ProposalExecutedEvent)>() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "ProposalExecutedEvent not found");
+    }
+
+    #[test]
+    fn test_proposal_cancelled_event_emitted() {
+        let f = Fixture::setup();
+        let proposal_id = f.propose("test", &Address::generate(&f.env));
+
+        f.env.mock_all_auths();
+        f.client().cancel_action(&f.admin, &proposal_id).unwrap();
+
+        let events = f.env.events();
+        let events_obj = events.all();
+        let mut found = false;
+        for event in events_obj.iter() {
+            if let Ok((topics, data)) = event.parsed::<(Vec<Symbol>, ProposalCancelledEvent)>() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "ProposalCancelledEvent not found");
     }
 }

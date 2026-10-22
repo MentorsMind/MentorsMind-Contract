@@ -226,6 +226,10 @@ pub enum DataKey {
     ReferrerAgg(Address),
     /// Provider-level share aggregates
     InsuranceAgg(Address),
+    /// Source index for filtering: LedgerSource → count of records with that source
+    SourceCount(LedgerSource),
+    /// Source index mapping: (LedgerSource, index_in_source) → record_id
+    SourceIndex(LedgerSource, u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +330,13 @@ impl ReconciliationEngine {
         env.storage().persistent().set(&DataKey::RecordCount, &id);
         env.storage().persistent().extend_ttl(&DataKey::RecordCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
+        // Update source index for pagination
+        let source_count_key = DataKey::SourceCount(source);
+        let source_count: u32 = env.storage().persistent().get(&source_count_key).unwrap_or(0);
+        let new_source_count = source_count.checked_add(1).ok_or(Error::Overflow)?;
+        env.storage().persistent().set(&source_count_key, &new_source_count);
+        env.storage().persistent().set(&DataKey::SourceIndex(source, source_count), &id);
+
         // Running totals
         let key = DataKey::RunningTotals(source);
         let (mut ins, mut outs): (i128, i128) = env
@@ -377,6 +388,51 @@ impl ReconciliationEngine {
 
     pub fn get_record_count(env: Env) -> u64 {
         env.storage().persistent().get(&DataKey::RecordCount).unwrap_or(0)
+    }
+
+    /// -------------------------------------------------------------------
+    /// Pagination endpoints for audit tooling
+    /// -------------------------------------------------------------------
+
+    /// Returns a paginated view of all ledger records.
+    pub fn get_records_page(env: Env, offset: u32, limit: u32) -> Vec<LedgerRecord> {
+        let count = Self::get_record_count(&env);
+        let count_u32 = if count > u32::MAX as u64 { u32::MAX } else { count as u32 };
+        let (start, end) = Pagination::bounds(count_u32, offset, limit);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let record_id = (i as u64) + 1; // Records are 1-indexed
+            if let Some(rec) = env.storage().persistent().get::<DataKey, LedgerRecord>(&DataKey::Record(record_id)) {
+                results.push_back(rec);
+            }
+        }
+        results
+    }
+
+    /// Returns a paginated view of ledger records filtered by source.
+    pub fn get_records_by_source(
+        env: Env,
+        source: LedgerSource,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<LedgerRecord> {
+        let source_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SourceCount(source))
+            .unwrap_or(0);
+        let (start, end) = Pagination::bounds(source_count, offset, limit);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            if let Some(record_id) = env.storage().persistent().get::<DataKey, u64>(&DataKey::SourceIndex(source, i)) {
+                if let Some(rec) = env.storage().persistent().get::<DataKey, LedgerRecord>(&DataKey::Record(record_id)) {
+                    results.push_back(rec);
+                }
+            }
+        }
+        results
     }
 
     /// -------------------------------------------------------------------
@@ -1692,5 +1748,110 @@ mod tests {
         // Config keys should still be accessible
         // because they were extended with TTL during initialization
         assert_eq!(client.get_record_count(), 0);
+    }
+}
+
+    // ======================================================================
+    // Pagination tests
+    // ======================================================================
+
+    #[test]
+    fn test_get_records_page_returns_paginated_results() {
+        let f = Fixture::setup();
+        
+        // Create 10 records
+        for i in 0..10 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::EscrowFee,
+                &f.token,
+                &(100 + i),
+                &500u32,
+                &1000,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "test"),
+            ).unwrap();
+        }
+
+        // Get first page
+        let page1 = f.client().get_records_page(0, 5);
+        assert_eq!(page1.len(), 5);
+        
+        // Get second page
+        let page2 = f.client().get_records_page(5, 5);
+        assert_eq!(page2.len(), 5);
+        
+        // Get page beyond range
+        let page3 = f.client().get_records_page(10, 5);
+        assert_eq!(page3.len(), 0);
+    }
+
+    #[test]
+    fn test_get_records_by_source_filters_correctly() {
+        let f = Fixture::setup();
+        
+        // Create records with different sources
+        for _i in 0..3 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::EscrowFee,
+                &f.token,
+                &100,
+                &500u32,
+                &1000,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "escrow"),
+            ).unwrap();
+        }
+        
+        for _i in 0..5 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::ReferralReward,
+                &f.token,
+                &50,
+                &0u32,
+                &0,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "referral"),
+            ).unwrap();
+        }
+
+        // Get EscrowFee records
+        let escrow_records = f.client().get_records_by_source(LedgerSource::EscrowFee, 0, 10);
+        assert_eq!(escrow_records.len(), 3);
+        
+        // Get ReferralReward records
+        let referral_records = f.client().get_records_by_source(LedgerSource::ReferralReward, 0, 10);
+        assert_eq!(referral_records.len(), 5);
+        
+        // Get paginated ReferralReward records
+        let page1 = f.client().get_records_by_source(LedgerSource::ReferralReward, 0, 3);
+        assert_eq!(page1.len(), 3);
+        let page2 = f.client().get_records_by_source(LedgerSource::ReferralReward, 3, 3);
+        assert_eq!(page2.len(), 2);
+    }
+
+    #[test]
+    fn test_pagination_respects_max_page_size() {
+        let f = Fixture::setup();
+        
+        // Create more than MAX_PAGE_SIZE records
+        for _i in 0..60 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::EscrowFee,
+                &f.token,
+                &100,
+                &500u32,
+                &1000,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "test"),
+            ).unwrap();
+        }
+
+        // Request more than MAX_PAGE_SIZE, should be clamped
+        let page = f.client().get_records_page(0, 100);
+        assert_eq!(page.len(), 50); // MAX_PAGE_SIZE is 50
     }
 }
