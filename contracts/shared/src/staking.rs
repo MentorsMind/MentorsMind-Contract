@@ -410,11 +410,7 @@ mod tests {
         assert_eq!(apply_bps_multiplier(i128::MAX, 20_000), i128::MAX);
         assert_eq!(apply_bps_multiplier(i128::MAX, u32::MAX), i128::MAX);
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn test_compute_reward_multiplier_min_duration() {

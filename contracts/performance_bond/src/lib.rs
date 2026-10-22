@@ -1,13 +1,16 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token,
+    Address, Env, Symbol, Vec,
 };
 
 use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_min_bond, key_cooldown_days,
-    DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
+    DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS, ReentrancyGuard,
+    validate_amount_limits, MAX_FINANCIAL_AMOUNT,
+    pagination::Pagination,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,12 +56,53 @@ pub struct SlashEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Contract Events
+// ---------------------------------------------------------------------------
+
+#[contractevent]
+#[derive(Clone)]
+pub struct BondPostedEvent {
+    #[topic]
+    pub contract: Symbol,
+    #[topic]
+    pub event_type: Symbol,
+    pub mentor: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct BondSlashedEvent {
+    #[topic]
+    pub contract: Symbol,
+    #[topic]
+    pub event_type: Symbol,
+    pub mentor: Address,
+    pub amount: i128,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct BondWithdrawnEvent {
+    #[topic]
+    pub contract: Symbol,
+    #[topic]
+    pub event_type: Symbol,
+    pub mentor: Address,
+    pub amount: i128,
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const MINIMUM_BOND: i128 = 100_000_000; // 100 MNT (with 7 decimals)
 const COOLDOWN_DAYS: u64 = 30;
 const COOLDOWN_SECONDS: u64 = COOLDOWN_DAYS * 86_400;
+
+const TTL_THRESHOLD: u32 = 500_000;
+const TTL_BUMP: u32 = 9_000_000;
 
 // Slash amounts (with 7 decimals)
 #[allow(dead_code)]
@@ -81,6 +125,14 @@ pub enum DataKey {
     Bond(Address),
     SlashHistory(Address),
     PerfectSessionsCount(Address),
+    /// Sequential index of slash events for a mentor (for pagination).
+    SlashIndex(Address, u32),
+    /// Count of slash events for a mentor.
+    SlashCount(Address),
+    /// Sequential index of bonded mentors — Address stored at each slot.
+    BondIndex(u32),
+    /// Total number of mentor bond entries ever posted.
+    BondCount,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +199,7 @@ impl PerformanceBondContract {
     ///
     /// Auth: mentor must authorize this call.
     pub fn post_bond(env: Env, mentor: Address, amount: i128) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOND"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -192,15 +245,33 @@ impl PerformanceBondContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(mentor.clone()), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Bond(mentor.clone()), TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (
-                symbol_short!("bond"),
-                symbol_short!("posted"),
-                mentor.clone(),
-            ),
+        // Maintain sequential bond index for pagination (#1210).
+        let bond_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BondIndex(bond_count), &mentor);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BondIndex(bond_count), TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::BondCount, &(bond_count + 1));
+
+        BondPostedEvent {
+            contract: symbol_short!("bond"),
+            event_type: symbol_short!("posted"),
+            mentor: mentor.clone(),
             amount,
-        );
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -229,7 +300,7 @@ impl PerformanceBondContract {
             .get(&DataKey::Bond(mentor.clone()))
             .ok_or(Error::NoBondFound)?;
 
-        if amount <= 0 {
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
             return Err(Error::InvalidAmount);
         }
 
@@ -275,6 +346,25 @@ impl PerformanceBondContract {
         env.storage()
             .persistent()
             .set(&DataKey::SlashHistory(mentor.clone()), &history);
+
+        // Maintain SlashIndex for pagination (#1272)
+        let slash_count = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SlashCount(mentor.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashIndex(mentor.clone(), slash_count), &SlashEvent {
+                amount,
+                reason: reason.clone(),
+                timestamp: env.ledger().timestamp(),
+                slash_count_at_time: record.slash_count,
+            });
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashCount(mentor.clone()), &(slash_count + 1));
+
         env.storage()
             .persistent()
             .set(&DataKey::PerfectSessionsCount(mentor.clone()), &0u32);
@@ -290,14 +380,14 @@ impl PerformanceBondContract {
                 .set(&DataKey::Bond(mentor.clone()), &record);
         }
 
-        env.events().publish(
-            (
-                symbol_short!("bond"),
-                symbol_short!("slashed"),
-                mentor.clone(),
-            ),
-            (amount, reason),
-        );
+        BondSlashedEvent {
+            contract: symbol_short!("bond"),
+            event_type: symbol_short!("slashed"),
+            mentor: mentor.clone(),
+            amount,
+            reason,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -308,6 +398,48 @@ impl PerformanceBondContract {
             .persistent()
             .get(&DataKey::SlashHistory(mentor))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the total count of slash events for a mentor (#1272).
+    pub fn get_slash_count(env: Env, mentor: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashCount(mentor))
+            .unwrap_or(0)
+    }
+
+    /// Returns a paginated slice of a mentor's slash history (#1272).
+    ///
+    /// # Arguments
+    /// * `mentor` - The mentor address to fetch slash history for
+    /// * `offset` - Starting index in the slash history
+    /// * `limit` - Maximum results to return (clamped to MAX_PAGE_SIZE)
+    ///
+    /// # Returns
+    /// Vector of SlashEvent records for the given page.
+    pub fn get_slash_history_page(
+        env: Env,
+        mentor: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<SlashEvent> {
+        use shared::pagination::Pagination;
+
+        let total = Self::get_slash_count(&env, mentor.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for idx in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, SlashEvent>(&DataKey::SlashIndex(mentor.clone(), idx))
+            {
+                result.push_back(event);
+            }
+        }
+
+        result
     }
 
     /// Record a perfect 5-star session for mentor recovery.
@@ -330,6 +462,7 @@ impl PerformanceBondContract {
     ///
     /// Auth: mentor must authorize this call.
     pub fn release_bond(env: Env, mentor: Address) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOND"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -371,16 +504,48 @@ impl PerformanceBondContract {
             .persistent()
             .remove(&DataKey::Bond(mentor.clone()));
 
-        env.events().publish(
-            (
-                symbol_short!("bond"),
-                symbol_short!("released"),
-                mentor.clone(),
-            ),
-            record.amount,
-        );
+        BondWithdrawnEvent {
+            contract: symbol_short!("bond"),
+            event_type: symbol_short!("withdrawn"),
+            mentor: mentor.clone(),
+            amount: record.amount,
+        }
+        .publish(&env);
 
         Ok(())
+    }
+
+    /// Returns the total count of bonds ever posted.
+    pub fn get_bond_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BondCount)
+            .unwrap_or(0)
+    }
+
+    /// Returns a paginated slice of `BondRecord`s for all posted bonds (#1210).
+    pub fn get_bonds_page(env: Env, offset: u32, limit: u32) -> Vec<BondRecord> {
+        let total = Self::get_bond_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for idx in start..end {
+            if let Some(mentor) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::BondIndex(idx))
+            {
+                if let Some(record) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, BondRecord>(&DataKey::Bond(mentor))
+                {
+                    result.push_back(record);
+                }
+            }
+        }
+
+        result
     }
 
     /// Get bond record for a mentor.

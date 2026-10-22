@@ -621,6 +621,90 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #1273 — explicit deadline boundary tests
+    // -----------------------------------------------------------------------
+
+    /// deadline = now - 1 (exactly one second in the past) must be rejected.
+    #[test]
+    #[should_panic(expected = "sig: expired")]
+    fn test_deadline_now_minus_one_rejected() {
+        let now: u64 = 10_000;
+        let env = env_at(now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        // deadline = now - 1: already expired
+        let payload = make_payload(&env, contract_id.clone(), 0, now - 1);
+
+        env.as_contract(&contract_id, || {
+            validate_and_consume_nonce(&env, &signer, &payload);
+        });
+    }
+
+    /// deadline = now + MAX_DEADLINE_SECS + 1 must be rejected.
+    #[test]
+    #[should_panic(expected = "sig: deadline too far")]
+    fn test_deadline_max_plus_one_rejected() {
+        let now: u64 = 1_000;
+        let env = env_at(now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        // deadline = now + MAX_DEADLINE_SECS + 1: just outside the window
+        let payload = make_payload(&env, contract_id.clone(), 0, now + MAX_DEADLINE_SECS + 1);
+
+        env.as_contract(&contract_id, || {
+            validate_and_consume_nonce(&env, &signer, &payload);
+        });
+    }
+
+    /// A valid deadline is accepted and the nonce advances.
+    #[test]
+    fn test_valid_deadline_accepted_and_nonce_increments() {
+        let now: u64 = 1_000;
+        let env = env_at(now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        // deadline = now + 3600: well within the valid window
+        let payload = make_payload(&env, contract_id.clone(), 0, now + 3_600);
+
+        env.as_contract(&contract_id, || {
+            assert_eq!(current_nonce(&env, &signer), 0);
+            let new_nonce = validate_and_consume_nonce(&env, &signer, &payload);
+            assert_eq!(new_nonce, 1);
+            assert_eq!(current_nonce(&env, &signer), 1);
+        });
+    }
+
+    /// Replaying the same nonce (same payload) must be rejected.
+    #[test]
+    #[should_panic(expected = "sig: invalid nonce")]
+    fn test_same_nonce_replay_rejected() {
+        let now: u64 = 1_000;
+        let env = env_at(now);
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, crate::sig_validation::tests::DummyContract);
+        let signer = Address::generate(&env);
+
+        let payload = make_payload(&env, contract_id.clone(), 0, now + 3_600);
+
+        env.as_contract(&contract_id, || {
+            // First use — accepted
+            validate_and_consume_nonce(&env, &signer, &payload);
+            // Replay — nonce is now 1, payload has nonce=0, must be rejected
+            validate_and_consume_nonce(&env, &signer, &payload);
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Dummy contract used as execution context in tests
     // -----------------------------------------------------------------------
 

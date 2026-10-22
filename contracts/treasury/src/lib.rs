@@ -1098,6 +1098,16 @@ impl TreasuryContract {
             amount,
         );
 
+        // Score the transfer's impact on the treasury balance. Large outflows
+        // that trip the velocity guard are surfaced as an event for monitors.
+        let velocity = assess_token_velocity(balance_before, amount, 0);
+        if velocity.stabilization_required {
+            env.events().publish(
+                (symbol_short!("treasury"), symbol_short!("velocity")),
+                (token.clone(), recipient.clone(), amount, velocity.velocity_bps),
+            );
+        }
+
         let threshold: i128 = env
             .storage()
             .persistent()

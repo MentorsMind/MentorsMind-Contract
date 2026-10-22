@@ -12,6 +12,8 @@ use shared::{
     acknowledge_prepare,
     confirm_commit,
     initiate_rollback,
+    confirm_rollback,
+    get_xchain_op,
     is_chain_isolated,
     isolate_chain,
     lift_chain_isolation,
@@ -37,6 +39,8 @@ pub enum DataKey {
     L2Config,
     L2Audit(BytesN<32>),
     ProcessedVAA(BytesN<32>),
+    OperationIndex(u32),
+    ProcessedTxCount,
     WrappedToken,
     TrustedRelayer(Address),
     ProcessedNonce(u32, u64),
@@ -164,7 +168,10 @@ impl BridgeReceiver {
 
         // Also store in config's processed_vaas list for audit
         let mut config = Self::get_config(&env);
+        let index = config.processed_vaas.len();
         config.processed_vaas.push_back(vaa_hash.clone());
+        env.storage().instance().set(&DataKey::OperationIndex(index), &vaa_hash);
+        env.storage().instance().set(&DataKey::ProcessedTxCount, &(index + 1));
         env.storage().instance().set(&DataKey::Config, &config);
 
         // Emit event
@@ -368,6 +375,25 @@ impl BridgeReceiver {
         config.processed_vaas
     }
 
+    pub fn get_processed_tx_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::ProcessedTxCount).unwrap_or(0)
+    }
+
+    pub fn get_processed_txs_page(env: Env, offset: u32, limit: u32) -> Vec<BytesN<32>> {
+        const MAX_PAGE_SIZE: u32 = 100;
+        let count = Self::get_processed_tx_count(env.clone());
+        let end = offset.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
+        let mut page = Vec::new(&env);
+        let mut index = offset.min(count);
+        while index < end {
+            if let Some(hash) = env.storage().instance().get(&DataKey::OperationIndex(index)) {
+                page.push_back(hash);
+            }
+            index += 1;
+        }
+        page
+    }
+
     // Helper functions
     fn get_config(env: &Env) -> BridgeConfig {
         env.storage()
@@ -533,6 +559,22 @@ impl BridgeReceiver {
             .unwrap_or_else(|e| panic!("Rollback failed: {}", e as u32));
 
         env.events().publish(("bridge", "AtomicOpRolledBack"), op_id);
+    }
+
+    /// Confirm rollback completion across all chains for an atomic bridge op.
+    pub fn confirm_bridge_rollback(env: Env, admin: Address, op_id: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        confirm_rollback(&env, &op_id)
+            .unwrap_or_else(|e| panic!("Confirm rollback failed: {}", e as u32));
+
+        env.events().publish(("bridge", "AtomicOpRollbackConfirmed"), op_id);
+    }
+
+    /// Query current phase of an in-flight or completed atomic bridge operation.
+    pub fn get_bridge_atomic_op_phase(env: Env, op_id: BytesN<32>) -> u32 {
+        let op = get_xchain_op(&env, &op_id)
+            .unwrap_or_else(|| panic!("Op not found"));
+        op.phase as u32
     }
 
     /// Validate a cross-chain state proof before executing a bridge transfer.
@@ -799,6 +841,14 @@ mod test {
         assert!(!client.is_bridge_chain_isolated(&CHAIN_ETHEREUM));
     }
 
+    #[contract]
+    pub struct MockEscrow;
+
+    #[contractimpl]
+    impl MockEscrow {
+        pub fn fund(_env: Env, _escrow_id: u64, _amount: i128) {}
+    }
+
     #[test]
     fn test_atomic_bridge_op_full_commit() {
         let env = Env::default();
@@ -811,6 +861,9 @@ mod test {
         client.init(&admin);
         client.add_trusted_relayer(&admin, &relayer);
 
+        let mock_escrow = env.register_contract(None, MockEscrow);
+        client.set_escrow_registry(&admin, &mock_escrow);
+
         let expected_root = BytesN::from_array(&env, &[0xABu8; 32]);
 
         let op_id = client.begin_bridge_atomic_op(
@@ -819,18 +872,77 @@ mod test {
             &CHAIN_SOLANA,
             &expected_root,
         );
+        // Verify operation begins in XChainPhase::Prepared (1)
+        assert_eq!(client.get_bridge_atomic_op_phase(&op_id), XChainPhase::Prepared as u32);
 
-        // Phase 1 — both chains prepare.
+        // Phase 1 — both chains prepare: Prepared -> Committing (2)
         client.acknowledge_bridge_prepare(&relayer, &op_id, &CHAIN_ETHEREUM);
         let phase = client.acknowledge_bridge_prepare(&relayer, &op_id, &CHAIN_SOLANA);
-        // Both prepared → phase transitions to Committing (2).
-        assert_eq!(phase, 2u32);
+        assert_eq!(phase, XChainPhase::Committing as u32);
+        assert_eq!(client.get_bridge_atomic_op_phase(&op_id), XChainPhase::Committing as u32);
 
-        // Phase 2 — both chains commit with matching root.
+        // Phase 2 — both chains commit with matching root: Committing -> Committed (3)
         client.confirm_bridge_commit(&relayer, &op_id, &CHAIN_ETHEREUM, &expected_root);
         let final_phase = client.confirm_bridge_commit(&relayer, &op_id, &CHAIN_SOLANA, &expected_root);
-        // Both committed → phase transitions to Committed (3).
-        assert_eq!(final_phase, 3u32);
+        assert_eq!(final_phase, XChainPhase::Committed as u32);
+        assert_eq!(client.get_bridge_atomic_op_phase(&op_id), XChainPhase::Committed as u32);
+    }
+
+    #[test]
+    fn test_atomic_bridge_op_rollback_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.add_trusted_relayer(&admin, &relayer);
+
+        let mock_escrow = env.register_contract(None, MockEscrow);
+        client.set_escrow_registry(&admin, &mock_escrow);
+
+        let expected_root = BytesN::from_array(&env, &[0xABu8; 32]);
+
+        let op_id = client.begin_bridge_atomic_op(
+            &relayer,
+            &CHAIN_ETHEREUM,
+            &CHAIN_SOLANA,
+            &expected_root,
+        );
+        // Starts in Prepared (1)
+        assert_eq!(client.get_bridge_atomic_op_phase(&op_id), XChainPhase::Prepared as u32);
+
+        // Rollback path: Prepared -> RollingBack (4)
+        client.rollback_bridge_op(&admin, &op_id);
+        assert_eq!(client.get_bridge_atomic_op_phase(&op_id), XChainPhase::RollingBack as u32);
+
+        // Confirm rollback: RollingBack -> RolledBack (5)
+        client.confirm_bridge_rollback(&admin, &op_id);
+        assert_eq!(client.get_bridge_atomic_op_phase(&op_id), XChainPhase::RolledBack as u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Untrusted relayer")]
+    fn test_atomic_bridge_op_rejects_non_relayer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let untrusted = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let expected_root = BytesN::from_array(&env, &[0xABu8; 32]);
+
+        client.begin_bridge_atomic_op(
+            &untrusted,
+            &CHAIN_ETHEREUM,
+            &CHAIN_SOLANA,
+            &expected_root,
+        );
     }
 
     #[test]

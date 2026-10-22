@@ -55,11 +55,11 @@ pub struct SnapshotMeta {
     pub contract_version: BytesN<32>,
     /// Admin address that authorized the snapshot.
     pub admin: Address,
-    /// SHA-256 checksum of the serialised snapshot data for integrity verification.
+    /// SHA-256 checksum of the serialized snapshot payload, so altered state can be detected before rollback.
     pub checksum: BytesN<32>,
-    /// Number of entity records (escrows, stakes, proposals) captured.
+    /// Number of entity records captured in this snapshot, such as escrows, stakes, or proposals.
     pub record_count: u64,
-    /// Position within the rolling 3-snapshot window (0, 1, or 2).
+    /// Zero-based position in the rolling `MAX_SNAPSHOTS`-entry window, where the oldest retained snapshot is evicted first.
     pub snapshot_index: u32,
 }
 
@@ -142,14 +142,13 @@ pub struct RollbackApproval {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum number of snapshots retained simultaneously.
-/// When a 4th snapshot is created the oldest is automatically removed.
+/// Maximum number of snapshots retained simultaneously; creating a fourth evicts the oldest snapshot.
 pub const MAX_SNAPSHOTS: u32 = 3;
 
-/// Number of emergency signers required to authorise a rollback (4-of-7).
+/// Number of distinct emergency approvals required before a rollback (4 of 7 signers).
 pub const EMERGENCY_THRESHOLD: u32 = 4;
 
-/// Total number of emergency signer slots.
+/// Total number of emergency signer slots available to the recovery policy.
 pub const EMERGENCY_SIGNERS: u32 = 7;
 
 // ---------------------------------------------------------------------------

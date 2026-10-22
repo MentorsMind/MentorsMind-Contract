@@ -314,7 +314,7 @@ fn simulate_liquidity_drain_enforces_sc36_fee_floor() {
     let mut approved = Vec::new(&env);
     approved.push_back(token_addr);
 
-    escrow.initialize(&admin, &treasury, &500u32, &approved, &0u64, &None);
+    escrow.initialize(&admin, &treasury, &500u32, &approved, &0u64);
     let original_fee = escrow.get_fee_bps();
     assert_panics(|| escrow.update_fee(&0u32));
     assert_eq!(
@@ -343,7 +343,7 @@ fn simulate_sybil_self_review_attempts_blocked_by_session_verification_requireme
 
     let mut approved = Vec::new(&env);
     approved.push_back(token.clone());
-    escrow.initialize(&admin, &treasury, &500u32, &approved, &0u64, &None);
+    escrow.initialize(&admin, &treasury, &500u32, &approved, &0u64);
 
     let now = env.ledger().timestamp();
     let eid = escrow.create_escrow(
@@ -370,4 +370,76 @@ fn simulate_sybil_self_review_attempts_blocked_by_session_verification_requireme
         escrow.submit_review(&learner, &eid, &symbol_short!("VALID"));
     }));
     assert!(ok.is_ok(), "learner review should succeed");
+}
+
+// Coordinated timing attack: late stakers pile in right before a distribution
+// to dilute rewards already earned by long-term stakers. The staking contract
+// defends with MIN_STAKING_DURATION_SECS (eligibility denominator) and with
+// per-epoch entry gating (late stakers cannot claim an epoch that closed
+// before they joined).
+#[test]
+fn simulate_coordinated_timing_attack_on_staking_distribution_is_blocked() {
+    use mentorminds_staking::{StakingContract, StakingContractClient};
+    use shared::MIN_STAKING_DURATION_SECS;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 10_000);
+
+    let admin = Address::generate(&env);
+    let (token, sac) = create_token(&env, &admin);
+
+    let staking_id = env.register_contract(None, StakingContract);
+    let staking = StakingContractClient::new(&env, &staking_id);
+    staking.initialize(&admin, &token, &None);
+
+    let stake_amount: i128 = 10_000;
+    let lock_days = (MIN_STAKING_DURATION_SECS / 86_400) as u32;
+    let reward: i128 = 100_000;
+
+    // Three long-term stakers.
+    let existing: std::vec::Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
+    for staker in &existing {
+        sac.mint(staker, &stake_amount);
+        staking.stake(staker, &stake_amount, &lock_days);
+    }
+
+    // Stakers mature past the minimum duration, then the first distribution
+    // closes epoch 0 with only the existing stakers eligible.
+    env.ledger()
+        .with_mut(|li| li.timestamp += MIN_STAKING_DURATION_SECS);
+    staking.distribute_revenue(&token, &reward);
+    assert_eq!(staking.get_epoch_eligible_total(&0), Some(3 * stake_amount));
+
+    // Attack: ten late stakers deposit one ledger (~5s) before the next
+    // distribution.
+    let late: std::vec::Vec<Address> = (0..10).map(|_| Address::generate(&env)).collect();
+    for staker in &late {
+        sac.mint(staker, &stake_amount);
+        staking.stake(staker, &stake_amount, &lock_days);
+    }
+    env.ledger().with_mut(|li| li.timestamp += 5);
+    staking.distribute_revenue(&token, &reward);
+
+    // Late stakers are excluded from the epoch-1 denominator.
+    assert_eq!(staking.get_epoch_eligible_total(&1), Some(3 * stake_amount));
+    assert_eq!(staking.get_total_staked(), 13 * stake_amount);
+
+    // Each late staker enters at epoch 2, after epoch 1 closed, so they have
+    // no claim on it and their snapshot cannot dilute existing stakers.
+    for staker in &late {
+        assert_eq!(staking.get_staker_epoch_entry(staker), Some(2));
+    }
+
+    // Existing stakers keep the full pre-attack share of epoch 1:
+    // reward * stake / pre-attack eligible total.
+    let pre_attack_total = staking.get_epoch_eligible_total(&0).unwrap();
+    let post_attack_total = staking.get_epoch_eligible_total(&1).unwrap();
+    assert_eq!(post_attack_total, pre_attack_total);
+    for staker in &existing {
+        let snapshot = staking.get_epoch_staker_snapshot(&1, staker).unwrap();
+        let expected_share = reward * stake_amount / pre_attack_total;
+        let actual_share = reward * snapshot / post_attack_total;
+        assert_eq!(actual_share, expected_share, "existing staker diluted by late deposits");
+    }
 }

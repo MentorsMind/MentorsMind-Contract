@@ -1,11 +1,43 @@
 #![no_std]
 
-use shared::events::{
-    emit_anomaly_event, evt_anomaly_detected, evt_anomaly_hold_cleared, evt_anomaly_hold_placed,
-};
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contractclient, contractevent, contractimpl, contracterror, contracttype,
+    symbol_short, Address, Env, Symbol, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Typed contract events (#1241)
+// ---------------------------------------------------------------------------
+
+/// Emitted when anomalous activity is detected but a hold is not yet placed.
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyDetectedEvent {
+    #[topic]
+    pub action: Symbol,
+    pub user: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a hold is placed on a user due to severe anomalous activity.
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldPlacedEvent {
+    #[topic]
+    pub action: Symbol,
+    pub user: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when an admin clears an existing hold from a user.
+#[contractevent]
+#[derive(Clone)]
+pub struct AnomalyHoldClearedEvent {
+    #[topic]
+    pub action: Symbol,
+    pub user: Address,
+    pub timestamp: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -86,6 +118,8 @@ pub enum DataKey {
     Config,
     Metrics(Address),
     Hold(Address),
+    UserIndex(u32),      // Sequential index of monitored users (#1264)
+    UserCount,            // Total count of monitored users (#1264)
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +132,29 @@ const ONE_DAY_SECS:   u64 = 86_400;
 const DEFAULT_ESCROW_WARN_PER_HOUR:  u32  = 10;
 const DEFAULT_DISPUTE_HOLD_PER_DAY:  u32  = 3;
 const DEFAULT_VOLUME_HOLD_PER_HOUR:  i128 = 50_000 * 1_000_000;
+
+// TTL and pagination constants (#1265, #1264)
+const PERSISTENT_LIFETIME_THRESHOLD: u32 = 34560;  // ~14 days in ledgers
+const PERSISTENT_BUMP_AMOUNT: u32 = 7200;          // ~3 days in ledgers
+const HOLD_TTL: u32 = 864000;                       // Maximum TTL for hold flags
+const MAX_PAGE_SIZE: u32 = 100;                     // Maximum items per pagination page
+
+// ---------------------------------------------------------------------------
+// Contract Client (#1263)
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "AnomalyDetectorClient")]
+pub trait AnomalyDetectorTrait {
+    fn initialize(env: Env, admin: Address) -> Result<(), Error>;
+    fn set_thresholds(env: Env, admin: Address, config: AnomalyConfig) -> Result<(), Error>;
+    fn get_thresholds(env: Env) -> AnomalyConfig;
+    fn check_anomaly(env: Env, user: Address, action: AnomalyAction, amount: i128) -> Result<AnomalyResult, Error>;
+    fn clear_hold(env: Env, user: Address) -> Result<(), Error>;
+    fn is_on_hold(env: Env, user: Address) -> bool;
+    fn get_metrics(env: Env, user: Address) -> UserMetrics;
+    fn get_monitored_user_count(env: Env) -> u32;
+    fn get_monitored_users_page(env: Env, offset: u32, limit: u32) -> Vec<(Address, UserMetrics)>;
+}
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -211,14 +268,32 @@ impl AnomalyDetectorContract {
             }
         }
 
-        // Persist updated metrics
+        // Persist updated metrics with TTL extension (#1265)
         env.storage().persistent().set(&DataKey::Metrics(user.clone()), &metrics);
+        env.storage().persistent().extend_ttl(&DataKey::Metrics(user.clone()), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // Track user in index for pagination (#1264)
+        if !env.storage().persistent().has(&DataKey::Metrics(user.clone())) {
+            let count: u32 = env.storage().persistent().get(&DataKey::UserCount).unwrap_or(0);
+            env.storage().persistent().set(&DataKey::UserIndex(count), &user.clone());
+            env.storage().persistent().set(&DataKey::UserCount, &(count + 1));
+            env.storage().persistent().extend_ttl(&DataKey::UserCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        }
 
         if result == AnomalyResult::Hold {
             env.storage().persistent().set(&DataKey::Hold(user.clone()), &true);
-            emit_anomaly_event(&env, evt_anomaly_hold_placed(&env), (user.clone(), env.ledger().timestamp()));
+            env.storage().persistent().extend_ttl(&DataKey::Hold(user.clone()), PERSISTENT_LIFETIME_THRESHOLD, HOLD_TTL);
+            AnomalyHoldPlacedEvent {
+                action:    symbol_short!("hold_plcd"),
+                user:      user.clone(),
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
         } else if result == AnomalyResult::Warning {
-            emit_anomaly_event(&env, evt_anomaly_detected(&env), (user.clone(), env.ledger().timestamp()));
+            AnomalyDetectedEvent {
+                action:    symbol_short!("detected"),
+                user:      user.clone(),
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
         }
 
         Ok(result)
@@ -233,9 +308,37 @@ impl AnomalyDetectorContract {
 
         env.storage().persistent().remove(&DataKey::Hold(user.clone()));
 
-        emit_anomaly_event(&env, evt_anomaly_hold_cleared(&env), (user.clone(), env.ledger().timestamp()));
+        AnomalyHoldClearedEvent {
+            action:    symbol_short!("hold_clrd"),
+            user:      user.clone(),
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         Ok(())
+    }
+
+    /// Returns the number of monitored users.
+    pub fn get_monitored_user_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::UserCount).unwrap_or(0)
+    }
+
+    /// Returns a paginated list of monitored users with their metrics.
+    /// Offset and limit are used for pagination; limit is clamped to MAX_PAGE_SIZE.
+    pub fn get_monitored_users_page(env: Env, offset: u32, limit: u32) -> Vec<(Address, UserMetrics)> {
+        let now = env.ledger().timestamp();
+        let limit = limit.min(MAX_PAGE_SIZE);
+        let count = Self::get_monitored_user_count(&env);
+
+        let mut result = Vec::new(&env);
+
+        for i in offset..offset.saturating_add(limit).min(count) {
+            if let Some(user) = env.storage().persistent().get::<_, Address>(&DataKey::UserIndex(i)) {
+                let metrics = Self::get_or_default_metrics(&env, &user, now);
+                result.push_back((user, metrics));
+            }
+        }
+
+        result
     }
 
     /// Returns true if the user is currently on hold.
@@ -417,6 +520,56 @@ mod tests {
             .client()
             .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
         assert_eq!(result, AnomalyResult::Hold);
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed #[contractevent] emission tests (#1241)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anomaly_detected_event_emitted() {
+        let f = Fixture::setup();
+        // Trigger enough escrow creates to produce a Warning (11th call)
+        for _ in 0..10 {
+            f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        }
+        // 11th triggers AnomalyDetectedEvent
+        let result = f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        assert_eq!(result, AnomalyResult::Warning);
+
+        // Verify that at least one event was recorded by the environment
+        let events = f.env.events().all();
+        assert!(!events.is_empty(), "AnomalyDetectedEvent must have been published");
+    }
+
+    #[test]
+    fn test_anomaly_hold_placed_event_emitted() {
+        let f = Fixture::setup();
+        // Trigger a hold via LargeTransfer
+        let result = f
+            .client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+        assert_eq!(result, AnomalyResult::Hold);
+
+        let events = f.env.events().all();
+        assert!(!events.is_empty(), "AnomalyHoldPlacedEvent must have been published");
+    }
+
+    #[test]
+    fn test_anomaly_hold_cleared_event_emitted() {
+        let f = Fixture::setup();
+        // Place a hold first
+        f.client()
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
+        assert!(f.client().is_on_hold(&f.user));
+
+        // Clear it and verify event
+        f.client().clear_hold(&f.user);
+        assert!(!f.client().is_on_hold(&f.user));
+
+        let events = f.env.events().all();
+        // There should be at least two events: one for placing, one for clearing
+        assert!(events.len() >= 2, "AnomalyHoldClearedEvent must have been published");
     }
 
     #[test]

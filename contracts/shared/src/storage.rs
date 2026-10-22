@@ -4,6 +4,25 @@
 /// can add new fields without breaking existing data. All storage access
 /// goes through typed key enums, making the layout explicit and auditable.
 ///
+/// # When to Use EternalStorage vs Raw Storage
+///
+/// **Use EternalStorage helpers when:**
+/// - You want centralized, auditable storage access throughout your contract
+/// - You need typed keys with collision detection and namespace isolation
+/// - You're building a new contract or refactoring an existing one
+/// - You want automatic TTL management via the helper methods
+///
+/// **Use raw `env.storage()` directly when:**
+/// - Writing prototype/test code that doesn't need formalization
+/// - You need very specific low-level control that the helpers don't expose
+/// - Performance-critical hot paths where the indirection matters (rare)
+///
+/// In general, **prefer EternalStorage** for production contracts — it provides
+/// better maintainability, upgrade safety, and consistency across the codebase.
+///
+/// For detailed guidance on storage tiers, TTL management, and upgrade patterns,
+/// see the [storage pattern guide](../../docs/storage-pattern.md).
+///
 /// # Pattern
 /// - Each contract defines its own `StorageKey` enum (or reuses these helpers).
 /// - Logic contracts call `EternalStorage::get / set / remove`.

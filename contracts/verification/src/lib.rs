@@ -13,7 +13,7 @@ use shared::{
     trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
 };
 use shared::metadata_validation::{audit_information_accuracy, InformationAuditRecord};
@@ -157,6 +157,19 @@ pub struct CertificationAuthorityRecord {
     pub registered_at: u64,
     pub reputation_bps: u32,
     pub active: bool,
+}
+
+#[contractclient(name = "VerificationContractClient")]
+pub trait VerificationTrait {
+    fn is_verified(env: Env, mentor: Address) -> bool;
+    fn get_verification_status(env: Env, mentor: Address) -> VerificationStatus;
+    fn submit_verification(
+        env: Env,
+        user: Address,
+        platform: Symbol,
+        credential_hash: BytesN<32>,
+        identity: CrossPlatformIdentity,
+    ) -> Result<(), Error>;
 }
 
 #[contract]
@@ -1297,7 +1310,6 @@ mod test {
         assert!(client.validate_external_reputation(&f.mentor, &platform, &1000u32));
         assert!(client.bridge_identity(&f.mentor, &platform, &ext_id));
     }
-}
 
 
     #[test]
@@ -1399,6 +1411,15 @@ mod test {
         let record = audit.unwrap();
         assert!(record.audited);
         assert!(!record.accuracy_verified);
+    }
+
+    #[test]
+    fn test_verification_contract_client_trait() {
+        let f = TestFixture::setup();
+        let client = VerificationContractClient::new(&f.env, &f.contract);
+        assert!(!client.is_verified(&f.mentor));
+        let status = client.get_verification_status(&f.mentor);
+        assert!(!status.is_verified);
     }
 }
 

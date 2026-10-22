@@ -10,7 +10,9 @@ use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAc
 use shared::GasEstimate;
 use shared::dynamic_fees::{calculate_dynamic_fee, DynamicFeeResult};
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::atomic_state::{StateTransitionContext, STATE_TRANSITION_TIMEOUT_SECS};
 use shared::CrossContractAuth;
+use shared::platform_authenticity::{detect_fee_evasion, PenaltyTier};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -55,6 +57,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
 const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const HEALTH_DASHBOARD: Symbol = symbol_short!("HLTH_DB");
+pub const DEP_HIST: Symbol = symbol_short!("DEP_HIST");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -102,6 +105,7 @@ pub enum DataKey {
     NamespaceRoot,
     HighValueThreshold,
     PendingHighValueSession(Symbol),
+    ActiveDeployContext,
 }
 
 #[contracttype]
@@ -311,6 +315,16 @@ impl EscrowFactory {
             panic_with_error!(&env, Error::Unauthorized);
         }
 
+        // Fee evasion check for the deploying learner
+        let fee_bps = Self::calculate_escrow_fees(&env, 0, 100);
+        let expected_fee = if amount > 0 {
+            (amount * fee_bps as i128) / 10_000
+        } else {
+            100_000
+        };
+        let expected_fee = if expected_fee == 0 { 100_000 } else { expected_fee };
+        Self::check_fee_evasion(&env, &learner, expected_fee);
+
         // Check pause guardian
         if let Some(guardian) = env.storage().persistent().get::<_, Address>(&PAUSE_GUARDIAN) {
             let is_paused: bool = env.invoke_contract(
@@ -410,15 +424,18 @@ impl EscrowFactory {
         let nonce_key = (SESSION_NONCE, session_id.clone());
         let nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
         let next_nonce = nonce.checked_add(1).expect("nonce overflow");
+        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+
+        Self::start_deploy_context(&env, salt.clone(), next_nonce as u64, now);
+
         env.storage().persistent().set(&nonce_key, &next_nonce);
         env.storage()
             .persistent()
             .extend_ttl(&nonce_key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
 
-        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
-
         // Deploy new escrow instance as minimal proxy
         let escrow_address = Self::deploy_minimal_proxy(&env, &implementation, salt);
+        Self::mark_deploy_checkpoint(&env);
 
         // Calculate dynamic fee
         let system_load: u32 = 0; // Replace with actual load metric
@@ -427,7 +444,7 @@ impl EscrowFactory {
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
-        let _: () = env.invoke_contract(
+        let initialize_result = env.try_invoke_contract::<(), soroban_sdk::Error>(
             &escrow_address,
             &initialize_sym,
             (
@@ -439,10 +456,15 @@ impl EscrowFactory {
             )
                 .into_val(&env),
         );
+        if !matches!(initialize_result, Ok(Ok(()))) {
+            Self::initiate_deploy_rollback(&env);
+            panic!("escrow initialization failed");
+        }
+        Self::mark_deploy_checkpoint(&env);
 
         // Create escrow in the deployed contract
         let create_escrow_sym = Symbol::new(&env, "create_escrow");
-        let _: Address = env.invoke_contract(
+        let create_result = env.try_invoke_contract::<Address, soroban_sdk::Error>(
             &escrow_address,
             &create_escrow_sym,
             (
@@ -455,6 +477,11 @@ impl EscrowFactory {
             )
                 .into_val(&env),
         );
+            if !matches!(create_result, Ok(Ok(_))) {
+                Self::initiate_deploy_rollback(&env);
+                panic!("escrow creation failed");
+            }
+            Self::mark_deploy_checkpoint(&env);
 
         // Store mapping
         env.storage()
@@ -498,12 +525,18 @@ impl EscrowFactory {
         // Register interface in the interface registry (if set)
         if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
             let interface_id = Symbol::new(&env, "escrow_v1");
-            let _: () = env.invoke_contract(
+            let register_result = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &registry_addr,
                 &Symbol::new(&env, "register_interface"),
                 (escrow_address.clone(), interface_id, 1u32).into_val(&env),
             );
+            if !matches!(register_result, Ok(Ok(()))) {
+                Self::initiate_deploy_rollback(&env);
+                panic!("interface registration failed");
+            }
         }
+        Self::mark_deploy_checkpoint(&env);
+        Self::complete_deploy_context(&env);
 
         // Report health metric for escrow creation
         if let Some(dashboard) = env.storage().persistent().get::<_, Address>(&HEALTH_DASHBOARD) {
@@ -790,7 +823,34 @@ impl EscrowFactory {
 
     pub fn validate_fee_payments(env: &Env, expected_bps: u32, provided_bps: u32) -> bool {
         // Allow a tiny rounding tolerance if needed, but normally should exactly match
+        let _ = env;
         expected_bps == provided_bps
+    }
+
+    pub fn check_fee_evasion(env: &Env, learner: &Address, expected_fee: i128) {
+        let key = (DEP_HIST, learner.clone());
+        let (count, total_fee): (u32, i128) = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or((0, 0));
+
+        if count > 0 {
+            let actual_avg = total_fee / (count as i128);
+            let audit = detect_fee_evasion(env, expected_fee, actual_avg);
+            if audit.penalty_tier == PenaltyTier::Permanent
+                || audit.penalty_tier == PenaltyTier::PermanentBan
+            {
+                panic_with_error!(env, Error::Unauthorized);
+            }
+        }
+
+        let new_count = count.saturating_add(1);
+        let new_fee = total_fee.saturating_add(expected_fee);
+        env.storage().temporary().set(&key, &(new_count, new_fee));
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     // -----------------------------------------------------------------------
@@ -883,7 +943,77 @@ impl EscrowFactory {
     /// beforehand.
     fn deploy_minimal_proxy(env: &Env, implementation: &Address, salt: BytesN<32>) -> Address {
         let _ = implementation;
-        env.deployer().with_current_contract(salt).deployed_address()
+        let addr = env.deployer().with_current_contract(salt).deployed_address();
+        #[cfg(test)]
+        {
+            let _ = env.register_contract(Some(&addr), MockEscrow);
+        }
+        addr
+    }
+
+    fn start_deploy_context(env: &Env, transition_id: BytesN<32>, entity_id: u64, now: u64) {
+        let timeout_at = now
+            .checked_add(STATE_TRANSITION_TIMEOUT_SECS)
+            .expect("deployment timeout overflow");
+        let context = StateTransitionContext {
+            transition_id,
+            entity_id,
+            pre_state: Symbol::new(env, "uninitialized"),
+            post_state: Symbol::new(env, "deployed"),
+            started_at: now,
+            timeout_at,
+            checkpoints_passed: 0,
+            total_checkpoints: 4,
+            lock_holder: env.current_contract_address(),
+            rollback_initiated: false,
+        };
+        let key = DataKey::ActiveDeployContext;
+        env.storage().persistent().set(&key, &context);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    fn mark_deploy_checkpoint(env: &Env) {
+        let key = DataKey::ActiveDeployContext;
+        let mut context: StateTransitionContext = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("deployment context missing");
+        context.checkpoints_passed = context
+            .checkpoints_passed
+            .checked_add(1)
+            .expect("deployment checkpoint overflow");
+        env.storage().persistent().set(&key, &context);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    fn initiate_deploy_rollback(env: &Env) {
+        let key = DataKey::ActiveDeployContext;
+        if let Some(mut context) = env
+            .storage()
+            .persistent()
+            .get::<_, StateTransitionContext>(&key)
+        {
+            context.rollback_initiated = true;
+            env.storage().persistent().set(&key, &context);
+        }
+    }
+
+    fn complete_deploy_context(env: &Env) {
+        let key = DataKey::ActiveDeployContext;
+        let context: StateTransitionContext = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("deployment context missing");
+        if context.checkpoints_passed < context.total_checkpoints {
+            panic!("deployment checkpoints incomplete");
+        }
+        env.storage().persistent().remove(&key);
     }
 
     /// Get admin address (internal helper)
@@ -904,6 +1034,35 @@ impl EscrowFactory {
         if *caller != Self::admin(env) {
             panic!("Unauthorized");
         }
+    }
+}
+
+#[cfg(test)]
+#[contract]
+pub struct MockEscrow;
+
+#[cfg(test)]
+#[contractimpl]
+impl MockEscrow {
+    pub fn initialize(
+        _env: Env,
+        _admin: Address,
+        _treasury: Address,
+        _fee_bps: u32,
+        _approved_tokens: Vec<Address>,
+        _auto_release_delay: u64,
+    ) {}
+
+    pub fn create_escrow(
+        env: Env,
+        _mentor: Address,
+        _learner: Address,
+        _amount: i128,
+        _session_id: Symbol,
+        _token: Address,
+        _session_end: u64,
+    ) -> Address {
+        env.current_contract_address()
     }
 }
 
@@ -1057,5 +1216,227 @@ mod timestamp_tests {
             MIN_SESSION_DURATION_SECS,
             MAX_SESSION_DURATION_SECS,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Meta-transaction replay protection tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod meta_tx_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use shared::sig_validation::{MetaTxAction, MetaTxPayload, MAX_DEADLINE_SECS};
+
+    fn setup_factory_for_metatx() -> (Env, Address, Address, EscrowFactoryClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+        let admin = Address::generate(&env);
+        let implementation = Address::generate(&env);
+
+        let factory_id = env.register_contract(None, EscrowFactory);
+        let factory = EscrowFactoryClient::new(&env, &factory_id);
+        
+        factory.initialize(&admin, &implementation);
+
+        (env, admin, factory_id, factory)
+    }
+
+    fn create_payload(
+        env: &Env,
+        contract_id: &Address,
+        signer: &Address,
+        nonce: u64,
+        deadline: u64,
+    ) -> MetaTxPayload {
+        // For simplicity, use a dummy params_hash
+        let params_hash = env.crypto().sha256(&soroban_sdk::Bytes::new(env));
+        
+        MetaTxPayload {
+            contract_id: contract_id.clone(),
+            nonce,
+            deadline,
+            action: MetaTxAction::DeployEscrow,
+            params_hash,
+        }
+    }
+
+    #[test]
+    fn test_meta_tx_replay_rejected() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
+        
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let session_id = soroban_sdk::symbol_short!("SESS_01");
+        
+        // Get initial nonce
+        let initial_nonce = factory.get_nonce(&signer);
+        assert_eq!(initial_nonce, 0);
+        
+        // Create payload with nonce 0
+        let now = env.ledger().timestamp();
+        let payload = create_payload(&env, &factory_id, &signer, 0, now + 3600);
+        
+        // First execution should succeed
+        let _escrow_addr = factory.execute_meta_tx(
+            &signer,
+            &payload,
+            &mentor,
+            &learner,
+            &1000,
+            &token,
+            &session_id,
+        );
+        
+        // Nonce should be incremented
+        let new_nonce = factory.get_nonce(&signer);
+        assert_eq!(new_nonce, 1);
+        
+        // Try to replay the same payload - should panic with nonce error
+        // Note: The exact error message depends on shared::sig_validation implementation
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,  // Same payload, same nonce
+                &mentor,
+                &learner,
+                &2000,     // Different amount, doesn't matter
+                &token,
+                &soroban_sdk::symbol_short!("SESS_02"),
+            );
+        }));
+        
+        assert!(result.is_err(), "Replay should have been rejected");
+    }
+
+    #[test]
+    fn test_meta_tx_expired_deadline_rejected() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
+        
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let session_id = soroban_sdk::symbol_short!("SESS_03");
+        
+        let now = env.ledger().timestamp();
+        let payload = create_payload(&env, &factory_id, &signer, 0, now + 1000);
+        
+        // Advance time past the deadline + MAX_DEADLINE_SECS
+        env.ledger().with_mut(|li| {
+            li.timestamp += MAX_DEADLINE_SECS + 1;
+        });
+        
+        // Attempt should be rejected due to expired deadline
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &1000,
+                &token,
+                &session_id,
+            );
+        }));
+        
+        assert!(result.is_err(), "Expired deadline should have been rejected");
+    }
+
+    #[test]
+    fn test_meta_tx_third_attempt_after_expiry_also_rejected() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
+        
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        
+        let now = env.ledger().timestamp();
+        let payload = create_payload(&env, &factory_id, &signer, 0, now + 1000);
+        
+        // First execution succeeds
+        factory.execute_meta_tx(
+            &signer,
+            &payload,
+            &mentor,
+            &learner,
+            &1000,
+            &token,
+            &soroban_sdk::symbol_short!("SESS_04"),
+        );
+        
+        // Second attempt (replay) should fail
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &1000,
+                &token,
+                &soroban_sdk::symbol_short!("SESS_05"),
+            );
+        }));
+        assert!(result.is_err(), "Second attempt (replay) should fail");
+        
+        // Advance time past MAX_DEADLINE_SECS
+        env.ledger().with_mut(|li| {
+            li.timestamp += MAX_DEADLINE_SECS + 1;
+        });
+        
+        // Third attempt should also fail (expired + wrong nonce)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &1000,
+                &token,
+                &soroban_sdk::symbol_short!("SESS_06"),
+            );
+        }));
+        assert!(result.is_err(), "Third attempt after expiry should also fail");
+    }
+
+    #[test]
+    fn test_meta_tx_sequential_nonces_work() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
+        
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        
+        let now = env.ledger().timestamp();
+        
+        // Execute 3 transactions with sequential nonces
+        for i in 0..3 {
+            let payload = create_payload(&env, &factory_id, &signer, i, now + 3600);
+            let session_id = match i {
+                0 => soroban_sdk::symbol_short!("S1"),
+                1 => soroban_sdk::symbol_short!("S2"),
+                _ => soroban_sdk::symbol_short!("S3"),
+            };
+            
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &((i + 1) as i128 * 1000),
+                &token,
+                &session_id,
+            );
+            
+            // Verify nonce incremented
+            assert_eq!(factory.get_nonce(&signer), i + 1);
+        }
     }
 }

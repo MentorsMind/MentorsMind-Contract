@@ -48,32 +48,59 @@ impl ReferralLeaderboardContract {
             .get(&DataKey::Leaderboard)
             .unwrap_or(Vec::new(&env));
 
-        // Remove existing entry for referrer if present
-        leaderboard = leaderboard
-            .iter()
-            .filter(|(addr, _)| addr != &referrer)
-            .map(|(addr, count)| (addr, count))
-            .collect::<Vec<_>>(&env);
+        // Remove existing entry for referrer if present (manual filter/map)
+        let mut deduplicated = Vec::new(&env);
+        for i in 0..leaderboard.len() {
+            let entry = leaderboard.get(i).unwrap();
+            if entry.0 != referrer {
+                deduplicated.push_back(entry);
+            }
+        }
+        leaderboard = deduplicated;
 
         // Add or update with new count
         leaderboard.push_back((referrer.clone(), referral_count));
 
-        // Sort by count descending, take top 50
-        leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
-        if leaderboard.len() > 50 {
-            leaderboard = leaderboard.slice(0..50);
+        // Manual insertion sort by count descending (selection sort)
+        for i in 0..leaderboard.len() {
+            let mut max_idx = i;
+            for j in (i + 1)..leaderboard.len() {
+                let current_max = leaderboard.get(max_idx).unwrap();
+                let current_j = leaderboard.get(j).unwrap();
+                if current_j.1 > current_max.1 {
+                    max_idx = j;
+                }
+            }
+            if max_idx != i {
+                let temp = leaderboard.get(max_idx).unwrap();
+                leaderboard.set(max_idx, leaderboard.get(i).unwrap());
+                leaderboard.set(i, temp);
+            }
         }
+
+        // Cap at 50 elements (manual slice equivalent)
+        let mut capped = Vec::new(&env);
+        for i in 0..leaderboard.len() {
+            if i >= 50 {
+                break;
+            }
+            capped.push_back(leaderboard.get(i).unwrap());
+        }
+        leaderboard = capped;
 
         env.storage()
             .persistent()
             .set(&DataKey::Leaderboard, &leaderboard);
 
-        // Emit event with top 3
-        let top_three = leaderboard
-            .iter()
-            .take(3)
-            .map(|(addr, _)| addr.clone())
-            .collect::<Vec<_>>(&env);
+        // Emit event with top 3 (manual take equivalent)
+        let mut top_three = Vec::new(&env);
+        for i in 0..leaderboard.len() {
+            if i >= 3 {
+                break;
+            }
+            let (addr, _) = leaderboard.get(i).unwrap();
+            top_three.push_back(addr);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "Leaderboard"), Symbol::new(&env, "Updated")),

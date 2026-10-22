@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
     token, Address, Env, Symbol, Vec,
 };
+use shared::ttl_utils::{PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -252,14 +253,31 @@ impl ReconciliationEngine {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().persistent().set(&DataKey::Admin,            &admin);
+        env.storage().persistent().extend_ttl(&DataKey::Admin, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::EscrowContract,   &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::EscrowContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::TreasuryContract, &treasury);
+        env.storage().persistent().extend_ttl(&DataKey::TreasuryContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::ReferralContract, &referral);
+        env.storage().persistent().extend_ttl(&DataKey::ReferralContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::InsuranceContract,&insurance);
+        env.storage().persistent().extend_ttl(&DataKey::InsuranceContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::RecordCount,      &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::RecordCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::MismatchCount,    &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::MismatchCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::ReportCount,      &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::ReportCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::HistoricalCount,  &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::HistoricalCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(())
     }
 
@@ -299,8 +317,14 @@ impl ReconciliationEngine {
             id, source, token: token.clone(), amount, aux_bps, gross_base,
             account: account.clone(), reference, timestamp: ts,
         };
-        env.storage().persistent().set(&DataKey::Record(id), &rec);
+        
+        // Write record and extend TTL to ensure audit trail persists
+        let record_key = DataKey::Record(id);
+        env.storage().persistent().set(&record_key, &rec);
+        env.storage().persistent().extend_ttl(&record_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::RecordCount, &id);
+        env.storage().persistent().extend_ttl(&DataKey::RecordCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         // Running totals
         let key = DataKey::RunningTotals(source);
@@ -315,6 +339,7 @@ impl ReconciliationEngine {
             outs = outs.checked_sub(amount).ok_or(Error::Overflow)?; // -(-x) = +x
         }
         env.storage().persistent().set(&key, &(ins, outs));
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         // Source-specific accumulators
         match source {
@@ -324,12 +349,14 @@ impl ReconciliationEngine {
                     env.storage().persistent().get(&k).unwrap_or((0, 0));
                 let new_credited = credited.checked_add(amount.max(0)).ok_or(Error::Overflow)?;
                 env.storage().persistent().set(&k, &(pending, new_credited));
+                env.storage().persistent().extend_ttl(&k, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
             }
             LedgerSource::InsuranceYield | LedgerSource::InsuranceClaim => {
                 let k = DataKey::InsuranceAgg(account.clone());
                 let shares: i128 = env.storage().persistent().get(&k).unwrap_or(0);
                 let new = shares.checked_add(amount).ok_or(Error::Overflow)?;
                 env.storage().persistent().set(&k, &new);
+                env.storage().persistent().extend_ttl(&k, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
             }
             _ => {}
         }
@@ -1598,5 +1625,72 @@ mod tests {
         assert_eq!(calc_insurance_yield(100_000), 10);
         assert_eq!(calc_insurance_yield(0), 0);
         assert_eq!(calc_insurance_yield(99), 0); // truncated
+    }
+
+    // ======================================================================
+    // TTL PERSISTENCE TESTS
+    // ======================================================================
+
+    #[test]
+    fn test_reconciliation_records_persist_with_ttl() {
+        let f = Fixture::setup();
+        let account = Address::generate(&f.env);
+        
+        // Append a record
+        let record_id = f.client().append_record(
+            &f.admin,
+            &LedgerSource::EscrowFee,
+            &f.token,
+            &1000,
+            &500u32,
+            &10000,
+            &account,
+            &Symbol::new(&f.env, "test_record")
+        ).unwrap();
+        
+        // Verify record exists
+        let record = f.client().get_record(&record_id).unwrap();
+        assert_eq!(record.id, record_id);
+        assert_eq!(record.amount, 1000);
+        
+        // Simulate time passage beyond default TTL (advance ledger by ~15 days)
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 15 * 17_280; // 15 days in ledgers
+        });
+        
+        // Record should still exist after default TTL window
+        // because we extended TTL with PERSISTENT_BUMP_AMOUNT (30 days)
+        let record_after_time = f.client().get_record(&record_id).unwrap();
+        assert_eq!(record_after_time.id, record_id);
+        assert_eq!(record_after_time.amount, 1000);
+    }
+
+    #[test]
+    fn test_config_keys_have_ttl_extension() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let referral = Address::generate(&env);
+        let insurance = Address::generate(&env);
+        
+        let recon_id = env.register_contract(None, ReconciliationEngine);
+        let client = ReconciliationEngineClient::new(&env, &recon_id);
+        
+        client.initialize(&admin, &escrow, &treasury, &referral, &insurance).unwrap();
+        
+        // Verify initial record count is set
+        assert_eq!(client.get_record_count(), 0);
+        
+        // Advance time significantly (20 days)
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 20 * 17_280; // 20 days in ledgers
+        });
+        
+        // Config keys should still be accessible
+        // because they were extended with TTL during initialization
+        assert_eq!(client.get_record_count(), 0);
     }
 }

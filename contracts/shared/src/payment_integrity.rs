@@ -184,3 +184,19 @@ pub fn compute_emergency_isolation(
         locked_at: env.ledger().timestamp(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Ledger, Env};
+
+    #[test]
+    fn evidence_sufficiency_requires_minimum_count_and_cooldown() {
+        let env = Env::default();
+        env.ledger().with_mut(|ledger| ledger.timestamp = MIN_DISPUTE_COOLDOWN_SECS);
+
+        assert!(!validate_evidence_sufficiency(&env, 0, 0).sufficient);
+        assert!(validate_evidence_sufficiency(&env, 1, 0).sufficient);
+        assert!(validate_evidence_sufficiency(&env, MIN_EVIDENCE_ITEMS, 0).sufficient);
+    }
+}

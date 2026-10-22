@@ -5,7 +5,7 @@ use shared::events::{
     evt_bounty_refunded, evt_bounty_verified,
 };
 use shared::health_reporter::{report_metric, MetricCategory};
-use shared::{SecureStorageAccess, StorageNamespace};
+use shared::pause_guard::{require_not_paused_local, pause, unpause, set_pause_guardian};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Val, Vec,
@@ -51,6 +51,8 @@ pub enum DataKey {
     BountyLock(u32),
     /// Address of the health dashboard for metric reporting.
     HealthDashboard,
+    /// Guardian address for pause/unpause operations.
+    PauseGuardian,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +204,23 @@ impl BountyContract {
         env.storage()
             .persistent()
             .set(&DataKey::HealthDashboard, &health_dashboard);
+    }
+
+    /// Set the pause guardian address. Admin only.
+    /// The guardian can call pause() and unpause() to control reward distribution.
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if stored_admin != admin {
+            panic!("Admin address mismatch");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
     }
 
     /// Post a new bounty with milestones. Transfers `reward` tokens from poster to this contract.
@@ -403,7 +422,7 @@ impl BountyContract {
     }
 
     /// Verified mentor confirms a learner completed the challenge.
-    /// Releases reward for all remaining unverified milestones to the learner.
+    /// Released reward for all remaining unverified milestones to the learner.
     /// First verified claim wins; subsequent calls panic.
     pub fn verify_completion(
         env: Env,
@@ -419,6 +438,9 @@ impl BountyContract {
         env.storage().persistent().set(&lock_key, &true);
 
         mentor.require_auth();
+
+        // Check if contract is paused before allowing reward distribution
+        require_not_paused_local(&env);
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if reviewer_notes_hash == zero_hash {
@@ -528,6 +550,7 @@ impl BountyContract {
     }
 
     /// Verify a single milestone for a learner, releasing the proportional reward.
+    /// Verify a single milestone for a learner, releasing the proportional reward.
     /// Different learners can complete different milestones (collaborative bounties).
     pub fn verify_milestone(
         env: Env,
@@ -544,6 +567,9 @@ impl BountyContract {
         env.storage().persistent().set(&lock_key, &true);
 
         mentor.require_auth();
+
+        // Check if contract is paused before allowing reward distribution
+        require_not_paused_local(&env);
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if reviewer_notes_hash == zero_hash {
@@ -1485,4 +1511,159 @@ mod test {
         assert_eq!(f.token().balance(&f.poster), 970_000); // 900k + 70k refund
         assert_eq!(f.token().balance(&f.bounty_id), 0);
     }
+
+    #[test]
+    fn test_stress_50_concurrent_claimants() {
+        let f = TestFixture::setup();
+        let id = f.post_default_bounty();
+
+        let num_claimants = 50;
+        let mut claimants = Vec::new(&f.env);
+
+        // Generate 50 different addresses and have them all claim the same bounty
+        for i in 0..num_claimants {
+            let claimant = Address::generate(&f.env);
+            claimants.push_back(claimant.clone());
+
+            // Each claimant claims the bounty with unique submission hashes
+            let submission_hash = BytesN::from_array(&f.env, &[(i as u8); 32]);
+            let uri_hash = BytesN::from_array(&f.env, &[(i as u8 + 1); 32]);
+
+            f.client().claim_bounty(&claimant, &id, &submission_hash, &uri_hash);
+        }
+
+        // Verify all 50 claims exist without collision
+        for i in 0..num_claimants {
+            let claimant = claimants.get(i).unwrap();
+            let claim = f.client().get_claim(&id, &claimant);
+            assert_eq!(claim.status, ClaimStatus::Pending);
+            assert_eq!(claim.learner, claimant);
+        }
+
+        // Verify bounty state is Claimed (not Verified yet)
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Claimed);
+        assert_eq!(bounty.winner, None);
+
+        // Verify the first claimant's claim can be verified and releases reward
+        let first_claimant = claimants.get(0).unwrap();
+        f.client()
+            .verify_completion(&f.mentor, &id, &first_claimant);
+
+        let bounty_after = f.client().get_bounty(&id);
+        assert_eq!(bounty_after.status, BountyStatus::Verified);
+        assert_eq!(bounty_after.winner, Some(first_claimant.clone()));
+
+        // Verify reward was transferred to first claimant
+        assert_eq!(f.token().balance(&first_claimant), 100_000);
+        assert_eq!(f.token().balance(&f.bounty_id), 0);
+
+        // Verify second claimant cannot claim again
+        let second_claimant = claimants.get(1).unwrap();
+        let second_claim = f.client().get_claim(&id, &second_claimant);
+        assert_eq!(second_claim.status, ClaimStatus::Pending);
+    }
 }
+
+    #[test]
+    fn test_set_pause_guardian() {
+        let f = TestFixture::setup();
+        let guardian = Address::generate(&f.env);
+        
+        // Set pause guardian as admin
+        f.client().set_pause_guardian(&f.admin, &guardian);
+    }
+
+    #[test]
+    #[should_panic(expected = "contract paused")]
+    fn test_verify_completion_blocked_when_paused() {
+        let f = TestFixture::setup();
+        let guardian = Address::generate(&f.env);
+        
+        // Set pause guardian and pause the contract
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        f.env.as_contract(&f.bounty_id, || {
+            pause(&f.env);
+        });
+
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Attempt to verify while paused should panic
+        f.client().verify_completion(&f.mentor, &id, &f.learner);
+    }
+
+    #[test]
+    #[should_panic(expected = "contract paused")]
+    fn test_verify_milestone_blocked_when_paused() {
+        let f = TestFixture::setup();
+        let guardian = Address::generate(&f.env);
+        
+        // Set pause guardian and pause the contract
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        f.env.as_contract(&f.bounty_id, || {
+            pause(&f.env);
+        });
+
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 5000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 5000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Test"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Attempt to verify milestone while paused should panic
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+    }
+
+    #[test]
+    fn test_verify_completion_succeeds_after_unpause() {
+        let f = TestFixture::setup();
+        let guardian = Address::generate(&f.env);
+        
+        // Set pause guardian
+        f.client().set_pause_guardian(&f.admin, &guardian);
+        
+        // Pause the contract
+        f.env.as_contract(&f.bounty_id, || {
+            pause(&f.env);
+        });
+
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Unpause the contract
+        f.env.as_contract(&f.bounty_id, || {
+            unpause(&f.env);
+        });
+
+        // Should now succeed
+        f.client().verify_completion(&f.mentor, &id, &f.learner);
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Verified);
+        assert_eq!(bounty.winner, Some(f.learner.clone()));
+
+        // Verify reward was transferred
+        assert_eq!(f.token().balance(&f.learner), 100_000);
+        assert_eq!(f.token().balance(&f.bounty_id), 0);
+    }

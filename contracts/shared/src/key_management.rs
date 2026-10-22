@@ -801,6 +801,27 @@ mod tests {
     }
 
     #[test]
+    fn test_rotation_due_after_rotation_interval() {
+        let env = env_at(1_000);
+        let account = soroban_sdk::Address::generate(&env);
+
+        register_key(
+            &env,
+            &account,
+            KeyScheme::Ed25519,
+            dummy_commitment(&env, 7),
+            dummy_commitment(&env, 8),
+            true,
+        );
+        assert!(!is_rotation_due(&env, &account));
+
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp = 1_000 + KEY_ROTATION_PERIOD_SECS + 1;
+        });
+        assert!(is_rotation_due(&env, &account));
+    }
+
+    #[test]
     fn test_child_key_derivation_deterministic() {
         let env = env_at(1_000);
         let parent = dummy_commitment(&env, 0xAA);

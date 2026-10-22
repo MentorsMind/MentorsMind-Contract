@@ -289,3 +289,59 @@ fn test_isa_state_machine_transitions() {
         }
     }
 }
+
+#[test]
+fn test_atomic_transition_escrow_valid() {
+    let env = Env::default();
+    let result = EscrowStatus::atomic_transition(
+        &env,
+        &EscrowStatus::Pending,
+        &EscrowStatus::Active,
+        false,
+        false,
+    );
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), EscrowStatus::Active);
+}
+
+#[test]
+fn test_atomic_transition_escrow_invalid() {
+    let env = Env::default();
+    let result = EscrowStatus::atomic_transition(
+        &env,
+        &EscrowStatus::Released,
+        &EscrowStatus::Pending,
+        false,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "Invalid state transition");
+}
+
+#[test]
+fn test_atomic_transition_proposal_valid() {
+    let env = Env::default();
+    let result = ProposalStatus::atomic_transition(
+        &env,
+        &ProposalStatus::Active,
+        &ProposalStatus::Passed,
+        false,
+        false,
+    );
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), ProposalStatus::Passed);
+}
+
+#[test]
+fn test_atomic_transition_proposal_invalid() {
+    let env = Env::default();
+    let result = ProposalStatus::atomic_transition(
+        &env,
+        &ProposalStatus::Executed,
+        &ProposalStatus::Passed,
+        false,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "Invalid state transition");
+}

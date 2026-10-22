@@ -135,6 +135,8 @@ const EXIT_COORDINATION_THRESHOLD: u32 = 10;
 // Storage keys
 // ---------------------------------------------------------------------------
 
+type DistributionEpoch = u64;
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -230,7 +232,12 @@ pub enum DataKey {
     StakerActionLogIndex(Address),
     /// RewardLockup entry for (staker, epoch) — contains the scaled
     /// reward amount and its unlock timestamp.
-    StakerRewardLockup(Address, u64),
+    StakerRewardLockup(Address, DistributionEpoch),
+    /// Dense index of all currently pending reward lockups.
+    PendingDistributionIndex(u32),
+    /// Reverse lookup used to remove a pending lockup from the dense index.
+    PendingDistributionPosition(Address, DistributionEpoch),
+    PendingDistributionCount,
     /// The highest epoch for which a RewardLockup has already been
     /// recorded for `staker` — avoids double-writing on re-settlement.
     StakerLockupSettledUntil(Address),
@@ -1843,6 +1850,7 @@ impl StakingContract {
                         .expect("Overflow");
                     lockup.claimed = true;
                     env.storage().persistent().set(&key, &lockup);
+                    Self::remove_pending_distribution(&env, &staker, epoch);
                 }
             }
         }
@@ -2410,9 +2418,13 @@ impl StakingContract {
                             unlocks_at,
                             claimed: false,
                         };
+                        let lockup_key = DataKey::StakerRewardLockup(staker.clone(), epoch);
+                        if !env.storage().persistent().has(&lockup_key) {
+                            Self::add_pending_distribution(env, staker, epoch);
+                        }
                         env.storage()
                             .persistent()
-                            .set(&DataKey::StakerRewardLockup(staker.clone(), epoch), &lockup);
+                            .set(&lockup_key, &lockup);
                         env.events().publish(
                             (
                                 Symbol::new(env, "reward_lockup"),
@@ -2436,6 +2448,112 @@ impl StakingContract {
                 .persistent()
                 .set(&DataKey::StakerNextClaimEpoch(staker.clone()), &epoch);
         }
+    }
+
+    fn add_pending_distribution(env: &Env, staker: &Address, epoch: DistributionEpoch) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingDistributionCount)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PendingDistributionIndex(count),
+            &(staker.clone(), epoch),
+        );
+        env.storage().persistent().set(
+            &DataKey::PendingDistributionPosition(staker.clone(), epoch),
+            &count,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingDistributionCount, &count.checked_add(1).expect("Overflow"));
+    }
+
+    fn remove_pending_distribution(env: &Env, staker: &Address, epoch: DistributionEpoch) {
+        let position_key = DataKey::PendingDistributionPosition(staker.clone(), epoch);
+        let Some(position) = env.storage().persistent().get::<_, u32>(&position_key) else {
+            return;
+        };
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingDistributionCount)
+            .unwrap_or(0);
+        if count == 0 || position >= count {
+            return;
+        }
+
+        let last_position = count - 1;
+        if position != last_position {
+            if let Some((last_staker, last_epoch)) = env
+                .storage()
+                .persistent()
+                .get::<_, (Address, DistributionEpoch)>(
+                    &DataKey::PendingDistributionIndex(last_position),
+                )
+            {
+                env.storage().persistent().set(
+                    &DataKey::PendingDistributionIndex(position),
+                    &(last_staker.clone(), last_epoch),
+                );
+                env.storage().persistent().set(
+                    &DataKey::PendingDistributionPosition(last_staker, last_epoch),
+                    &position,
+                );
+            }
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingDistributionIndex(last_position));
+        env.storage().persistent().remove(&position_key);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingDistributionCount, &last_position);
+    }
+
+    /// Number of currently unclaimed reward lockups across all stakers.
+    pub fn get_pending_distribution_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingDistributionCount)
+            .unwrap_or(0)
+    }
+
+    /// Paginated pending reward lockups across all stakers.
+    /// `limit` is capped to `MAX_PAGE_SIZE` by the shared pagination helper.
+    pub fn get_pending_distributions_page(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<(Address, RewardLockup)> {
+        let count = Self::get_pending_distribution_count(env.clone());
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for index in start..end {
+            if let Some((staker, epoch)) = env
+                .storage()
+                .persistent()
+                .get::<_, (Address, DistributionEpoch)>(
+                    &DataKey::PendingDistributionIndex(index),
+                )
+            {
+                if let Some(lockup) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, RewardLockup>(&DataKey::StakerRewardLockup(
+                        staker.clone(),
+                        epoch,
+                    ))
+                {
+                    if !lockup.claimed {
+                        result.push_back((staker, lockup));
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Look up the RewardLockup for (staker, epoch), if any.
@@ -3985,6 +4103,61 @@ mod test {
         assert_eq!(f.client().get_pending_rewards(&staker), 200);
         f.client().claim_rewards(&staker, &f.mnt_id);
         assert_eq!(f.mnt().balance(&staker), 1_000 + 200);
+    }
+
+    #[test]
+    fn test_pending_distributions_page_paginates_across_stakers() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(0);
+
+        let first = Address::generate(&f.env);
+        let second = Address::generate(&f.env);
+        for staker in [&first, &second] {
+            f.fund(staker, 1_000);
+            f.client().stake(staker, &1_000, &1);
+        }
+
+        fund_treasury_and_distribute(&f, 0);
+        fund_treasury_and_distribute(&f, 200);
+        fund_treasury_and_distribute(&f, 200);
+
+        f.env.ledger().set_timestamp(86_401);
+        f.client().unstake(&first);
+        f.client().unstake(&second);
+
+        assert_eq!(f.client().get_pending_distribution_count(), 4);
+
+        let first_page = f.client().get_pending_distributions_page(&0, &2);
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page.get(0).unwrap().0, first);
+        assert_eq!(first_page.get(0).unwrap().1.epoch_id, 1);
+        assert_eq!(first_page.get(1).unwrap().0, first);
+        assert_eq!(first_page.get(1).unwrap().1.epoch_id, 2);
+
+        let second_page = f.client().get_pending_distributions_page(&2, &2);
+        assert_eq!(second_page.len(), 2);
+        assert_eq!(second_page.get(0).unwrap().0, second);
+        assert_eq!(second_page.get(0).unwrap().1.epoch_id, 1);
+        assert_eq!(second_page.get(1).unwrap().0, second);
+        assert_eq!(second_page.get(1).unwrap().1.epoch_id, 2);
+
+        assert_eq!(
+            f.client()
+                .get_pending_distributions_page(&0, &(shared::MAX_PAGE_SIZE + 1))
+                .len(),
+            4
+        );
+
+        f.env
+            .ledger()
+            .set_timestamp(86_401 + REWARD_LOCKUP_SECS + 1);
+        f.client().claim_rewards(&first, &f.mnt_id);
+
+        assert_eq!(f.client().get_pending_distribution_count(), 2);
+        let remaining = f.client().get_pending_distributions_page(&0, &2);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.get(0).unwrap().0, second);
+        assert_eq!(remaining.get(1).unwrap().0, second);
     }
 
     #[test]

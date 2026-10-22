@@ -14,11 +14,15 @@ use shared::{
     KeyRecord, KeyRotationProposal, KeyScheme,
     // #867 — Transaction intent / high-risk operation protection
     evaluate_transaction_intent, get_protection_state, TransactionIntent,
+    // #1271 — Admin rotation
+    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS,
 };
+use shared::ttl_utils::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
     Env, Symbol, TryIntoVal, Val, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 
 // ---------------------------------------------------------------------------
@@ -45,6 +49,8 @@ pub enum Error {
     InvalidEmergencySignatures = 13,
     /// Duplicate or unregistered emergency signer in aggregation.
     InvalidEmergencySigner = 14,
+    /// Stored proposal arguments no longer match the checksum captured at proposal time.
+    ProposalArgsTampered = 15,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +93,8 @@ pub enum DataKey {
     ActiveProposalCount,
     Signer(Address),
     Proposal(u32),
+    /// SHA-256 checksum of the proposal argument XDR captured at proposal time.
+    ProposalArgsChecksum(u32),
     Approval(u32, Address),
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
@@ -117,6 +125,11 @@ pub enum DataKey {
     // -----------------------------------------------------------------------
     /// Key management namespace root for this multisig instance.
     KeyManagementRoot,
+    // -----------------------------------------------------------------------
+    // #1271 — Admin rotation keys
+    // -----------------------------------------------------------------------
+    /// Pending admin transfer with cooling-off period enforcement.
+    PendingAdminTransfer,
 }
 
 /// Record of a multisig-signer-reviewed dispute oversight audit.
@@ -207,6 +220,7 @@ impl MultisigAdminContract {
             return Err(Error::NotSigner);
         }
         proposer.require_auth();
+        let args_checksum = compute_checksum(&env, &args.clone().to_xdr(&env));
         let count: u32 = env.storage().instance().get(&DataKey::ProposalCount).unwrap_or(0);
         let new_id = count.checked_add(1).expect("proposal count overflow");
         env.storage().instance().set(&DataKey::ProposalCount, &new_id);
@@ -232,7 +246,25 @@ impl MultisigAdminContract {
             cancelled: false,
         };
         env.storage().persistent().set(&DataKey::Proposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(new_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalArgsChecksum(new_id), &args_checksum);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProposalArgsChecksum(new_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage().persistent().set(&DataKey::Approval(new_id, proposer.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(new_id, proposer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("proposed"), new_id),
             (proposer, expiry),
@@ -265,8 +297,18 @@ impl MultisigAdminContract {
         }
         signer.require_auth();
         env.storage().persistent().set(&DataKey::Approval(action_id, signer.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(action_id, signer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         proposal.approval_count = proposal.approval_count.checked_add(1).expect("approval count overflow");
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(action_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("signed"), action_id),
             (signer, proposal.approval_count),
@@ -294,10 +336,24 @@ impl MultisigAdminContract {
         if env.ledger().timestamp() > proposal.expiry { return Err(Error::Expired); }
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
         if proposal.approval_count < threshold { return Err(Error::BelowThreshold); }
+        let stored_checksum: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalArgsChecksum(action_id))
+            .ok_or(Error::ProposalArgsTampered)?;
+        let computed_checksum = compute_checksum(&env, &proposal.args.clone().to_xdr(&env));
+        if computed_checksum != stored_checksum {
+            return Err(Error::ProposalArgsTampered);
+        }
 
         // Mark executed before dispatch (prevents re-entrancy)
         proposal.executed = true;
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(action_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let event_target   = proposal.target.clone();
         let event_function = proposal.function.clone();
@@ -1302,6 +1358,96 @@ fn apply_update_threshold(env: &Env, new_threshold: u32) -> Result<(), Error> {
 }
 
 // ---------------------------------------------------------------------------
+// #1271 — Admin rotation (two-step with timelock)
+// ---------------------------------------------------------------------------
+
+/// Propose an admin key rotation with MIN_ADMIN_TIMELOCK_SECS cooling period.
+pub fn propose_admin_change(env: &Env, current_admin: Address, new_admin: Address) -> Result<AdminTransfer, Error> {
+    current_admin.require_auth();
+
+    if env.storage().persistent().has(&DataKey::PendingAdminTransfer) {
+        return Err(Error::AlreadyInitialized); // Transfer already pending
+    }
+
+    let proposed_at = env.ledger().timestamp();
+    let effective_at = proposed_at + MIN_ADMIN_TIMELOCK_SECS;
+
+    let transfer = AdminTransfer {
+        new_admin: new_admin.clone(),
+        effective_at,
+        status: AdminChangeProposal::Proposed,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingAdminTransfer, &transfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("adm_prop")),
+        (current_admin, new_admin),
+    );
+
+    Ok(transfer)
+}
+
+/// Accept a pending admin transfer after the timelock has expired.
+pub fn accept_admin_change(env: &Env, new_admin: Address) -> Result<(), Error> {
+    new_admin.require_auth();
+
+    let transfer: AdminTransfer = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PendingAdminTransfer)
+        .ok_or(Error::ProposalNotFound)?;
+
+    let now = env.ledger().timestamp();
+    if now < transfer.effective_at {
+        return Err(Error::Expired); // Timelock not yet expired
+    }
+
+    if transfer.new_admin != new_admin {
+        return Err(Error::NotAdmin); // Only the new admin can accept
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("adm_acc")),
+        (transfer.new_admin,),
+    );
+
+    Ok(())
+}
+
+/// Cancel a pending admin transfer (current admin only).
+pub fn cancel_admin_change(env: &Env, current_admin: Address) -> Result<(), Error> {
+    current_admin.require_auth();
+
+    let transfer: AdminTransfer = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PendingAdminTransfer)
+        .ok_or(Error::ProposalNotFound)?;
+
+    if transfer.status != AdminChangeProposal::Proposed {
+        return Err(Error::ProposalNotFound);
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("adm_canc")),
+        (current_admin, transfer.new_admin),
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1470,6 +1616,40 @@ mod test {
 
         f.client().sign_action(&f.signers[1], &pid);
         assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::BelowThreshold)));
+    }
+
+    #[test]
+    fn test_execute_rejects_tampered_proposal_args() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let pid = f.propose(&target, "do_thing");
+        f.sign_n(pid, 3);
+
+        f.env.as_contract(&f.contract, || {
+            let mut proposal: ProposalRecord = f
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(pid))
+                .unwrap();
+            proposal.args = vec![&f.env, 7u32.into_val(&f.env)];
+            f.env.storage().persistent().set(&DataKey::Proposal(pid), &proposal);
+        });
+
+        assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::ProposalArgsTampered)));
+    }
+
+    #[test]
+    fn test_proposal_survives_default_ttl() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let pid = f.propose(&target, "do_thing");
+
+        f.env.ledger().with_mut(|li| li.sequence_number += 300_000);
+
+        assert_eq!(f.client().get_proposal(&pid).approval_count, 1u32);
+        f.client().sign_action(&f.signers[1], &pid);
+        assert_eq!(f.client().get_proposal(&pid).approval_count, 2u32);
     }
 
     #[test]

@@ -9,7 +9,13 @@ use shared::events::{
     evt_gov_proposal_passed, evt_gov_proposal_queued, evt_gov_timelock_set,
     evt_gov_vote_cast,
 };
-use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS, SecureStorageAccess};
+use shared::{
+    detect_coordinated_timing, GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS,
+    SecureStorageAccess,
+};
+
+/// Number of recent vote timestamps retained per proposal for timing checks.
+const COORDINATED_VOTE_HISTORY: u32 = 32;
 use shared::market_control_protection::{
     analyze_market_networks as gov_analyze_market_networks,
     audit_market_competition as gov_audit_market_competition,
@@ -240,6 +246,9 @@ pub enum DataKey {
     /// Per-proposal escrow deposit amount (in token smallest units)
     ProposalDeposit(u32),
     Vote(u32, Address),
+    /// Rolling window of recent vote timestamps for a proposal, used by
+    /// coordinated-timing detection (capped at `COORDINATED_VOTE_HISTORY`).
+    VoteTimestamps(u32),
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
     Timelock,
@@ -308,6 +317,10 @@ pub enum DataKey {
     /// Staking contract queried for the proposer's `staked_at` timestamp
     /// when enforcing the minimum holding period on `create_proposal`.
     StakingContract,
+    /// Sequential index of proposal IDs grouped by status for paginated filtering.
+    ProposalsByStatus(ProposalStatus, u32),
+    /// Per-status proposal count used as the next write index.
+    ProposalStatusCount(ProposalStatus),
 }
 
 #[contracttype]
@@ -350,6 +363,20 @@ impl GovernanceContract {
         if !ProposalStatus::is_valid_transition(env, &from, &to) {
             panic!("invalid transition from {:?} to {:?}", from, to);
         }
+
+        // Maintain ProposalsByStatus index: append proposal.id under new status
+        let new_count = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProposalStatusCount(to.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalsByStatus(to.clone(), new_count), &proposal.id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalStatusCount(to.clone()), &(new_count + 1));
+
         proposal.status = to;
     }
 
@@ -859,6 +886,33 @@ impl GovernanceContract {
                 .checked_add(weight)
                 .expect("votes against overflow");
         }
+
+        // ─── Coordinated-timing detection ───────────────────────────────
+        // Compare this vote's timestamp against the recent votes on the same
+        // proposal. Votes landing suspiciously close together are flagged
+        // (non-blocking) so governance monitors can review them.
+        let now = env.ledger().timestamp();
+        let window_secs = proposal.voting_ends_at.saturating_sub(proposal.created_at);
+        let history_key = DataKey::VoteTimestamps(proposal_id);
+        let mut history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        for prior in history.iter() {
+            if detect_coordinated_timing(&[prior, now], window_secs) {
+                env.events().publish(
+                    (symbol_short!("gov"), symbol_short!("coord")),
+                    (proposal_id, voter.clone(), now),
+                );
+                break;
+            }
+        }
+        if history.len() >= COORDINATED_VOTE_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(now);
+        env.storage().persistent().set(&history_key, &history);
 
         // Store raw vote and weight
         env.storage().persistent().set(&key, &support);
@@ -2374,6 +2428,47 @@ impl GovernanceContract {
             (symbol_short!("govtx"), symbol_short!("flag_clr")),
             voter,
         );
+    }
+
+    /// Returns a paginated list of proposal IDs filtered by status.
+    ///
+    /// Used by governance UIs to show Active, Passed, Executed, or Failed proposals.
+    ///
+    /// # Arguments
+    /// * `status` - Proposal status to filter by (Active, Passed, Executed, etc.)
+    /// * `offset` - Starting index in the status-filtered list
+    /// * `limit` - Maximum results (clamped to MAX_PAGE_SIZE)
+    ///
+    /// # Returns
+    /// Vector of proposal IDs in the specified status, paginated.
+    pub fn get_proposals_by_status(
+        env: Env,
+        status: ProposalStatus,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        use shared::pagination::Pagination;
+
+        let total = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProposalStatusCount(status.clone()))
+            .unwrap_or(0);
+
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut result = vec![&env];
+
+        for idx in start..end {
+            if let Some(proposal_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::ProposalsByStatus(status.clone(), idx))
+            {
+                result.push_back(proposal_id);
+            }
+        }
+
+        result
     }
 }
 

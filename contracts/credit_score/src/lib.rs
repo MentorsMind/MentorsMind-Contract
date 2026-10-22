@@ -1,7 +1,21 @@
 #![no_std]
+use shared::validation::Validator;
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env,
+    IntoVal, Symbol, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// An input failed shared-validator bounds checking.
+    ValidationFailed = 1,
+}
 
 // ---------------------------------------------------------------------------
 // External Interfaces (Types only for contract calls)
@@ -96,6 +110,10 @@ pub enum DataKey {
 
 const MIN_SCORE: u32 = 300;
 const MAX_SCORE: u32 = 850;
+/// Accepted raw score range at entry (validated by `shared::validation::Validator`).
+/// Scores outside `[0, 1000]` are rejected with [`Error::ValidationFailed`].
+const MIN_VALID_SCORE: i128 = 0;
+const MAX_VALID_SCORE: i128 = 1000;
 const DAY_SECONDS: u64 = 86_400;
 const DAY_SECONDS_TTL: u32 = 86_400;
 
@@ -108,15 +126,13 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 // ---------------------------------------------------------------------------
 
 #[contractevent]
-#[derive(Clone)]
-struct ScoreUpdatedEvent {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreUpdatedEvent {
     #[topic]
-    category: Symbol,
-    #[topic]
-    action: Symbol,
-    #[topic]
-    user: Address,
-    score: u32,
+    address: Address,
+    old_score: u32,
+    new_score: u32,
+    reason: Symbol,
 }
 
 #[contract]
@@ -161,7 +177,13 @@ impl CreditScoreContract {
     ///
     /// The change is appended to the address's auditable history so that
     /// lending-pool and governance consumers can detect manual manipulation.
-    pub fn set_score(env: Env, admin: Address, user: Address, score: u32, reason: Symbol) {
+    pub fn set_score(
+        env: Env,
+        admin: Address,
+        user: Address,
+        score: u32,
+        reason: Symbol,
+    ) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -172,6 +194,12 @@ impl CreditScoreContract {
             panic!("Unauthorized");
         }
 
+        Validator::new(&env)
+            .require_range(score as i128, MIN_VALID_SCORE, MAX_VALID_SCORE, "score")
+            .validate()
+            .map_err(|_| Error::ValidationFailed)?;
+
+        let old_score = env.storage().persistent().get(&DataKey::UserScore(user.clone())).unwrap_or(MIN_SCORE);
         let clamped = score.clamp(MIN_SCORE, MAX_SCORE);
         env.storage()
             .persistent()
@@ -180,15 +208,17 @@ impl CreditScoreContract {
         Self::append_history(&env, user.clone(), clamped, reason.clone());
 
         ScoreUpdatedEvent {
-            category: symbol_short!("score"),
-            action: symbol_short!("set"),
-            user,
-            score: clamped,
+            address: user,
+            old_score,
+            new_score: clamped,
+            reason,
         }
-        .publish(env);
+        .publish(&env);
+
+        Ok(())
     }
 
-    pub fn refresh_score(env: Env, user: Address) {
+    pub fn refresh_score(env: Env, user: Address) -> Result<(), Error> {
         let last_update: u64 = env
             .storage()
             .temporary()
@@ -198,7 +228,13 @@ impl CreditScoreContract {
             panic!("Rate limited: once per day");
         }
 
+        let old_score = env.storage().persistent().get(&DataKey::UserScore(user.clone())).unwrap_or(MIN_SCORE);
         let (score, breakdown) = Self::do_compute(env.clone(), user.clone());
+
+        Validator::new(&env)
+            .require_range(score as i128, MIN_VALID_SCORE, MAX_VALID_SCORE, "score")
+            .validate()
+            .map_err(|_| Error::ValidationFailed)?;
 
         env.storage()
             .persistent()
@@ -220,12 +256,14 @@ impl CreditScoreContract {
         Self::append_history(&env, user.clone(), score, symbol_short!("refresh"));
 
         ScoreUpdatedEvent {
-            category: symbol_short!("score"),
-            action: symbol_short!("updated"),
-            user,
-            score,
+            address: user,
+            old_score,
+            new_score: score,
+            reason: symbol_short!("refresh"),
         }
         .publish(&env);
+
+        Ok(())
     }
 
     pub fn compute_score(env: Env, user: Address) -> u32 {
@@ -426,7 +464,7 @@ mod test {
     pub struct MockEscrow;
     #[contractimpl]
     impl MockEscrow {
-        pub fn mentor(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
+        pub fn get_escrows_by_mentor(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
             let mut v = Vec::new(&env);
             v.push_back(Escrow {
                 id: 1,
@@ -435,7 +473,7 @@ mod test {
                 amount: 1000,
                 session_id: symbol_short!("S1"),
                 status: EscrowStatus::Released,
-                created_at: env.ledger().timestamp() - (100 * 86400),
+                created_at: env.ledger().timestamp().saturating_sub(100 * 86400),
                 token_address: Address::generate(&env),
                 platform_fee: 0,
                 net_amount: 1000,
@@ -452,7 +490,7 @@ mod test {
             });
             v
         }
-        pub fn learner(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
+        pub fn get_escrows_by_learner(env: Env, _u: Address, _p: u32, _ps: u32) -> Vec<Escrow> {
             Vec::new(&env)
         }
     }
@@ -475,7 +513,7 @@ mod test {
     #[test]
     fn test_perfect_flow() {
         let env = Env::default();
-        env.ledger().set_timestamp(1_000_000);
+        env.ledger().set_timestamp(10_000_000);
         let admin = Address::generate(&env);
         let escrow = env.register_contract(None, MockEscrow);
         let staking = env.register_contract(None, MockStaking);
@@ -543,6 +581,32 @@ mod test {
     }
 
     #[test]
+    fn set_score_rejects_score_above_max() {
+        let env = Env::default();
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        let result = client.try_set_score(&admin, &user, &1001, &Symbol::new(&env, "admin_set"));
+        assert_eq!(result, Err(Ok(Error::ValidationFailed)));
+
+        // No history entry must be written for a rejected score.
+        let page = client.get_score_history_page(&user, &0, &10);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn set_score_accepts_upper_bound() {
+        let env = Env::default();
+        let (admin, cid) = setup_no_mock(&env);
+        let client = CreditScoreContractClient::new(&env, &cid);
+        let user = Address::generate(&env);
+
+        client.set_score(&admin, &user, &1000, &Symbol::new(&env, "admin_set"));
+        assert_eq!(client.get_score(&user), MAX_SCORE);
+    }
+
+    #[test]
     fn multiple_set_score_calls_accumulate_history() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
@@ -575,7 +639,7 @@ mod test {
     #[test]
     fn refresh_score_appends_history_entry() {
         let env = Env::default();
-        env.ledger().set_timestamp(1_000_000);
+        env.ledger().set_timestamp(10_000_000);
         let admin = Address::generate(&env);
         let escrow = env.register_contract(None, MockEscrow);
         let staking = env.register_contract(None, MockStaking);
@@ -591,7 +655,7 @@ mod test {
         let rec = page.get(0).unwrap();
         assert_eq!(rec.reason, symbol_short!("refresh"));
         assert_eq!(rec.score, client.get_score(&user));
-        assert_eq!(rec.timestamp, 1_000_000);
+        assert_eq!(rec.timestamp, 10_000_000);
     }
 
     // ── Pagination ────────────────────────────────────────────────────────

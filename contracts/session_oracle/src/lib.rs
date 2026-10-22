@@ -1,6 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use shared::pagination::{Pagination, MAX_PAGE_SIZE};
 
 const EXPIRY_GRACE_SECS: u64 = 48 * 60 * 60;
 const DISPUTE_WINDOW_SECS: u64 = 48 * 60 * 60;
@@ -37,6 +38,8 @@ pub enum DataKey {
     NamespaceRoot,
     Admin,
     Session(Symbol),
+    SessionCount,
+    SessionIndex(u32),
 }
 
 #[contracterror]
@@ -98,6 +101,20 @@ impl SessionOracleContract {
             state: SessionState::Pending,
         };
         env.storage().persistent().set(&key, &record);
+
+        // Maintain sequential index
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SessionIndex(count), &session_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SessionCount, &(count + 1));
+
         env.events().publish(
             (Symbol::new(&env, "session_registered"), session_id),
             escrow_id,
@@ -234,6 +251,30 @@ impl SessionOracleContract {
             .ok_or(Error::SessionNotFound)
     }
 
+    pub fn get_session_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SessionCount)
+            .unwrap_or(0)
+    }
+
+    pub fn get_sessions_page(env: Env, offset: u32, limit: u32) -> Vec<Symbol> {
+        let total = Self::get_session_count(&env);
+        let (start, end) = Pagination::bounds(total, offset, limit);
+
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            if let Some(session_id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Symbol>(&DataKey::SessionIndex(i))
+            {
+                result.push_back(session_id);
+            }
+        }
+        result
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
@@ -354,5 +395,49 @@ mod tests {
 
         let session = client.get_session(&session_id);
         assert_eq!(session.state, SessionState::Disputed);
+    }
+
+    #[test]
+    fn test_session_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+        let contract_id = env.register_contract(None, SessionOracleContract);
+        let client = SessionOracleContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        // Register 5 sessions
+        for i in 0..5 {
+            let session_id = Symbol::new(&env, &format!("sess_{}", i));
+            client.register_session(&admin, &session_id, &mentor, &learner, &(i as u64), &5_000);
+        }
+
+        // Test get_session_count
+        assert_eq!(client.get_session_count(), 5);
+
+        // Test first page
+        let page1 = client.get_sessions_page(&0, &2);
+        assert_eq!(page1.len(), 2);
+
+        // Test second page
+        let page2 = client.get_sessions_page(&2, &2);
+        assert_eq!(page2.len(), 2);
+
+        // Test third page (partial)
+        let page3 = client.get_sessions_page(&4, &2);
+        assert_eq!(page3.len(), 1);
+
+        // Test out-of-bounds offset
+        let empty = client.get_sessions_page(&10, &2);
+        assert_eq!(empty.len(), 0);
+
+        // Test limit clamped to MAX_PAGE_SIZE
+        let large_page = client.get_sessions_page(&0, &1000);
+        assert!(large_page.len() <= 50); // MAX_PAGE_SIZE
     }
 }

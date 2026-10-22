@@ -202,7 +202,7 @@ pub fn validate_market_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::Env;
 
     /// Test fund conservation with balanced flows where prior + inflows = current + outflows + fees.
