@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     Map, Symbol, TryFromVal, Val,
 };
+use shared::pagination::{Pagination, MAX_PAGE_SIZE};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -442,5 +443,53 @@ mod tests {
         let func = Symbol::new(&env, "update");
         assert!(client.try_add_template(&admin, &target, &func, &schema_hash).is_ok());
         assert_eq!(client.get_template_hash(&target, &func), Some(schema_hash));
+    }
+
+    #[test]
+    fn test_pagination_and_proposal_count() {
+        let (env, _admin, client) = setup();
+
+        assert_eq!(client.get_proposal_count(), 0);
+        let empty_page = client.get_proposals_page(&0, &10);
+        assert_eq!(empty_page.len(), 0);
+
+        let template = TemplateType::UpdateFee;
+        let schema_hash = schema_hash_for(&env, &template);
+        client.register_template(&template, &schema_hash);
+
+        let proposer = Address::generate(&env);
+
+        for i in 1..=5 {
+            let mut params = Map::<Symbol, Val>::new(&env);
+            params.set(Symbol::new(&env, "fee_bps"), (i * 100u32).into_val(&env));
+            client.create_from_template(&proposer, &template, &params);
+        }
+
+        assert_eq!(client.get_proposal_count(), 5);
+
+        // Page 1: offset 0, limit 2 -> proposals 1, 2
+        let page1 = client.get_proposals_page(&0, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap().id, 1);
+        assert_eq!(page1.get(1).unwrap().id, 2);
+
+        // Page 2: offset 2, limit 2 -> proposals 3, 4
+        let page2 = client.get_proposals_page(&2, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().id, 3);
+        assert_eq!(page2.get(1).unwrap().id, 4);
+
+        // Page 3: offset 4, limit 2 -> proposal 5 (only 1 remaining)
+        let page3 = client.get_proposals_page(&4, &2);
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.get(0).unwrap().id, 5);
+
+        // Offset beyond count -> empty
+        let page_past = client.get_proposals_page(&5, &10);
+        assert_eq!(page_past.len(), 0);
+
+        // Clamped to MAX_PAGE_SIZE
+        let all = client.get_proposals_page(&0, &(MAX_PAGE_SIZE + 10));
+        assert_eq!(all.len(), 5);
     }
 }
