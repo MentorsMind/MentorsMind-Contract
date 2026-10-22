@@ -2,22 +2,18 @@
 
 use shared::{compute_checksum, StakeRecord};
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, xdr::ToXdr, Address,
-    BytesN, Env, FromVal, IntoVal, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env,
+    IntoVal, Symbol, Vec,
 };
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    NotInitialized = 1,
-    StateValidationFailed = 2,
-    CrossContractCallFailed = 3,
-}
-
-#[contractclient(name = "SnapshotContractClient")]
-pub trait SnapshotContractTrait {
-    fn get_voting_power(env: Env, snapshot_id: u32, voter: Address) -> i128;
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    CrossContractCallFailed = 4,
 }
 
 #[contracttype]
@@ -46,7 +42,7 @@ impl SnapshotContract {
         delegation_contract: Address,
     ) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
-            return Err(Error::StateValidationFailed);
+            return Err(Error::AlreadyInitialized);
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage()
@@ -58,8 +54,24 @@ impl SnapshotContract {
         Ok(())
     }
 
-    /// records all staked MNT balances at current ledger and snapshots delegation state
-    pub fn record_snapshot(env: Env, snapshot_id: u32) -> Result<(), Error> {
+    /// Records all staked MNT balances at current ledger and snapshots delegation state.
+    /// Only the admin configured at `initialize` may call this.
+    pub fn record_snapshot(
+        env: Env,
+        caller: Address,
+        snapshot_id: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if caller != admin {
+            return Err(Error::Unauthorized);
+        }
+
         let staking_contract: Address = env
             .storage()
             .persistent()
@@ -102,7 +114,7 @@ impl SnapshotContract {
             // Get stake record from the staking contract.
             // StakeRecord is imported from the shared crate, so the XDR
             // positional layout here is GUARANTEED to match what the
-            // staking contract emitted on get_stake — no silent tier
+            // staking contract emitted on get_stake - no silent tier
             // corruption caused by mismatched field counts/types.
             let record: StakeRecord = match env
                 .try_invoke_contract::<StakeRecord, soroban_sdk::Error>(
@@ -253,11 +265,11 @@ mod test {
     use super::*;
     use shared::StakeRecord as SharedStakeRecord;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{symbol_short, Env, IntoVal};
+    use soroban_sdk::{symbol_short, Env, FromVal, IntoVal};
 
     // -----------------------------------------------------------------------
     // NOTE: StakeRecord is NOT re-defined here. MockStaking imports the same
-    // `SharedStakeRecord` (shared crate) that SnapshotContract uses — XDR
+    // `SharedStakeRecord` (shared crate) that SnapshotContract uses - XDR
     // positional layout is guaranteed identical across both. This is the
     // exact fix for issue #646: the old test-local definition was missing
     // the 5th field `unlock_cooldown_until`, shifting all subsequent fields.
@@ -306,7 +318,7 @@ mod test {
                 })
         }
         pub fn set_stake(env: Env, mentor: Address, amount: i128) {
-            // Use shared StakeRecord — includes unlock_cooldown_until field
+            // Use shared StakeRecord - includes unlock_cooldown_until field
             // and tier: u32 so positional XDR matches between mock/staking/snapshot.
             let tier = if amount >= 2_000 {
                 3 // Gold
@@ -395,7 +407,7 @@ mod test {
         staking.set_stake(&voter2, &600);
 
         // Record snapshot 1
-        client.record_snapshot(&1);
+        client.record_snapshot(&admin, &1);
 
         assert_eq!(client.get_total_supply_at(&1), 1000);
         assert_eq!(client.get_voting_power(&1, &voter1), 400);
@@ -409,16 +421,16 @@ mod test {
         assert_eq!(client.get_voting_power(&1, &voter1), 400);
 
         // Record snapshot 2
-        client.record_snapshot(&2);
+        client.record_snapshot(&admin, &2);
         assert_eq!(client.get_voting_power(&2, &voter1), 900);
     }
 
     // ========================================================================
-    // Issue #646 — Tier correctness for Bronze / Silver / Gold mentors
+    // Issue #646 - Tier correctness for Bronze / Silver / Gold mentors
     //
     // The root bug: snapshot's in-loop StakeRecord was missing the 5th field
     // `unlock_cooldown_until: Option<u64>`, so positional XDR deserialization
-    // read garbage bytes for `tier` (field 6 in staking → became field 5 in
+    // read garbage bytes for `tier` (field 6 in staking -> became field 5 in
     // snapshot, which was reading the Option discriminant bytes, typically
     // returning tier = 0 for all mentors, including Gold-tier).
     // ========================================================================
@@ -441,10 +453,10 @@ mod test {
         // Bronze: >= 100 (threshold)
         // Silver: >= 500 (threshold)
         // Gold:   >= 2000 (threshold)
-        let none = Address::generate(&env); // 50 → tier 0
-        let bronze = Address::generate(&env); // 100 → tier 1
-        let silver = Address::generate(&env); // 500 → tier 2
-        let gold = Address::generate(&env); // 2000 → tier 3
+        let none = Address::generate(&env); // 50 -> tier 0
+        let bronze = Address::generate(&env); // 100 -> tier 1
+        let silver = Address::generate(&env); // 500 -> tier 2
+        let gold = Address::generate(&env); // 2000 -> tier 3
 
         staking.set_total_staked(&2650); // 50+100+500+2000
         staking.set_stakers(&Vec::from_array(
@@ -465,11 +477,11 @@ mod test {
 
         // --- Record snapshot. Snapshot deserializes StakeRecord via shared
         // crate type and stores voting power.
-        client.record_snapshot(&1);
+        client.record_snapshot(&admin, &1);
 
         // --- Voting power must equal the raw amount (snapshot stores amount,
         // not tier directly). But to validate the tier bytes were decoded
-        // correctly we do an explicit cross-contract serialize→deserialize
+        // correctly we do an explicit cross-contract serialize->deserialize
         // round-trip for every staker and compare the tier field.
         let tiers: [u32; 4] = [0, 1, 2, 3];
         let stakers_arr = [&none, &bronze, &silver, &gold];
@@ -609,7 +621,7 @@ mod test {
             unlock_cooldown_until: expected_until,
             tier: expected_tier,
         };
-        // Full structure check — any reordering or field-count change
+        // Full structure check - any reordering or field-count change
         // will either fail to compile, fail struct literal, or fail assert.
         assert_eq!(r.mentor, mentor);
         assert_eq!(r.amount, 42);
@@ -642,12 +654,75 @@ mod test {
         staking.set_stake(&voter2, &600);
 
         // Record snapshot 1
-        client.record_snapshot(&1);
+        client.record_snapshot(&admin, &1);
 
         // Check that snapshot integrity verification passes
         assert!(client.verify_snapshot_integrity(&1));
 
         // Unknown snapshot ID returns false
         assert!(!client.verify_snapshot_integrity(&999));
+    }
+
+    // ========================================================================
+    // Issue #1023 - Typed Error variants reachability.
+    //
+    // Each test below targets one variant of `Error` from the acceptance
+    // criteria to prove it is reachable via the public contract surface.
+    // ========================================================================
+
+    #[test]
+    fn test_error_already_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let snapshot_id = env.register_contract(None, SnapshotContract);
+        let staking_id = env.register_contract(None, MockStaking);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let client = SnapshotContractClient::new(&env, &snapshot_id);
+
+        let admin = Address::generate(&env);
+
+        // First initialize succeeds.
+        client.initialize(&admin, &staking_id, &delegation_id);
+
+        // Second initialize must surface Error::AlreadyInitialized.
+        let res = client.try_initialize(&admin, &staking_id, &delegation_id);
+        assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_error_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let snapshot_id = env.register_contract(None, SnapshotContract);
+        let client = SnapshotContractClient::new(&env, &snapshot_id);
+
+        // Contract was never initialized; record_snapshot must return
+        // Error::NotInitialized (admin lookup fails before any auth check).
+        let caller = Address::generate(&env);
+        let res = client.try_record_snapshot(&caller, &1);
+        assert_eq!(res, Err(Ok(Error::NotInitialized)));
+    }
+
+    #[test]
+    fn test_error_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let snapshot_id = env.register_contract(None, SnapshotContract);
+        let staking_id = env.register_contract(None, MockStaking);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let client = SnapshotContractClient::new(&env, &snapshot_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &staking_id, &delegation_id);
+
+        // A caller that is not the configured admin must be rejected with
+        // Error::Unauthorized, regardless of mock_all_auths() passing the
+        // signature-level auth check.
+        let intruder = Address::generate(&env);
+        let res = client.try_record_snapshot(&intruder, &1);
+        assert_eq!(res, Err(Ok(Error::Unauthorized)));
     }
 }
