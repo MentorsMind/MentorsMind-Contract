@@ -18,6 +18,7 @@ use soroban_sdk::{
 const DISPUTE_WINDOW: u64 = 48 * 60 * 60; // 48 hours in seconds
 const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 9_000_000; // large enough to survive test time jumps
+const BOUNTY_SCOPE: Symbol = symbol_short!("mm_bounty");
 
 // ---------------------------------------------------------------------------
 // Milestone types
@@ -168,6 +169,8 @@ pub struct BountyContract;
 impl BountyContract {
     /// Initialize the contract with an admin and optional verification contract address.
     pub fn initialize(env: Env, admin: Address, verification_contract: Address) {
+        SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, BOUNTY_SCOPE);
+
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
@@ -1060,6 +1063,19 @@ mod test {
         // Tokens transferred to contract
         assert_eq!(f.token().balance(&f.poster), 900_000);
         assert_eq!(f.token().balance(&f.bounty_id), 100_000);
+    }
+
+    #[test]
+    fn test_initialize_installs_storage_namespace() {
+        let f = TestFixture::setup();
+        let namespace: StorageNamespace = f
+            .env
+            .storage()
+            .instance()
+            .get(&DataKey::NamespaceRoot)
+            .expect("Namespace root not installed");
+
+        assert_eq!(namespace.scope, BOUNTY_SCOPE);
     }
 
     #[test]

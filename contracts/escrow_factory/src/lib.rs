@@ -32,6 +32,16 @@ pub struct EscrowInfo {
     pub created_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryConfig {
+    pub admin: Address,
+    pub implementation: Address,
+    pub pause_guardian: Option<Address>,
+    pub anomaly_detector: Option<Address>,
+    pub escrow_count: u64,
+}
+
 // Storage keys
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const IMPLEMENTATION: Symbol = symbol_short!("IMPL");
@@ -224,6 +234,21 @@ impl EscrowFactory {
 
     pub fn get_admin(env: Env) -> Address {
         Self::admin(&env)
+    }
+
+    /// Return the current factory configuration for off-chain monitoring.
+    pub fn get_config(env: Env) -> FactoryConfig {
+        FactoryConfig {
+            admin: env.storage().persistent().get(&ADMIN).expect("Not initialized"),
+            implementation: env
+                .storage()
+                .persistent()
+                .get(&IMPLEMENTATION)
+                .expect("Implementation not set"),
+            pause_guardian: env.storage().persistent().get(&PAUSE_GUARDIAN),
+            anomaly_detector: env.storage().persistent().get(&ANOMALY_DETECTOR),
+            escrow_count: env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0),
+        }
     }
 
     /// Set the pause guardian contract address. Admin only.
@@ -1077,13 +1102,39 @@ mod testutils;
 #[cfg(test)]
 mod timestamp_tests {
     use super::*;
-    use soroban_sdk::{testutils::Ledger, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Env,
+    };
 
     /// Helper: create a minimal env with a known timestamp.
     fn env_at(ts: u64) -> Env {
         let env = Env::default();
         env.ledger().with_mut(|li| li.timestamp = ts);
         env
+    }
+
+    #[test]
+    fn test_get_config_after_initialization() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let implementation = Address::generate(&env);
+        let factory = env.register_contract(None, EscrowFactory);
+
+        env.as_contract(&factory, || {
+            EscrowFactory::initialize(env.clone(), admin.clone(), implementation.clone());
+
+            assert_eq!(
+                EscrowFactory::get_config(env.clone()),
+                FactoryConfig {
+                    admin: admin.clone(),
+                    implementation: implementation.clone(),
+                    pause_guardian: None,
+                    anomaly_detector: None,
+                    escrow_count: 0,
+                }
+            );
+        });
     }
 
     // --- validate_future_timestamp ---

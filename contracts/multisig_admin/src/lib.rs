@@ -125,6 +125,8 @@ pub enum DataKey {
     Threshold,
     SignerCount,
     ProposalCount,
+    /// Proposals created but not yet executed or cancelled.
+    ActiveProposalCount,
     Signer(Address),
     Proposal(u32),
     /// SHA-256 checksum of the proposal argument XDR captured at proposal time.
@@ -230,6 +232,7 @@ impl MultisigAdminContract {
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::SignerCount, &(signers.len() as u32));
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        env.storage().instance().set(&DataKey::ActiveProposalCount, &0u32);
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("init")),
             (signers.len() as u32, threshold),
@@ -257,6 +260,15 @@ impl MultisigAdminContract {
         let count: u32 = env.storage().instance().get(&DataKey::ProposalCount).unwrap_or(0);
         let new_id = count.checked_add(1).expect("proposal count overflow");
         env.storage().instance().set(&DataKey::ProposalCount, &new_id);
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0);
+        let new_active_count = active_count.checked_add(1).expect("active proposal count overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveProposalCount, &new_active_count);
         let expiry = env.ledger().timestamp().checked_add(EXPIRY_SECONDS).expect("expiry overflow");
         let proposal = ProposalRecord {
             id: new_id,
@@ -421,6 +433,15 @@ impl MultisigAdminContract {
             env.invoke_contract::<()>(&proposal.target, &proposal.function, proposal.args.clone());
         }
 
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveProposalCount, &active_count.saturating_sub(1));
+
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("executed"), action_id),
             ProposalExecutedEvent {
@@ -457,6 +478,14 @@ impl MultisigAdminContract {
         caller.require_auth();
         proposal.cancelled = true;
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveProposalCount, &active_count.saturating_sub(1));
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("cancelled"), action_id),
             ProposalCancelledEvent {
@@ -497,6 +526,14 @@ impl MultisigAdminContract {
         env.storage().instance()
             .get(&DataKey::SignerCount)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Returns proposals not yet executed or cancelled; elapsed expiry is not reconciled.
+    pub fn get_active_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1574,6 +1611,7 @@ mod test {
         assert_eq!(pid1, 1u32);
         let pid2 = f.propose(&target, "do_thing");
         assert_eq!(pid2, 2u32);
+        assert_eq!(f.client().get_active_proposal_count(), 2u32);
 
         let proposal = f.client().get_proposal(&pid1);
         assert_eq!(proposal.approval_count, 1u32);
@@ -1581,6 +1619,26 @@ mod test {
         assert_eq!(proposal.executed, false);
         assert_eq!(proposal.cancelled, false);
         assert_eq!(proposal.expiry, EXPIRY_SECONDS);
+    }
+
+    #[test]
+    fn test_active_proposal_count_tracks_mixed_outcomes() {
+        let f = Fixture::setup();
+        assert_eq!(f.client().get_active_proposal_count(), 0u32);
+
+        let executed = f.threshold_proposal(2);
+        let cancelled = f.propose(&Address::generate(&f.env), "do_thing");
+        let remaining = f.propose(&Address::generate(&f.env), "do_thing");
+        assert_eq!(f.client().get_active_proposal_count(), 3u32);
+
+        f.sign_n(executed, 3);
+        f.client().execute_action(&executed);
+        assert_eq!(f.client().get_active_proposal_count(), 2u32);
+
+        f.client().cancel_action(&f.signers[1], &cancelled);
+        assert_eq!(f.client().get_active_proposal_count(), 1u32);
+        assert!(!f.client().get_proposal(&remaining).executed);
+        assert!(!f.client().get_proposal(&remaining).cancelled);
     }
 
     #[test]
