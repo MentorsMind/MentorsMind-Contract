@@ -27,8 +27,6 @@ pub struct MonthlyMetrics {
     pub net_new: i32,
 }
 
-const BUCKET_SIZE_SECS: u64 = 86400;
-
 #[contracttype]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
@@ -43,6 +41,9 @@ pub enum DataKey {
     EscrowDisputeCount,
     EscrowTotalDurationSecs,
     RevenueBucket(Symbol, u32),
+    MentorRevenueCount,
+    MentorRevenueAt(u32),
+    MentorRevenue30d(Address),
 }
 
 #[contracttype]
