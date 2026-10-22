@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
+use shared::{Pagination, MAX_PAGE_SIZE};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -198,6 +199,31 @@ impl TreasuryAnalyticsContract {
             .unwrap_or(0u32)
     }
 
+    /// Get a page of fee revenue records using shared Pagination.
+    /// limit is clamped to MAX_PAGE_SIZE before resolving the slice.
+    pub fn get_fee_revenue_page(env: Env, offset: u32, limit: u32) -> Vec<FeeRevenue> {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeRevenueCount)
+            .unwrap_or(0u32);
+
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for i in start..end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, FeeRevenue>(&DataKey::FeeRevenue(i))
+            {
+                result.push_back(record);
+            }
+        }
+
+        result
+    }
+
     // -----------------------------------------------------------------------
     // Referral Payout Analysis
     // -----------------------------------------------------------------------
@@ -274,6 +300,31 @@ impl TreasuryAnalyticsContract {
             .persistent()
             .get(&DataKey::ReferralPayoutCount)
             .unwrap_or(0u32)
+    }
+
+    /// Get a page of referral payout records using shared Pagination.
+    /// limit is clamped to MAX_PAGE_SIZE before resolving the slice.
+    pub fn get_referral_payout_page(env: Env, offset: u32, limit: u32) -> Vec<ReferralPayout> {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReferralPayoutCount)
+            .unwrap_or(0u32);
+
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for i in start..end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ReferralPayout>(&DataKey::ReferralPayout(i))
+            {
+                result.push_back(record);
+            }
+        }
+
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -847,6 +898,91 @@ mod tests {
 
         let page3 = client.get_fee_revenue(&4, &2);
         assert_eq!(page3.len(), 1);
+    }
+
+    #[test]
+    fn test_get_fee_revenue_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, contract_id) = setup_test(&env);
+        let client = TreasuryAnalyticsContractClient::new(&env, &contract_id);
+
+        let token = Address::generate(&env);
+
+        // Insert 7 records
+        for i in 0u32..7 {
+            env.ledger().set_timestamp(1000 + (i as u64) * 100);
+            client.record_fee_revenue(&token, &(100 * (i as i128 + 1)), &symbol_short!("test"));
+        }
+
+        // First page: offset=0, limit=3 → records 0,1,2
+        let page1 = client.get_fee_revenue_page(&0, &3);
+        assert_eq!(page1.len(), 3);
+        assert_eq!(page1.get(0).unwrap().amount, 100);
+        assert_eq!(page1.get(2).unwrap().amount, 300);
+
+        // Second page: offset=3, limit=3 → records 3,4,5
+        let page2 = client.get_fee_revenue_page(&3, &3);
+        assert_eq!(page2.len(), 3);
+        assert_eq!(page2.get(0).unwrap().amount, 400);
+        assert_eq!(page2.get(2).unwrap().amount, 600);
+
+        // Third page: offset=6, limit=3 → record 6 only (partial page)
+        let page3 = client.get_fee_revenue_page(&6, &3);
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.get(0).unwrap().amount, 700);
+
+        // Offset past end → empty
+        let empty = client.get_fee_revenue_page(&100, &10);
+        assert_eq!(empty.len(), 0);
+
+        // limit exceeds MAX_PAGE_SIZE (50) — returns at most 50 records
+        // We only have 7 records so we still get 7 back, but internally limit is clamped
+        let capped = client.get_fee_revenue_page(&0, &9999);
+        assert_eq!(capped.len(), 7); // all 7 fit within the clamped MAX_PAGE_SIZE of 50
+    }
+
+    #[test]
+    fn test_get_referral_payout_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, contract_id) = setup_test(&env);
+        let client = TreasuryAnalyticsContractClient::new(&env, &contract_id);
+
+        let token = Address::generate(&env);
+        let referrer = Address::generate(&env);
+
+        // Insert 6 records
+        for i in 0u32..6 {
+            env.ledger().set_timestamp(1000 + (i as u64) * 100);
+            client.record_referral_payout(&referrer, &token, &(50 * (i as i128 + 1)));
+        }
+
+        // First page: offset=0, limit=2 → records 0,1
+        let page1 = client.get_referral_payout_page(&0, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap().amount, 50);
+        assert_eq!(page1.get(1).unwrap().amount, 100);
+
+        // Middle page: offset=2, limit=2 → records 2,3
+        let page2 = client.get_referral_payout_page(&2, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().amount, 150);
+        assert_eq!(page2.get(1).unwrap().amount, 200);
+
+        // Last page: offset=4, limit=2 → records 4,5
+        let page3 = client.get_referral_payout_page(&4, &2);
+        assert_eq!(page3.len(), 2);
+        assert_eq!(page3.get(0).unwrap().amount, 250);
+        assert_eq!(page3.get(1).unwrap().amount, 300);
+
+        // Offset past end → empty
+        let empty = client.get_referral_payout_page(&100, &5);
+        assert_eq!(empty.len(), 0);
+
+        // limit exceeds MAX_PAGE_SIZE — still returns all 6 because 6 < 50
+        let capped = client.get_referral_payout_page(&0, &9999);
+        assert_eq!(capped.len(), 6);
     }
 
     #[test]

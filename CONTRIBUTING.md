@@ -113,13 +113,13 @@ patterns. The minimum required components are:
 - [ ] Define typed storage keys with a `DataKey` enum and include a
       `DataKey::NamespaceRoot` entry. Follow the
       [DataKey::NamespaceRoot guide (Issue #53)](https://github.com/MentorsMind/MentorsMind-Contract/issues/53)
-      and the [storage pattern documentation](docs/storage-guide.md).
+      and the [storage pattern documentation](docs/storage-pattern.md).
 - [ ] Define a `#[contracterror]` error enum for all expected contract
       failures.
 - [ ] Add an `initialize` entrypoint with an initialization guard so it cannot
       be run twice.
 - [ ] Choose the correct Soroban storage tier and bump TTLs for persistent or
-      instance data according to the [storage pattern documentation](docs/storage-guide.md).
+      instance data according to the [storage pattern documentation](docs/storage-pattern.md).
 - [ ] Emit events for state-changing operations. Document the event topics and
       payloads in [`docs/events.md`](docs/events.md) following the standardized
       3-element topic tuple format.

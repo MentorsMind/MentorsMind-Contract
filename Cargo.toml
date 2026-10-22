@@ -28,6 +28,7 @@ members = [
     "contracts/kyc_registry",
     "contracts/lending_pool",
     "contracts/mnt-token",
+    "contracts/onboarding_escrow",
     "contracts/shared",
     "contracts/verification",
     "contracts/session_registry",

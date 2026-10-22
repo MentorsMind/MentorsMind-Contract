@@ -39,6 +39,8 @@ pub enum DataKey {
     L2Config,
     L2Audit(BytesN<32>),
     ProcessedVAA(BytesN<32>),
+    OperationIndex(u32),
+    ProcessedTxCount,
     WrappedToken,
     TrustedRelayer(Address),
     ProcessedNonce(u32, u64),
@@ -166,7 +168,10 @@ impl BridgeReceiver {
 
         // Also store in config's processed_vaas list for audit
         let mut config = Self::get_config(&env);
+        let index = config.processed_vaas.len();
         config.processed_vaas.push_back(vaa_hash.clone());
+        env.storage().instance().set(&DataKey::OperationIndex(index), &vaa_hash);
+        env.storage().instance().set(&DataKey::ProcessedTxCount, &(index + 1));
         env.storage().instance().set(&DataKey::Config, &config);
 
         // Emit event
@@ -368,6 +373,25 @@ impl BridgeReceiver {
     pub fn get_processed_vaas(env: Env) -> Vec<BytesN<32>> {
         let config = Self::get_config(&env);
         config.processed_vaas
+    }
+
+    pub fn get_processed_tx_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::ProcessedTxCount).unwrap_or(0)
+    }
+
+    pub fn get_processed_txs_page(env: Env, offset: u32, limit: u32) -> Vec<BytesN<32>> {
+        const MAX_PAGE_SIZE: u32 = 100;
+        let count = Self::get_processed_tx_count(env.clone());
+        let end = offset.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
+        let mut page = Vec::new(&env);
+        let mut index = offset.min(count);
+        while index < end {
+            if let Some(hash) = env.storage().instance().get(&DataKey::OperationIndex(index)) {
+                page.push_back(hash);
+            }
+            index += 1;
+        }
+        page
     }
 
     // Helper functions

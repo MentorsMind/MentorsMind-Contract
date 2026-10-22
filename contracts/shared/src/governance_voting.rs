@@ -176,6 +176,26 @@ pub fn validate_minimum_holding_period(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holding_period_accepts_exact_boundary() {
+        assert_eq!(validate_minimum_holding_period(100, 100 + MIN_HOLDING_PERIOD_SECS), Ok(()));
+    }
+
+    #[test]
+    fn holding_period_rejects_one_second_early() {
+        assert!(validate_minimum_holding_period(100, 100 + MIN_HOLDING_PERIOD_SECS - 1).is_err());
+    }
+
+    #[test]
+    fn holding_period_handles_timestamp_underflow_safely() {
+        assert!(validate_minimum_holding_period(u64::MAX, 0).is_err());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Manipulation detection
 // ---------------------------------------------------------------------------

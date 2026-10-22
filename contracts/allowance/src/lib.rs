@@ -3,6 +3,7 @@
 use shared::events::{
     emit_allowance_event, evt_allowance_authorized, evt_allowance_pulled, evt_allowance_revoked,
 };
+use shared::pause_guard::require_not_paused;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Symbol,
 };
@@ -25,6 +26,10 @@ pub struct AllowanceRecord {
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
+    /// Contract administrator, set once at `initialize`.
+    Admin,
+    /// Address of the pause-guardian contract used as an emergency stop.
+    PauseGuardian,
     Allowance(Address, Address, Address), // (owner, spender, token)
 }
 
@@ -33,6 +38,35 @@ pub struct RecurringAllowanceContract;
 
 #[contractimpl]
 impl RecurringAllowanceContract {
+    /// Initialise the contract with its admin. Can only be called once.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().persistent().has(&DataKey::Admin) {
+            panic!("Already initialized");
+        }
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+    }
+
+    /// Admin-only: set or update the pause-guardian contract address used as
+    /// the emergency stop for [`Self::pull_payment`].
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PauseGuardian)
+    }
+
     pub fn authorize(
         env: Env,
         owner: Address,
@@ -76,6 +110,14 @@ impl RecurringAllowanceContract {
     }
 
     pub fn pull_payment(env: Env, spender: Address, owner: Address, token: Address, amount: i128) {
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         spender.require_auth();
 
         if amount <= 0 {
@@ -205,6 +247,72 @@ mod tests {
                 .persistent()
                 .set(&to_key, &(to_balance + amount));
         }
+    }
+
+    #[contract]
+    pub struct MockPauseGuardian;
+
+    #[contractimpl]
+    impl MockPauseGuardian {
+        pub fn set_paused(env: Env, paused: bool) {
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("PAUSED"), &paused);
+        }
+
+        pub fn is_paused(env: Env) -> bool {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("PAUSED"))
+                .unwrap_or(false)
+        }
+    }
+
+    #[test]
+    fn test_pause_blocks_pull_payment() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let allowance_id = env.register_contract(None, RecurringAllowanceContract);
+        let token_id = env.register_contract(None, MockToken);
+        let guardian_id = env.register_contract(None, MockPauseGuardian);
+        let allowance = RecurringAllowanceContractClient::new(&env, &allowance_id);
+        let token = MockTokenClient::new(&env, &token_id);
+        let guardian = MockPauseGuardianClient::new(&env, &guardian_id);
+
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        token.mint(&owner, &1_000);
+
+        allowance.initialize(&admin);
+        allowance.authorize(&owner, &spender, &token_id, &100, &5, &60);
+        allowance.set_pause_guardian(&admin, &guardian_id);
+
+        guardian.set_paused(&true);
+        let result = allowance.try_pull_payment(&spender, &owner, &token_id, &100);
+        assert!(result.is_err(), "paused contract must block pull_payment");
+        assert_eq!(token.balance(&spender), 0);
+
+        guardian.set_paused(&false);
+        allowance.pull_payment(&spender, &owner, &token_id, &100);
+        assert_eq!(token.balance(&spender), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_set_pause_guardian_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let allowance_id = env.register_contract(None, RecurringAllowanceContract);
+        let guardian_id = env.register_contract(None, MockPauseGuardian);
+        let allowance = RecurringAllowanceContractClient::new(&env, &allowance_id);
+
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        allowance.initialize(&admin);
+        allowance.set_pause_guardian(&stranger, &guardian_id);
     }
 
     #[test]

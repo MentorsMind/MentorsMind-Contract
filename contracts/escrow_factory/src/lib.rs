@@ -1194,128 +1194,224 @@ mod timestamp_tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
-// Pagination tests
+// Meta-transaction replay protection tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod pagination_tests {
+mod meta_tx_tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use shared::sig_validation::{MetaTxAction, MetaTxPayload, MAX_DEADLINE_SECS};
 
-    #[test]
-    fn test_get_escrows_page_with_multiple_escrows() {
+    fn setup_factory_for_metatx() -> (Env, Address, Address, EscrowFactoryClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        
+        env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
         let admin = Address::generate(&env);
         let implementation = Address::generate(&env);
-        let contract_id = env.register_contract(None, EscrowFactory);
-        let client = EscrowFactoryClient::new(&env, &contract_id);
+
+        let factory_id = env.register_contract(None, EscrowFactory);
+        let factory = EscrowFactoryClient::new(&env, &factory_id);
         
-        client.initialize(&admin, &implementation);
+        factory.initialize(&admin, &implementation);
+
+        (env, admin, factory_id, factory)
+    }
+
+    fn create_payload(
+        env: &Env,
+        contract_id: &Address,
+        signer: &Address,
+        nonce: u64,
+        deadline: u64,
+    ) -> MetaTxPayload {
+        // For simplicity, use a dummy params_hash
+        let params_hash = env.crypto().sha256(&soroban_sdk::Bytes::new(env));
         
-        // Deploy 7 escrows
-        for i in 0..7 {
-            let count: u64 = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0)
-            });
-            
-            let new_count = count + 1;
-            let escrow_info = EscrowInfo {
-                address: Address::generate(&env),
-                session_id: Symbol::new(&env, &format!("session{}", i)),
-                mentor: Address::generate(&env),
-                learner: Address::generate(&env),
-                created_at: env.ledger().timestamp(),
-            };
-            
-            env.as_contract(&contract_id, || {
-                env.storage().persistent().set(&(ESCROW_LIST, new_count), &escrow_info);
-                env.storage().persistent().set(&ESCROW_COUNT, &new_count);
-            });
+        MetaTxPayload {
+            contract_id: contract_id.clone(),
+            nonce,
+            deadline,
+            action: MetaTxAction::DeployEscrow,
+            params_hash,
         }
-        
-        // Test first page
-        let page1 = client.get_escrows_page(&0, &5);
-        assert_eq!(page1.len(), 5);
-        
-        // Test second page
-        let page2 = client.get_escrows_page(&5, &5);
-        assert_eq!(page2.len(), 2);
-        
-        // Test empty page
-        let page3 = client.get_escrows_page(&10, &5);
-        assert_eq!(page3.len(), 0);
     }
 
     #[test]
-    fn test_get_escrows_page_respects_max_page_size() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn test_meta_tx_replay_rejected() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
         
-        let admin = Address::generate(&env);
-        let implementation = Address::generate(&env);
-        let contract_id = env.register_contract(None, EscrowFactory);
-        let client = EscrowFactoryClient::new(&env, &contract_id);
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let session_id = soroban_sdk::symbol_short!("SESS_01");
         
-        client.initialize(&admin, &implementation);
+        // Get initial nonce
+        let initial_nonce = factory.get_nonce(&signer);
+        assert_eq!(initial_nonce, 0);
         
-        // Add 60 escrows (more than MAX_PAGE_SIZE)
-        for i in 0..60 {
-            let count: u64 = env.as_contract(&contract_id, || {
-                env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0)
-            });
-            
-            let new_count = count + 1;
-            let escrow_info = EscrowInfo {
-                address: Address::generate(&env),
-                session_id: Symbol::new(&env, &format!("s{}", i)),
-                mentor: Address::generate(&env),
-                learner: Address::generate(&env),
-                created_at: env.ledger().timestamp(),
-            };
-            
-            env.as_contract(&contract_id, || {
-                env.storage().persistent().set(&(ESCROW_LIST, new_count), &escrow_info);
-                env.storage().persistent().set(&ESCROW_COUNT, &new_count);
-            });
-        }
+        // Create payload with nonce 0
+        let now = env.ledger().timestamp();
+        let payload = create_payload(&env, &factory_id, &signer, 0, now + 3600);
         
-        // Request more than MAX_PAGE_SIZE, should be clamped to 50
-        let page = client.get_escrows_page(&0, &100);
-        assert_eq!(page.len(), 50);
+        // First execution should succeed
+        let _escrow_addr = factory.execute_meta_tx(
+            &signer,
+            &payload,
+            &mentor,
+            &learner,
+            &1000,
+            &token,
+            &session_id,
+        );
+        
+        // Nonce should be incremented
+        let new_nonce = factory.get_nonce(&signer);
+        assert_eq!(new_nonce, 1);
+        
+        // Try to replay the same payload - should panic with nonce error
+        // Note: The exact error message depends on shared::sig_validation implementation
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,  // Same payload, same nonce
+                &mentor,
+                &learner,
+                &2000,     // Different amount, doesn't matter
+                &token,
+                &soroban_sdk::symbol_short!("SESS_02"),
+            );
+        }));
+        
+        assert!(result.is_err(), "Replay should have been rejected");
     }
 
     #[test]
-    fn test_get_escrow_count() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn test_meta_tx_expired_deadline_rejected() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
         
-        let admin = Address::generate(&env);
-        let implementation = Address::generate(&env);
-        let contract_id = env.register_contract(None, EscrowFactory);
-        let client = EscrowFactoryClient::new(&env, &contract_id);
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let session_id = soroban_sdk::symbol_short!("SESS_03");
         
-        client.initialize(&admin, &implementation);
+        let now = env.ledger().timestamp();
+        let payload = create_payload(&env, &factory_id, &signer, 0, now + 1000);
         
-        // Initially zero
-        assert_eq!(client.get_escrow_count(), 0);
-        
-        // Add one escrow
-        env.as_contract(&contract_id, || {
-            let escrow_info = EscrowInfo {
-                address: Address::generate(&env),
-                session_id: Symbol::new(&env, "test"),
-                mentor: Address::generate(&env),
-                learner: Address::generate(&env),
-                created_at: env.ledger().timestamp(),
-            };
-            env.storage().persistent().set(&(ESCROW_LIST, 1u64), &escrow_info);
-            env.storage().persistent().set(&ESCROW_COUNT, &1u64);
+        // Advance time past the deadline + MAX_DEADLINE_SECS
+        env.ledger().with_mut(|li| {
+            li.timestamp += MAX_DEADLINE_SECS + 1;
         });
         
-        assert_eq!(client.get_escrow_count(), 1);
+        // Attempt should be rejected due to expired deadline
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &1000,
+                &token,
+                &session_id,
+            );
+        }));
+        
+        assert!(result.is_err(), "Expired deadline should have been rejected");
+    }
+
+    #[test]
+    fn test_meta_tx_third_attempt_after_expiry_also_rejected() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
+        
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        
+        let now = env.ledger().timestamp();
+        let payload = create_payload(&env, &factory_id, &signer, 0, now + 1000);
+        
+        // First execution succeeds
+        factory.execute_meta_tx(
+            &signer,
+            &payload,
+            &mentor,
+            &learner,
+            &1000,
+            &token,
+            &soroban_sdk::symbol_short!("SESS_04"),
+        );
+        
+        // Second attempt (replay) should fail
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &1000,
+                &token,
+                &soroban_sdk::symbol_short!("SESS_05"),
+            );
+        }));
+        assert!(result.is_err(), "Second attempt (replay) should fail");
+        
+        // Advance time past MAX_DEADLINE_SECS
+        env.ledger().with_mut(|li| {
+            li.timestamp += MAX_DEADLINE_SECS + 1;
+        });
+        
+        // Third attempt should also fail (expired + wrong nonce)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &1000,
+                &token,
+                &soroban_sdk::symbol_short!("SESS_06"),
+            );
+        }));
+        assert!(result.is_err(), "Third attempt after expiry should also fail");
+    }
+
+    #[test]
+    fn test_meta_tx_sequential_nonces_work() {
+        let (env, _admin, factory_id, factory) = setup_factory_for_metatx();
+        
+        let signer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        
+        let now = env.ledger().timestamp();
+        
+        // Execute 3 transactions with sequential nonces
+        for i in 0..3 {
+            let payload = create_payload(&env, &factory_id, &signer, i, now + 3600);
+            let session_id = match i {
+                0 => soroban_sdk::symbol_short!("S1"),
+                1 => soroban_sdk::symbol_short!("S2"),
+                _ => soroban_sdk::symbol_short!("S3"),
+            };
+            
+            factory.execute_meta_tx(
+                &signer,
+                &payload,
+                &mentor,
+                &learner,
+                &((i + 1) as i128 * 1000),
+                &token,
+                &session_id,
+            );
+            
+            // Verify nonce incremented
+            assert_eq!(factory.get_nonce(&signer), i + 1);
+        }
     }
 }

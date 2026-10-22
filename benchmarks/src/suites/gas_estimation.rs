@@ -6,13 +6,11 @@
 ///   3. Compares estimated vs actual and records accuracy.
 extern crate std;
 
-use crate::harness::{measure, wasm_size, GasAccuracyResult, BenchResult};
-use crate::report::write_gas_accuracy_report;
+use crate::harness::{measure, wasm_size, write_gas_accuracy_report, GasAccuracyResult, BenchResult};
 use mentorminds_escrow::{EscrowContract, EscrowContractClient};
 use mentorminds_governance::{
     GovernanceContract, GovernanceContractClient, ProposalAction,
 };
-use mentorminds_escrow_factory::EscrowFactory;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
@@ -22,7 +20,6 @@ use soroban_sdk::{
 
 const CONTRACT_ESCROW: &str = "escrow";
 const CONTRACT_GOVERNANCE: &str = "governance";
-const CONTRACT_ESCROW_FACTORY: &str = "escrow_factory";
 
 // ---------------------------------------------------------------------------
 // Escrow fixtures
@@ -168,6 +165,9 @@ impl GovernanceFixture {
             &delegation,
             &Some(60u64),
             &Some(1_000u32),
+            &None,
+            &None,
+            &Some(10u32),
         );
 
         Self { env, gov_id: gov, admin, proposer, voter, snapshot }
@@ -184,51 +184,6 @@ impl GovernanceFixture {
             &BytesN::from_array(&self.env, &[0xab; 32]),
             &ProposalAction::UpdateFee(300u32),
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Escrow Factory fixtures
-// ---------------------------------------------------------------------------
-
-struct EscrowFactoryFixture {
-    env: Env,
-    factory_address: Address,
-    admin: Address,
-    implementation: Address,
-    mentor: Address,
-    learner: Address,
-    token: Address,
-}
-
-impl EscrowFactoryFixture {
-    fn new() -> Self {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let implementation = Address::generate(&env);
-        let mentor = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let token = Address::generate(&env);
-
-        let factory_address = env.register_contract(None, EscrowFactory);
-        let factory_client = mentorminds_escrow_factory::EscrowFactoryClient::new(&env, &factory_address);
-
-        factory_client.initialize(&admin, &implementation);
-
-        Self {
-            env,
-            factory_address,
-            admin,
-            implementation,
-            mentor,
-            learner,
-            token,
-        }
-    }
-
-    fn client(&self) -> mentorminds_escrow_factory::EscrowFactoryClient<'_> {
-        mentorminds_escrow_factory::EscrowFactoryClient::new(&self.env, &self.factory_address)
     }
 }
 
@@ -303,33 +258,10 @@ pub fn run() -> Vec<BenchResult> {
         ));
     }
 
-    // --- escrow_factory: estimate_deploy_escrow_cost (view only) ---
-    {
-        let wasm = wasm_size("mentorminds_escrow_factory");
-        let f = EscrowFactoryFixture::new();
-        let estimate = f.client().estimate_deploy_escrow_cost();
-
-        // Record the estimate as a bench result with zero actuals so it
-        // appears in reports without confusing regression checks.
-        results.push(BenchResult {
-            contract: CONTRACT_ESCROW_FACTORY.into(),
-            entry_point: "estimate_deploy_escrow_cost".into(),
-            cpu_instructions: estimate.base_instructions,
-            mem_bytes: 0,
-            storage_reads: estimate.storage_reads,
-            storage_writes: estimate.storage_writes,
-            wasm_bytes: wasm,
-        });
-
-        accuracy.push(GasAccuracyResult::new(
-            CONTRACT_ESCROW_FACTORY,
-            "estimate_deploy_escrow_cost",
-            0,
-            estimate.base_instructions,
-            0,
-            0,
-        ));
-    }
+    // NOTE: the escrow_factory gas-estimation suite is temporarily disabled —
+    // the `mentorminds-escrow-factory` crate is not a dependency of this
+    // benchmark binary. Re-enable once the dependency and its client are wired
+    // up here.
 
     print_gas_accuracy(&accuracy);
     write_gas_accuracy_report(&accuracy);

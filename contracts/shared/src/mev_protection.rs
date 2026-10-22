@@ -103,3 +103,74 @@ pub fn record_mev_monitoring(
     
     record
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_arbitrage_at_count_2() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        let result = detect_atomic_arbitrage(&env, &caller, 2);
+        
+        assert_eq!(result.is_arbitrage, false);
+        assert_eq!(result.is_sandwich, false);
+        assert_eq!(result.risk_score, 0);
+    }
+
+    #[test]
+    fn test_arbitrage_at_count_3() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        let result = detect_atomic_arbitrage(&env, &caller, 3);
+        
+        assert_eq!(result.is_arbitrage, true);
+        assert_eq!(result.is_sandwich, false);
+        assert_eq!(result.risk_score, 50);
+    }
+
+    #[test]
+    fn test_sandwich_at_count_5() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        let result = detect_atomic_arbitrage(&env, &caller, 5);
+        
+        assert_eq!(result.is_arbitrage, true);
+        assert_eq!(result.is_sandwich, true);
+        assert_eq!(result.risk_score, 90); // 50 + 40
+    }
+
+    #[test]
+    fn test_enforce_protocol_isolation_below_threshold() {
+        let flag = MevProtectionFlag {
+            is_arbitrage: true,
+            is_sandwich: false,
+            risk_score: 50,
+        };
+        
+        assert_eq!(enforce_protocol_isolation(&flag), true);
+    }
+
+    #[test]
+    fn test_enforce_protocol_isolation_at_threshold() {
+        let flag = MevProtectionFlag {
+            is_arbitrage: true,
+            is_sandwich: false,
+            risk_score: MEV_ARBITRAGE_RISK_THRESHOLD,
+        };
+        
+        assert_eq!(enforce_protocol_isolation(&flag), false);
+    }
+
+    #[test]
+    fn test_enforce_protocol_isolation_above_threshold() {
+        let flag = MevProtectionFlag {
+            is_arbitrage: true,
+            is_sandwich: true,
+            risk_score: 90,
+        };
+        
+        assert_eq!(enforce_protocol_isolation(&flag), false);
+    }
+}

@@ -81,7 +81,6 @@ use shared::{
     ReleaseFailure, FailureClassification, RecoveryState,
     calculate_next_retry,
     MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD, StateTransitionContext,
-    CrossContractStateCheck,
     InvalidStateRecord,
     is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS, EmergencyAction, EmergencyAdminRole,
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
@@ -355,10 +354,14 @@ pub struct FeeAppliedEventData {
 }
 
 /// Event data emitted when the graduated fee schedule is updated.
+///
+/// `has_previous` distinguishes the first configuration (no prior schedule, in
+/// which case `old_schedule` mirrors `new_schedule`) from later updates.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeScheduleUpdatedEventData {
-    pub old_schedule: Option<FeeSchedule>,
+    pub has_previous: bool,
+    pub old_schedule: FeeSchedule,
     pub new_schedule: FeeSchedule,
 }
 
@@ -1160,6 +1163,8 @@ impl EscrowContract {
         Self::_validate_fee_schedule(&schedule);
 
         let old_schedule = env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule);
+        let has_previous = old_schedule.is_some();
+        let old_schedule = old_schedule.unwrap_or_else(|| schedule.clone());
 
         env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
         env.storage()
@@ -1169,6 +1174,7 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
             FeeScheduleUpdatedEventData {
+                has_previous,
                 old_schedule,
                 new_schedule: schedule,
             },
@@ -1241,7 +1247,8 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
             FeeScheduleUpdatedEventData {
-                old_schedule: Some(old_schedule),
+                has_previous: true,
+                old_schedule,
                 new_schedule: schedule,
             },
         );

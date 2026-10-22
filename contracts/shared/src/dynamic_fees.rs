@@ -85,3 +85,58 @@ pub fn detect_fee_gaming(
         evasion_score: 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_base_fee_zero_load_zero_reputation() {
+        let env = Env::default();
+        let result = calculate_dynamic_fee(&env, 0, 0);
+        assert_eq!(result.fee_bps, BASE_FEE_BPS); // 200
+        assert_eq!(result.is_emergency, false);
+    }
+
+    #[test]
+    fn test_max_fee_at_double_threshold_plus_one() {
+        let env = Env::default();
+        let result = calculate_dynamic_fee(&env, HIGH_LOAD_THRESHOLD * 2 + 1, 0);
+        assert_eq!(result.fee_bps, MAX_FEE_BPS); // 1000
+        assert_eq!(result.is_emergency, true);
+    }
+
+    #[test]
+    fn test_reputation_discount_at_score_80() {
+        let env = Env::default();
+        let result = calculate_dynamic_fee(&env, 0, 80);
+        // BASE_FEE_BPS (200) - 100 (1% discount) = 100
+        assert_eq!(result.fee_bps, MIN_FEE_BPS); // Should be clamped to MIN_FEE_BPS (100)
+        assert_eq!(result.is_emergency, false);
+    }
+
+    #[test]
+    fn test_reputation_discount_at_score_90() {
+        let env = Env::default();
+        let result = calculate_dynamic_fee(&env, 0, 90);
+        // BASE_FEE_BPS (200) - 100 (1% discount) = 100
+        assert_eq!(result.fee_bps, MIN_FEE_BPS); // Should be clamped to MIN_FEE_BPS (100)
+        assert_eq!(result.is_emergency, false);
+    }
+
+    #[test]
+    fn test_emergency_at_double_threshold_load() {
+        let env = Env::default();
+        let result = calculate_dynamic_fee(&env, HIGH_LOAD_THRESHOLD * 2, 50);
+        // At exactly 2 * threshold, the condition is false (needs > not >=)
+        // So it falls to the else if condition: > HIGH_LOAD_THRESHOLD
+        // fee = 200 + 300 - 50 (0.5% discount for rep >= 50) = 450
+        assert_eq!(result.fee_bps, 450);
+        assert_eq!(result.is_emergency, false);
+        
+        // Test just above double threshold
+        let result_emergency = calculate_dynamic_fee(&env, HIGH_LOAD_THRESHOLD * 2 + 1, 50);
+        assert_eq!(result_emergency.fee_bps, MAX_FEE_BPS);
+        assert_eq!(result_emergency.is_emergency, true);
+    }
+}

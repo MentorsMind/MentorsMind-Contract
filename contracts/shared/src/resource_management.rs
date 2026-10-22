@@ -109,3 +109,66 @@ pub fn check_emergency_trigger(
 ) -> bool {
     global_requests_rpm > 500 // Threshold for global emergency state
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allocate_resources_at_99_sessions_request_1() {
+        let env = Env::default();
+        let result = allocate_system_resources(&env, 99, 1);
+        
+        assert_eq!(result.granted, true);
+        assert_eq!(result.remaining_quota, 0);
+    }
+
+    #[test]
+    fn test_allocate_resources_at_100_sessions_request_1() {
+        let env = Env::default();
+        let result = allocate_system_resources(&env, 100, 1);
+        
+        assert_eq!(result.granted, false);
+        assert_eq!(result.remaining_quota, 0);
+    }
+
+    #[test]
+    fn test_allocate_resources_exceeds_quota() {
+        let env = Env::default();
+        let result = allocate_system_resources(&env, 95, 10);
+        
+        assert_eq!(result.granted, false);
+        assert_eq!(result.remaining_quota, 5);
+    }
+
+    #[test]
+    fn test_manage_session_load_emergency_throttle() {
+        let env = Env::default();
+        let result = manage_session_load(&env, 3, true);
+        
+        assert_eq!(result.allowed, true);
+        assert_eq!(result.current_rpm, 3);
+        assert_eq!(result.is_emergency, true);
+    }
+
+    #[test]
+    fn test_manage_session_load_emergency_reduced_rpm() {
+        let env = Env::default();
+        let result = manage_session_load(&env, 10, true);
+        
+        // During emergency, RPM should be EMERGENCY_THROTTLE_RATE (5)
+        assert_eq!(result.allowed, false); // 10 >= 5
+        assert_eq!(result.current_rpm, 10);
+        assert_eq!(result.is_emergency, true);
+    }
+
+    #[test]
+    fn test_manage_session_load_normal_operation() {
+        let env = Env::default();
+        let result = manage_session_load(&env, 25, false);
+        
+        assert_eq!(result.allowed, true); // 25 < 30 (DEFAULT_MAX_REQUESTS_PER_MINUTE)
+        assert_eq!(result.current_rpm, 25);
+        assert_eq!(result.is_emergency, false);
+    }
+}

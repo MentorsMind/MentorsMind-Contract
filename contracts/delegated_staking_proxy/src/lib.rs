@@ -13,9 +13,13 @@
 //! correct across deposits/withdrawals that change the total pool size at
 //! different times.
 
-use shared::{pagination::Pagination, safe_math::SafeMath, StakeRecord};
+use shared::{
+    pagination::Pagination, safe_math::SafeMath, validate_amount_limits, ReentrancyGuard,
+    StakeRecord, MAX_FINANCIAL_AMOUNT,
+};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    Symbol, Vec,
 };
 
 #[contracterror]
@@ -33,10 +37,6 @@ pub enum Error {
     StillLocked = 9,
     NothingStaked = 10,
 }
-
-/// Economic sanity ceiling for a single deposit/reward amount, mirroring
-/// `staking::MAX_FINANCIAL_AMOUNT`.
-const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 
 /// Fixed-point scale for the reward-per-share accumulator.
 const PRECISION: i128 = 1_000_000_000_000; // 1e12
@@ -125,7 +125,7 @@ impl DelegatedStakingProxy {
     pub fn deposit_and_stake(env: Env, owner: Address, amount: i128) -> Result<(), Error> {
         Self::require_initialized(&env)?;
 
-        if amount <= 0 || amount > MAX_FINANCIAL_AMOUNT {
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
             return Err(Error::InvalidAmount);
         }
         let min_deposit: i128 = env
@@ -138,6 +138,8 @@ impl DelegatedStakingProxy {
         }
 
         owner.require_auth();
+
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("PROXY"));
 
         let mnt_token: Address = env
             .storage()
@@ -225,6 +227,8 @@ impl DelegatedStakingProxy {
         Self::require_initialized(&env)?;
         owner.require_auth();
 
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("PROXY"));
+
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -285,6 +289,8 @@ impl DelegatedStakingProxy {
             .persistent()
             .get(&DataKey::WithdrawalRequest(owner.clone()))
             .ok_or(Error::NoWithdrawalRequest)?;
+
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("PROXY"));
 
         Self::accrue_pending(&env, &owner);
 
