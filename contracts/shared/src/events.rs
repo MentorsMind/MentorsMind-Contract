@@ -41,7 +41,7 @@
 /// here is missing from `events_schema.json`.
 #[allow(dead_code)]
 
-use soroban_sdk::{contractevent, contracttype, Address, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{contracttype, Address, Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.

@@ -18,7 +18,7 @@ use shared::{
 };
 use shared::ttl_utils::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contractevent, contracttype, symbol_short, Address, Bytes, BytesN,
+    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
     Env, Symbol, TryIntoVal, Val, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
@@ -27,7 +27,7 @@ use soroban_sdk::xdr::ToXdr;
 // Contract Events
 // ---------------------------------------------------------------------------
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalCreatedEvent {
     pub proposal_id: u32,
@@ -37,7 +37,7 @@ pub struct ProposalCreatedEvent {
     pub expiry: u64,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalSignedEvent {
     pub proposal_id: u32,
@@ -45,7 +45,7 @@ pub struct ProposalSignedEvent {
     pub approval_count: u32,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalExecutedEvent {
     pub proposal_id: u32,
@@ -53,7 +53,7 @@ pub struct ProposalExecutedEvent {
     pub function: Symbol,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalCancelledEvent {
     pub proposal_id: u32,
@@ -273,8 +273,8 @@ impl MultisigAdminContract {
         let proposal = ProposalRecord {
             id: new_id,
             proposer: proposer.clone(),
-            target,
-            function,
+            target: target.clone(),
+            function: function.clone(),
             args,
             approval_count: 1,
             expiry,
