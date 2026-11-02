@@ -1,0 +1,53 @@
+﻿cargo : warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+At line:1 char:1
++ cargo check --workspace 2>&1 | Out-File -FilePath workspace_errors.tx ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: profil...workspace root::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+package:   C:\Users\HP\Desktop\MentorsMind-Contract\contracts\grants\Cargo.toml
+workspace: C:\Users\HP\Desktop\MentorsMind-Contract\Cargo.toml
+   Compiling serde_core v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling schemars v0.8.22
+   Compiling thiserror v1.0.69
+    Checking dyn-clone v1.0.20
+   Compiling derive_arbitrary v1.3.2
+   Compiling soroban-env-host v25.2.2
+   Compiling dtor-proc-macro v0.0.6
+   Compiling ctor-proc-macro v0.0.6
+    Checking mentorminds-formal-verification v0.1.0 (C:\Users\HP\Desktop\MentorsMind-Contract\formal_verification)
+warning: unexpected `cfg` condition name: `kani`
+  --> formal_verification\src\lib.rs:52:7
+   |
+52 | #[cfg(kani)]
+   |       ^^^^ help: found config with similar value: `feature = "kani"`
+   |
+   = help: expected names are: `docsrs`, `feature`, and `test` and 32 more
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(kani)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about 
+checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: `mentorminds-formal-verification` (lib) generated 1 warning
+    Checking dtor v0.1.1
+    Checking ctor v0.5.0
+    Checking arbitrary v1.3.2
+    Checking serde v1.0.229
+    Checking hex v0.4.3
+    Checking state-transition-analyzer v0.1.0 (C:\Users\HP\Desktop\MentorsMind-Contract\tools)
+   Compiling crate-git-revision v0.0.6
+   Compiling stellar-strkey v0.0.13
+   Compiling stellar-xdr v25.0.0
+   Compiling soroban-env-common v25.2.2
+   Compiling stellar-strkey v0.0.16
+    Checking serde_with v3.24.0
+   Compiling soroban-sdk v25.3.2
+   Compiling soroban-spec v25.3.2
+   Compiling soroban-spec-rust v25.3.2
+   Compiling soroban-env-macros v25.2.2
+   Compiling soroban-sdk-macros v25.3.2

@@ -1,0 +1,1049 @@
+﻿cargo : warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+At line:1 char:1
++ cargo check -p shared 2>&1 | Out-File -FilePath shared_errors.txt -En ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: profil...workspace root::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+package:   C:\Users\HP\Desktop\MentorsMind-Contract\contracts\grants\Cargo.toml
+workspace: C:\Users\HP\Desktop\MentorsMind-Contract\Cargo.toml
+    Checking shared v0.1.0 (C:\Users\HP\Desktop\MentorsMind-Contract\contracts\shared)
+error[E0592]: duplicate definitions with name `spec_xdr`
+   --> contracts\shared\src\events.rs:131:1
+    |
+130 | #[contractevent]
+    | ---------------- other definition for `spec_xdr`
+131 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ duplicate definitions for `spec_xdr`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0592]: duplicate definitions with name `spec_xdr`
+   --> contracts\shared\src\events.rs:142:1
+    |
+141 | #[contractevent]
+    | ---------------- other definition for `spec_xdr`
+142 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ duplicate definitions for `spec_xdr`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0592]: duplicate definitions with name `spec_xdr`
+   --> contracts\shared\src\events.rs:152:1
+    |
+151 | #[contractevent]
+    | ---------------- other definition for `spec_xdr`
+152 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ duplicate definitions for `spec_xdr`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0592]: duplicate definitions with name `spec_xdr`
+   --> contracts\shared\src\events.rs:162:1
+    |
+161 | #[contractevent]
+    | ---------------- other definition for `spec_xdr`
+162 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ duplicate definitions for `spec_xdr`
+    |
+    = note: this error originates in the attribute macro `contracttype` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+  --> contracts\shared\src\cross_contract_auth.rs:61:22
+   |
+61 |         env.events().publish(
+   |                      ^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\economic_verification.rs:150:22
+    |
+150 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+  --> contracts\shared\src\error_context.rs:61:10
+   |
+61 |         .publish((symbol_short!("ctr_err"), operation, reason), ctx);
+   |          ^^^^^^^
+
+error[E0283]: type annotations needed
+  --> contracts\shared\src\events.rs:59:1
+   |
+59 | #[contractevent]
+   | ^ cannot infer type
+   |
+   = note: multiple `impl`s satisfying `_: IntoVal<Env, soroban_sdk::Val>` found in the `soroban_sdk` crate:
+           - impl<E, T, U> IntoVal<E, T> for U
+             where E: soroban_env_common::env::Env, T: FromVal<E, U>;
+           - impl<N> IntoVal<Env, soroban_sdk::Val> for soroban_sdk::crypto::Hash<N>
+             where the constant `N` has type `usize`;
+note: required by a bound in `events::ContractEvent`
+  --> contracts\shared\src\events.rs:61:29
+   |
+61 | pub struct ContractEvent<D: IntoVal<Env, Val>> {
+   |                             ^^^^^^^^^^^^^^^^^ required by this bound in `ContractEvent`
+   = note: this error originates in the attribute macro `contractevent` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0283]: type annotations needed
+  --> contracts\shared\src\events.rs:59:1
+   |
+59 | #[contractevent]
+   | ^^^^^^^^^^^^^^^^ cannot infer type
+   |
+   = note: multiple `impl`s satisfying `_: IntoVal<Env, soroban_sdk::Val>` found in the `soroban_sdk` crate:
+           - impl<E, T, U> IntoVal<E, T> for U
+             where E: soroban_env_common::env::Env, T: FromVal<E, U>;
+           - impl<N> IntoVal<Env, soroban_sdk::Val> for soroban_sdk::crypto::Hash<N>
+             where the constant `N` has type `usize`;
+note: required by a bound in `events::ContractEvent::<D>::spec_xdr`
+  --> contracts\shared\src\events.rs:61:29
+   |
+59 | #[contractevent]
+   | ---------------- required by a bound in this associated function
+60 | #[derive(Clone, Debug, Eq, PartialEq)]
+61 | pub struct ContractEvent<D: IntoVal<Env, Val>> {
+   |                             ^^^^^^^^^^^^^^^^^ required by this bound in `ContractEvent::<D>::spec_xdr`
+   = note: this error originates in the attribute macro `contractevent` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:131:1
+    |
+131 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `AdminChangeProposedEvent`
+   --> contracts\shared\src\events.rs:131:1
+    |
+131 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `AdminChangeProposedEvent`
+   --> contracts\shared\src\events.rs:130:1
+    |
+130 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contracttype` which comes from the expansion of the 
+attribute macro `contractevent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:130:1
+    |
+130 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `AdminChangeProposedEvent`
+   --> contracts\shared\src\events.rs:131:1
+    |
+131 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `AdminChangeProposedEvent`
+   --> contracts\shared\src\events.rs:130:1
+    |
+130 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contractevent` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:142:1
+    |
+142 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `AdminChangeAcceptedEvent`
+   --> contracts\shared\src\events.rs:142:1
+    |
+142 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `AdminChangeAcceptedEvent`
+   --> contracts\shared\src\events.rs:141:1
+    |
+141 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contracttype` which comes from the expansion of the 
+attribute macro `contractevent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:141:1
+    |
+141 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `AdminChangeAcceptedEvent`
+   --> contracts\shared\src\events.rs:142:1
+    |
+142 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `AdminChangeAcceptedEvent`
+   --> contracts\shared\src\events.rs:141:1
+    |
+141 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contractevent` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:152:1
+    |
+152 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `AdminChangeCancelledEvent`
+   --> contracts\shared\src\events.rs:152:1
+    |
+152 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `AdminChangeCancelledEvent`
+   --> contracts\shared\src\events.rs:151:1
+    |
+151 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contracttype` which comes from the expansion of the 
+attribute macro `contractevent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:151:1
+    |
+151 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `AdminChangeCancelledEvent`
+   --> contracts\shared\src\events.rs:152:1
+    |
+152 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `AdminChangeCancelledEvent`
+   --> contracts\shared\src\events.rs:151:1
+    |
+151 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contractevent` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:162:1
+    |
+162 | #[contracttype]
+    | ^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `ProposalCancelledWithCooldown`
+   --> contracts\shared\src\events.rs:162:1
+    |
+162 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `ProposalCancelledWithCooldown`
+   --> contracts\shared\src\events.rs:161:1
+    |
+161 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contracttype` which comes from the expansion of the 
+attribute macro `contractevent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> contracts\shared\src\events.rs:161:1
+    |
+161 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^ multiple `spec_xdr` found
+    |
+note: candidate #1 is defined in an impl for the type `ProposalCancelledWithCooldown`
+   --> contracts\shared\src\events.rs:162:1
+    |
+162 | #[contracttype]
+    | ^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `ProposalCancelledWithCooldown`
+   --> contracts\shared\src\events.rs:161:1
+    |
+161 | #[contractevent]
+    | ^^^^^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `contractevent` (in Nightly builds, run with -Z 
+macro-backtrace for more info)
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:176:49
+    |
+176 |     emit(env, contract_escrow(env), event_type, data);
+    |     ----                                        ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+175 | pub fn emit_escrow_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                               ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:181:53
+    |
+181 |     emit(env, contract_governance(env), event_type, data);
+    |     ----                                            ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+180 | pub fn emit_governance_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                   ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:186:50
+    |
+186 |     emit(env, contract_staking(env), event_type, data);
+    |     ----                                         ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+185 | pub fn emit_staking_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:191:51
+    |
+191 |     emit(env, contract_timelock(env), event_type, data);
+    |     ----                                          ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+190 | pub fn emit_timelock_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                 ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:196:49
+    |
+196 |     emit(env, contract_bounty(env), event_type, data);
+    |     ----                                        ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+195 | pub fn emit_bounty_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                               ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:201:52
+    |
+201 |     emit(env, contract_allowance(env), event_type, data);
+    |     ----                                           ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+200 | pub fn emit_allowance_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                  ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:206:50
+    |
+206 |     emit(env, contract_anomaly(env), event_type, data);
+    |     ----                                         ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+205 | pub fn emit_anomaly_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:211:51
+    |
+211 |     emit(env, contract_referral(env), event_type, data);
+    |     ----                                          ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+210 | pub fn emit_referral_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                 ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:216:55
+    |
+216 |     emit(env, contract_verification(env), event_type, data);
+    |     ---- required by a bound introduced by this call  ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+215 | pub fn emit_verification_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                     ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:221:50
+    |
+221 |     emit(env, contract_vesting(env), event_type, data);
+    |     ----                                         ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+220 | pub fn emit_vesting_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:226:51
+    |
+226 |     emit(env, contract_multisig(env), event_type, data);
+    |     ----                                          ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+225 | pub fn emit_multisig_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                 ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:231:51
+    |
+231 |     emit(env, contract_treasury(env), event_type, data);
+    |     ----                                          ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+230 | pub fn emit_treasury_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                 ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:236:55
+    |
+236 |     emit(env, contract_subscription(env), event_type, data);
+    |     ---- required by a bound introduced by this call  ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+235 | pub fn emit_subscription_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                     ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:241:49
+    |
+241 |     emit(env, contract_streak(env), event_type, data);
+    |     ----                                        ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+240 | pub fn emit_streak_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                               ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:246:51
+    |
+246 |     emit(env, contract_velocity(env), event_type, data);
+    |     ----                                          ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+245 | pub fn emit_velocity_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                 ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:251:50
+    |
+251 |     emit(env, contract_upgrade(env), event_type, data);
+    |     ----                                         ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+250 | pub fn emit_upgrade_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:256:56
+    |
+256 |     emit(env, contract_trs_analytics(env), event_type, data);
+    |     ---- required by a bound introduced by this call   ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+255 | pub fn emit_trs_analytics_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                      ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:261:56
+    |
+261 |     emit(env, contract_sub_analytics(env), event_type, data);
+    |     ---- required by a bound introduced by this call   ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+260 | pub fn emit_sub_analytics_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                      ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:266:53
+    |
+266 |     emit(env, contract_delegation(env), event_type, data);
+    |     ----                                            ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+265 | pub fn emit_delegation_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                                   ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:271:57
+    |
+271 |     emit(env, contract_escrow_factory(env), event_type, data);
+    |     ---- required by a bound introduced by this call    ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+270 | pub fn emit_escrow_factory_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                       ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:276:55
+    |
+276 |     emit(env, contract_endorsements(env), event_type, data);
+    |     ---- required by a bound introduced by this call  ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+275 | pub fn emit_endorsements_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                     ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:281:46
+    |
+281 |     emit(env, contract_isa(env), event_type, data);
+    |     ----                                     ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+280 | pub fn emit_isa_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: D) {
+    |                                            ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:286:55
+    |
+286 |     emit(env, contract_rate_limiter(env), event_type, data);
+    |     ---- required by a bound introduced by this call  ^^^^ the trait `Clone` is not implemented for `D`
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+285 | pub fn emit_rate_limiter_event<D: IntoVal<Env, Val> + core::clone::Clone>(env: &Env, event_type: Symbol, data: 
+D) {
+    |                                                     ++++++++++++++++++++
+
+error[E0277]: the trait bound `D: Clone` is not satisfied
+   --> contracts\shared\src\events.rs:297:42
+    |
+297 |     emit(env, contract_name, event_type, data);
+    |     ----                                 ^^^^ the trait `Clone` is not implemented for `D`
+    |     |
+    |     required by a bound introduced by this call
+    |
+note: required by a bound in `emit`
+   --> contracts\shared\src\events.rs:73:36
+    |
+ 73 | pub fn emit<D: IntoVal<Env, Val> + Clone>(
+    |                                    ^^^^^ required by this bound in `emit`
+help: consider further restricting type parameter `D` with trait `Clone`
+    |
+291 | pub fn emit_generic_event<D: IntoVal<Env, Val> + core::clone::Clone>(
+    |                                                ++++++++++++++++++++
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:221:18
+    |
+221 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:293:18
+    |
+293 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:333:18
+    |
+333 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:389:18
+    |
+389 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:425:18
+    |
+425 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:489:18
+    |
+489 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:554:18
+    |
+554 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:600:18
+    |
+600 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:644:18
+    |
+644 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\key_management.rs:664:18
+    |
+664 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\params.rs:203:18
+    |
+203 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:169:22
+    |
+169 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:201:35
+    |
+201 |                 self.env.events().publish(
+    |                                   ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:214:27
+    |
+214 |         self.env.events().publish(
+    |                           ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:296:22
+    |
+296 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:310:22
+    |
+310 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:361:26
+    |
+361 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:368:26
+    |
+368 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\reentrancy_guard.rs:581:27
+    |
+581 |         self.env.events().publish(
+    |                           ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\ttl_utils.rs:367:22
+    |
+367 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\ttl_utils.rs:449:26
+    |
+449 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\ttl_utils.rs:486:22
+    |
+486 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\ttl_utils.rs:518:26
+    |
+518 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+  --> contracts\shared\src\mev_protection.rs:99:18
+   |
+99 |     env.events().publish(
+   |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\transaction_guard.rs:231:22
+    |
+231 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\transaction_guard.rs:244:22
+    |
+244 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\transaction_guard.rs:313:18
+    |
+313 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\transaction_guard.rs:350:18
+    |
+350 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\transaction_guard.rs:381:18
+    |
+381 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\transaction_guard.rs:424:18
+    |
+424 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:259:18
+    |
+259 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:306:22
+    |
+306 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:365:22
+    |
+365 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:393:18
+    |
+393 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:446:18
+    |
+446 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:589:18
+    |
+589 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:607:22
+    |
+607 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\validator_accountability.rs:694:18
+    |
+694 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:427:18
+    |
+427 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:458:22
+    |
+458 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:507:22
+    |
+507 |         env.events().publish(
+    |                      ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:537:18
+    |
+537 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:564:18
+    |
+564 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:722:18
+    |
+722 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:754:18
+    |
+754 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:797:18
+    |
+797 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:815:26
+    |
+815 |             env.events().publish(
+    |                          ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:866:18
+    |
+866 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\cross_chain_sync.rs:893:18
+    |
+893 |     env.events().publish(
+    |                  ^^^^^^^
+
+warning: use of deprecated method `soroban_sdk::events::Events::publish`: use the #[contractevent] macro on a contract 
+event type
+   --> contracts\shared\src\lib.rs:884:18
+    |
+884 |     env.events().publish(
+    |                  ^^^^^^^
+
+Some errors have detailed explanations: E0034, E0277, E0283, E0592.
+For more information about an error, try `rustc --explain E0034`.
+warning: `shared` (lib) generated 53 warnings
+error: could not compile `shared` (lib) due to 38 previous errors; 53 warnings emitted

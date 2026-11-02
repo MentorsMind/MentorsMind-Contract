@@ -40,7 +40,7 @@ pub enum DataKey {
     EscrowCount,
     EscrowDisputeCount,
     EscrowTotalDurationSecs,
-    RevenueBucket(Symbol, u32),
+    RevenueBucket(Address, u32),
     MentorRevenueCount,
     MentorRevenueAt(u32),
     MentorRevenue30d(Address),
@@ -75,35 +75,6 @@ impl SubscriptionAnalytics {
         env.storage()
             .persistent()
             .set(&DataKey::MentorRevenueCount, &0u32);
-    }
-
-    pub fn record_renewal(env: Env, mentor: Symbol, amount: i128) {
-        let now = env.ledger().timestamp();
-        let current_day = (now / BUCKET_SIZE_SECS) as u32;
-
-        let bucket_key = DataKey::RevenueBucket(mentor.clone(), current_day);
-        let existing: i128 = env.storage().persistent().get(&bucket_key).unwrap_or(0);
-        env.storage().persistent().set(&bucket_key, &(existing + amount));
-
-        // Prune old bucket from 32 days ago
-        if current_day >= 32 {
-            let old_bucket_key = DataKey::RevenueBucket(mentor, current_day - 32);
-            env.storage().persistent().remove(&old_bucket_key);
-        }
-    }
-
-    pub fn get_mentor_revenue_30d(env: Env, mentor: Symbol) -> i128 {
-        let now = env.ledger().timestamp();
-        let current_day = (now / BUCKET_SIZE_SECS) as u32;
-
-        let mut total: i128 = 0;
-        let start_day = current_day.saturating_sub(29);
-        for day in start_day..=current_day {
-            let bucket_key = DataKey::RevenueBucket(mentor.clone(), day);
-            let val: i128 = env.storage().persistent().get(&bucket_key).unwrap_or(0);
-            total += val;
-        }
-        total
     }
 
     pub fn record_subscription_event(
