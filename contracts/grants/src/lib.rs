@@ -1,7 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 use shared::pagination::Pagination;
+use shared::safe_math::SafeMath;
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -244,9 +245,15 @@ impl Grants {
             panic!("Learner already approved for this program");
         }
 
-        // Check that total allocated doesn't exceed budget
-        if program.allocated + amount > program.budget {
-            panic!("Would exceed program budget");
+        // Check that total allocated doesn't exceed budget.
+        // Use checked arithmetic so the check-then-write cannot overflow and
+        // validate the new total against the budget before persisting it.
+        let new_allocated = program
+            .allocated
+            .safe_add(&env, amount)
+            .expect("Allocation overflow");
+        if new_allocated > program.budget {
+            panic!("GrantBudgetExceeded");
         }
 
         // Verify eligibility proof was submitted
@@ -256,7 +263,7 @@ impl Grants {
         }
 
         // Update program allocated
-        program.allocated += amount;
+        program.allocated = new_allocated;
         env.storage().instance().set(&program_key, &program);
 
         // Store learner allocation

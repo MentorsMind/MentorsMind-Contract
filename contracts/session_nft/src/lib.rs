@@ -217,6 +217,10 @@ impl SessionBundleNFT {
             panic!("Not transferable");
         }
 
+        if env.ledger().timestamp() >= bundle.expiry {
+            panic!("NFT expired");
+        }
+
         let from_bundles: Vec<u64> = env
             .storage()
             .persistent()
@@ -695,6 +699,31 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "Session learner mismatch")]
+    fn test_mint_reverts_when_any_session_owned_by_other_learner() {
+        let f = TestFixture::setup();
+        // One session legitimately owned by the caller.
+        let owned = f.register_completed_session("owned1");
+        // Another session owned by a different learner.
+        let other_learner = Address::generate(&f.env);
+        let foreign = Symbol::new(&f.env, "foreign1");
+        f.registry().register_session(
+            &foreign,
+            &f.mentor,
+            &other_learner,
+            &1_500_000u64,
+            &60u32,
+            &100i128,
+            &Address::generate(&f.env),
+        );
+        f.registry().update_status(&foreign, &SessionStatus::Completed);
+
+        let session_ids = vec![&f.env, owned, foreign];
+        let hash = dummy_hash(&f.env);
+        f.mint_default(&session_ids, &hash, 2000u64);
+    }
+
+    #[test]
     #[should_panic(expected = "No sessions provided")]
     fn test_mint_with_empty_session_ids() {
         let f = TestFixture::setup();
@@ -771,6 +800,22 @@ mod test {
 
         let bundle = f.client().get_bundle(&token_id);
         assert_eq!(bundle.owner, new_owner);
+    }
+
+    #[test]
+    #[should_panic(expected = "NFT expired")]
+    fn test_transfer_rejected_after_expiry() {
+        let f = TestFixture::setup();
+        let sid = f.register_completed_session("t2");
+        let session_ids = vec![&f.env, sid];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id = f.mint_default(&session_ids, &hash, 2000u64);
+
+        // Advance the ledger past the bundle's expiry timestamp.
+        f.env.ledger().with_mut(|li| li.timestamp = 2000);
+
+        let new_owner = Address::generate(&f.env);
+        f.client().transfer(&f.learner, &new_owner, &token_id);
     }
 
     #[test]
