@@ -1,7 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 use shared::pagination::Pagination;
+use shared::safe_math::SafeMath;
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -13,6 +14,15 @@ const TTL_BUMP: u32 = 1_000_000;
 /// Maximum percentage of treasury that can be committed to grants (in basis points)
 /// 2000 BPS = 20%
 const MAX_GRANT_PCT_BPS: u16 = 2000;
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum GrantError {
+    /// The allocation would push the program's total allocated amount over its budget.
+    GrantBudgetExceeded = 1,
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -230,9 +240,15 @@ impl Grants {
             panic!("Learner already approved for this program");
         }
 
-        // Check that total allocated doesn't exceed budget
-        if program.allocated + amount > program.budget {
-            panic!("Would exceed program budget");
+        // Check that total allocated doesn't exceed budget.
+        // Use checked arithmetic so the check-then-write cannot overflow and
+        // validate the new total against the budget before persisting it.
+        let new_allocated = program
+            .allocated
+            .safe_add(&env, amount)
+            .expect("Allocation overflow");
+        if new_allocated > program.budget {
+            panic!("GrantBudgetExceeded");
         }
 
         // Verify eligibility proof was submitted
@@ -242,7 +258,7 @@ impl Grants {
         }
 
         // Update program allocated
-        program.allocated += amount;
+        program.allocated = new_allocated;
         env.storage().instance().set(&program_key, &program);
 
         // Store learner allocation
@@ -653,6 +669,43 @@ mod tests {
 
         // Try to approve without application
         client.approve_grant(&new_admin, &learner, &program_id, &50i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "GrantBudgetExceeded")]
+    fn test_second_allocation_over_budget_rejected() {
+        let (env, _admin, _treasury, token) = setup();
+        let learner_a = Address::generate(&env);
+        let learner_b = Address::generate(&env);
+
+        let client = GrantsClient::new(
+            &env,
+            &env.register_contract(None, Grants),
+        );
+
+        let new_admin = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        client.initialize(&new_admin, &new_treasury);
+
+        // Budget of 100, per-learner max of 100.
+        let program_id = client.create_grant_program(
+            &new_admin,
+            &100i128,
+            &100i128,
+            &dummy_hash(&env),
+            &2_000_000u64,
+            &token,
+        );
+
+        client.apply_for_grant(&learner_a, &program_id, &dummy_hash(&env));
+        client.apply_for_grant(&learner_b, &program_id, &dummy_hash(&env));
+
+        // First allocation of 60 succeeds.
+        client.approve_grant(&new_admin, &learner_a, &program_id, &60i128);
+        assert_eq!(client.get_grant_program(&program_id).allocated, 60);
+
+        // Second allocation of 60 would total 120 > budget of 100: rejected.
+        client.approve_grant(&new_admin, &learner_b, &program_id, &60i128);
     }
 
     #[test]
