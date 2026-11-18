@@ -276,6 +276,26 @@ impl ReferralContract {
             panic!("Referee already registered");
         }
 
+        // Reject circular referral chains: the referee must not already be an
+        // ancestor of the referrer (e.g. A→B then B→A). Walk the referrer's
+        // chain, bounded to avoid unbounded loops on malformed data.
+        const MAX_REFERRAL_CHAIN_DEPTH: u32 = 64;
+        let mut current = referrer.clone();
+        for _ in 0..MAX_REFERRAL_CHAIN_DEPTH {
+            let info: ReferralInfo = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Referral(current.clone()))
+            {
+                Some(info) => info,
+                None => break,
+            };
+            if info.referrer == referee {
+                panic!("Circular referral detected");
+            }
+            current = info.referrer;
+        }
+
         let referee_type = if is_mentor {
             RefereeType::Mentor
         } else {
@@ -1004,6 +1024,18 @@ mod test {
         let f = TestFixture::setup();
         let user = Address::generate(&f.env);
         f.client().register_referral(&user, &user, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Circular referral detected")]
+    fn test_circular_referral_rejection() {
+        let f = TestFixture::setup();
+        let a = Address::generate(&f.env);
+        let b = Address::generate(&f.env);
+
+        // A refers B, then B tries to refer A — would form a two-hop cycle.
+        f.client().register_referral(&a, &b, &true);
+        f.client().register_referral(&b, &a, &true);
     }
 
     #[test]

@@ -114,17 +114,22 @@ const DEFAULT_LIQUIDITY_PARAMETER: i128 = 100_000_000_000_000_000; // 0.1 * SCAL
 /// x is in fixed-point format (scaled by 10^18).
 /// Accurate to ~0.01% for x in [-5, 5].
 /// Returns result in fixed-point format.
-fn exp_fixed_point(env: &Env, x: i128) -> i128 {
+/// All arithmetic uses checked operations; returns `Error::Overflow` on overflow.
+fn exp_fixed_point(env: &Env, x: i128) -> Result<i128, Error> {
     if x == 0 {
-        return FIXED_POINT_SCALE;
+        return Ok(FIXED_POINT_SCALE);
     }
 
     // Avoid overflow for very large x
-    if x > 5 * FIXED_POINT_SCALE {
-        return i128::MAX / 2; // Saturate instead of overflow
+    let upper_bound = match 5i128.checked_mul(FIXED_POINT_SCALE) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    if x > upper_bound {
+        return Ok(i128::MAX / 2); // Saturate instead of overflow
     }
-    if x < -5 * FIXED_POINT_SCALE {
-        return 0; // e^(-5+) ~= 0
+    if x < -upper_bound {
+        return Ok(0); // e^(-5+) ~= 0
     }
 
     let mut result = FIXED_POINT_SCALE; // 1.0
@@ -138,13 +143,20 @@ fn exp_fixed_point(env: &Env, x: i128) -> i128 {
         if term == 0 {
             break;
         }
-        result = result.safe_add(env, term);
+        result = match result.checked_add(term) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
 
         // Prepare next term: x_power = x^(n+1)
-        x_power = x_power.safe_mul(env, x).safe_div(env, FIXED_POINT_SCALE);
+        let mul = match x_power.checked_mul(x) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
+        x_power = mul.safe_div(env, FIXED_POINT_SCALE);
     }
 
-    result
+    Ok(result)
 }
 
 /// Compute ln(x) in fixed-point format using Newton's method.
@@ -168,7 +180,7 @@ fn ln_fixed_point(env: &Env, x: i128) -> i128 {
             break;
         }
         prev_y = y;
-        let exp_y = exp_fixed_point(env, y);
+        let exp_y = exp_fixed_point(env, y).unwrap_or(i128::MAX / 2);
         let delta = (x - exp_y).safe_div(env, exp_y);
         y = y.safe_add(env, delta);
     }
@@ -179,16 +191,37 @@ fn ln_fixed_point(env: &Env, x: i128) -> i128 {
 /// LMSR cost function: C(q_yes, q_no) = b * ln(e^(q_yes/b) + e^(q_no/b))
 /// where b is the liquidity parameter.
 /// Returns cost in fixed-point format.
-fn lmsr_cost(env: &Env, q_yes: i128, q_no: i128, b: i128) -> i128 {
-    let q_yes_scaled = q_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
-    let q_no_scaled = q_no.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
+/// All arithmetic uses checked operations; returns `Error::Overflow` on overflow.
+fn lmsr_cost(env: &Env, q_yes: i128, q_no: i128, b: i128) -> Result<i128, Error> {
+    if b <= 0 {
+        return Err(Error::InvalidAmount);
+    }
 
-    let exp_yes = exp_fixed_point(env, q_yes_scaled);
-    let exp_no = exp_fixed_point(env, q_no_scaled);
-    let sum = exp_yes.safe_add(env, exp_no);
+    let q_yes_mul = match q_yes.checked_mul(FIXED_POINT_SCALE) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    let q_yes_scaled = q_yes_mul.safe_div(env, b);
+
+    let q_no_mul = match q_no.checked_mul(FIXED_POINT_SCALE) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    let q_no_scaled = q_no_mul.safe_div(env, b);
+
+    let exp_yes = exp_fixed_point(env, q_yes_scaled)?;
+    let exp_no = exp_fixed_point(env, q_no_scaled)?;
+    let sum = match exp_yes.checked_add(exp_no) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
 
     let ln_sum = ln_fixed_point(env, sum);
-    b.safe_mul(env, ln_sum).safe_div(env, FIXED_POINT_SCALE)
+    let b_mul = match b.checked_mul(ln_sum) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    Ok(b_mul.safe_div(env, FIXED_POINT_SCALE))
 }
 
 /// Get current price for yes outcome as basis points (0-10000).
@@ -197,8 +230,8 @@ fn get_yes_price_bps(env: &Env, q_yes: i128, q_no: i128, b: i128) -> u32 {
     let q_yes_scaled = q_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
     let q_no_scaled = q_no.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
 
-    let exp_yes = exp_fixed_point(env, q_yes_scaled);
-    let exp_no = exp_fixed_point(env, q_no_scaled);
+    let exp_yes = exp_fixed_point(env, q_yes_scaled).unwrap_or(i128::MAX / 2);
+    let exp_no = exp_fixed_point(env, q_no_scaled).unwrap_or(i128::MAX / 2);
     let sum = exp_yes.safe_add(env, exp_no);
 
     let price = if sum == 0 {
@@ -415,8 +448,8 @@ impl PredictionMarket {
         }
 
         // Calculate cost using LMSR with SafeMath
-        let old_cost = lmsr_cost(&env, market.yes_pool, market.no_pool, market.liquidity_parameter);
-        let new_cost = lmsr_cost(&env, new_yes_pool, new_no_pool, market.liquidity_parameter);
+        let old_cost = lmsr_cost(&env, market.yes_pool, market.no_pool, market.liquidity_parameter)?;
+        let new_cost = lmsr_cost(&env, new_yes_pool, new_no_pool, market.liquidity_parameter)?;
 
         // Cost to bettor
         let cost = if new_cost >= old_cost {
@@ -1007,4 +1040,102 @@ mod tests {
         let oracle1 = Address::generate(&env);
         let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
 
-        registry_client.set_registered(&oracle
+        let market = client.get_market(&market_id);
+        assert!(market.resolution_requires_multi);
+        assert_eq!(market.resolution_oracle, oracle1);
+    }
+
+    #[test]
+    #[should_panic(expected = "resolution date must be in future")]
+    fn test_invalid_resolution_date() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        client.create_market(&creator, &learner, &hash, &0, &token, &None, &oracle, &false);
+    }
+
+    #[test]
+    fn test_near_max_pool_overflow_protection() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let bettor = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        let market_id = client.create_market(
+            &creator,
+            &learner,
+            &hash,
+            &1000,
+            &token,
+            &None,
+            &oracle,
+            &false,
+        );
+
+        // Near-max amount that would cause overflow
+        let near_max_amount = i128::MAX;
+        let res = client.try_place_bet(&bettor, &market_id, &true, &near_max_amount);
+        assert!(res.is_err());
+        assert_eq!(res, Err(Ok(Error::Overflow)));
+    }
+
+    #[test]
+    fn test_lmsr_cost_fuzz_no_panic() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+
+        let half_max = i128::MAX / 2;
+        // Representative large values within [0, i128::MAX / 2]
+        let values: [i128; 8] = [
+            0,
+            1,
+            FIXED_POINT_SCALE,
+            half_max / 4,
+            half_max / 2,
+            half_max - 1,
+            half_max,
+            i128::MAX / 4,
+        ];
+
+        env.as_contract(&contract_id, || {
+            for &q_yes in values.iter() {
+                for &q_no in values.iter() {
+                    for &b in values.iter() {
+                        // b must be positive for a valid LMSR; skip zero
+                        if b <= 0 {
+                            continue;
+                        }
+                        // Must never panic; only Ok or Err(Error::Overflow)
+                        let res = lmsr_cost(&env, q_yes, q_no, b);
+                        match res {
+                            Ok(_) => {}
+                            Err(Error::Overflow) => {}
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
