@@ -14,6 +14,16 @@ const TTL_BUMP: u32 = 1_000_000;
 /// 2000 BPS = 20%
 const MAX_GRANT_PCT_BPS: u16 = 2000;
 
+// ── Errors ────────────────────────────────────────────────────────────────────
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// Allocation attempted after the program's expiry timestamp.
+    ProgramExpired = 1,
+    /// Allocation would push cumulative commitments past MAX_GRANT_PCT_BPS of treasury.
+    ExceedsTreasuryCap = 2,
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,9 +221,13 @@ impl Grants {
             .get(&program_key)
             .expect("Program not found");
 
+        // Enforce program expiry before disbursing any grant.
         if env.ledger().timestamp() >= program.expiry {
-            panic!("Program has expired");
+            panic!("{:?}", Error::ProgramExpired);
         }
+
+        // Enforce the treasury cap against the live treasury balance.
+        Self::check_grant_commitment(&env, &program.token, 0);
 
         if amount > program.per_learner_max {
             panic!("Amount exceeds per_learner_max");
@@ -431,17 +445,23 @@ impl Grants {
 
         let treasury_balance = Self::get_token_balance(env, token, &treasury);
 
-        let max_allowed = (treasury_balance * (MAX_GRANT_PCT_BPS as i128)) / 10000;
+        let max_allowed = (treasury_balance * (MAX_GRANT_PCT_BPS as i128)) / 10_000;
 
         if total_committed + new_budget > max_allowed {
-            panic!("Would exceed MAX_GRANT_PCT_BPS");
+            panic!("{:?}", Error::ExceedsTreasuryCap);
         }
     }
 
-    fn get_token_balance(env: &Env, token: &Address, account: &Address) -> i128 {
-        // Note: In a real implementation, this would call token contract's balance method
-        // For now, returning a placeholder that would need treasury integration
-        0
+    /// Query the treasury contract for the live balance of `token`.
+    fn get_token_balance(env: &Env, token: &Address, _account: &Address) -> i128 {
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&TREASURY)
+            .expect("Not initialized");
+
+        let client = treasury_interface::Client::new(env, &treasury);
+        client.get_balance(token)
     }
 }
 
@@ -653,6 +673,58 @@ mod tests {
 
         // Try to approve without application
         client.approve_grant(&new_admin, &learner, &program_id, &50i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "ProgramExpired")]
+    fn test_allocate_after_expiry_rejected() {
+        let (env, _admin, _treasury, token) = setup();
+        let learner = Address::generate(&env);
+
+        let client = GrantsClient::new(&env, &env.register_contract(None, Grants));
+
+        let new_admin = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        client.initialize(&new_admin, &new_treasury);
+
+        let program_id = client.create_grant_program(
+            &new_admin,
+            &1000i128,
+            &100i128,
+            &dummy_hash(&env),
+            &2_000_000u64,
+            &token,
+        );
+
+        client.apply_for_grant(&learner, &program_id, &dummy_hash(&env));
+
+        // Advance the ledger past the program expiry.
+        env.ledger().with_mut(|li| li.timestamp = 2_000_001);
+
+        client.approve_grant(&new_admin, &learner, &program_id, &50i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "ExceedsTreasuryCap")]
+    fn test_oversized_program_rejected_by_small_treasury() {
+        let (env, _admin, _treasury, token) = setup();
+
+        let client = GrantsClient::new(&env, &env.register_contract(None, Grants));
+
+        let new_admin = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        client.initialize(&new_admin, &new_treasury);
+
+        // Treasury holds only 1000 tokens; 20% cap = 200.
+        // A 1000 budget program exceeds the cap and must be rejected.
+        client.create_grant_program(
+            &new_admin,
+            &1000i128,
+            &100i128,
+            &dummy_hash(&env),
+            &2_000_000u64,
+            &token,
+        );
     }
 
     #[test]
