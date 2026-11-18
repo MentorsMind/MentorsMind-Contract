@@ -41,6 +41,10 @@ pub struct InterfaceRegistryContract;
 #[contractimpl]
 impl InterfaceRegistryContract {
     const YIELD_INTERFACE: &'static str = "yield_v1";
+    /// Canonical interface id under which resolution oracles are registered.
+    /// Consumers (e.g. the prediction market) validate an oracle address by
+    /// calling `verify(address, oracle_v1)` / `is_registered_oracle(address)`.
+    const ORACLE_INTERFACE: &'static str = "oracle_v1";
 
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
@@ -237,6 +241,32 @@ impl InterfaceRegistryContract {
         }
     }
 
+    /// Register `contract` as a resolution oracle under the canonical
+    /// `oracle_v1` interface id. Admin-only (delegates to `register_interface`).
+    pub fn register_oracle(env: Env, contract: Address, version: u32) {
+        Self::register_interface(
+            env.clone(),
+            contract,
+            Symbol::new(&env, Self::ORACLE_INTERFACE),
+            version,
+        );
+    }
+
+    /// Whether `address` is a registered (and non-quarantined) resolution
+    /// oracle, i.e. registered under the canonical `oracle_v1` interface id.
+    /// Stable cross-contract entry point for consumers such as the prediction
+    /// market to validate a `resolution_oracle` before use.
+    pub fn is_registered_oracle(env: Env, address: Address) -> bool {
+        Self::verify(env.clone(), address, Symbol::new(&env, Self::ORACLE_INTERFACE))
+    }
+
+    /// Panics unless `address` is a registered resolution oracle.
+    pub fn require_oracle(env: Env, address: Address) {
+        if !Self::is_registered_oracle(env.clone(), address) {
+            panic!("oracle not registered");
+        }
+    }
+
     /// Store an interface descriptor for a given interface_id.
     pub fn set_interface_descriptor(
         env: Env,
@@ -358,6 +388,31 @@ mod tests {
 
         assert_eq!(registry.get_yield_contract(), yield_contract);
         assert_eq!(registry.get_yield_contract_version(), 3);
+    }
+
+    #[test]
+    fn test_register_oracle_and_verify() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (registry, _admin, oracle) = setup(&env);
+        let interface = Symbol::new(&env, "oracle_v1");
+
+        registry.register_oracle(&oracle, &1);
+
+        // Registered oracle is accepted via both entry points.
+        assert!(registry.verify(&oracle, &interface));
+        assert!(registry.is_registered_oracle(&oracle));
+        registry.require_oracle(&oracle);
+
+        // An unregistered address is rejected.
+        let unregistered = Address::generate(&env);
+        assert!(!registry.verify(&unregistered, &interface));
+        assert!(!registry.is_registered_oracle(&unregistered));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.require_oracle(&unregistered);
+        }));
+        assert!(result.is_err());
     }
 
     #[test]

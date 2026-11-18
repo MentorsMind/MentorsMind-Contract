@@ -112,6 +112,16 @@ const DEFAULT_MAX_MULTIPLIER_BPS: u32 = 20_000;
 const DEFAULT_MAX_LIFETIME_REWARD: i128 = 10_000 * 10_000_000;
 const DEFAULT_GLOBAL_REFERRAL_MINT_CAP: i128 = 5_000_000 * 10_000_000;
 
+/// Absolute ceiling for `ReferralConfig::max_multiplier_bps` (30_000 bps = 3x).
+///
+/// Economic justification: the multiplier scales every referral reward before
+/// the per-address and global caps are applied. If an admin could set it
+/// arbitrarily high, a single referral tree could mint an unbounded amount of
+/// MNT in a handful of claims and drain the token supply. Capping the
+/// multiplier at 3x keeps referral emissions a bounded fraction of supply even
+/// in the worst case, while still leaving headroom above the 2x default.
+pub const ABSOLUTE_MAX_MULTIPLIER_BPS: u32 = 30_000;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAdminChange {
@@ -234,6 +244,9 @@ impl ReferralContract {
         if config.max_multiplier_bps == 0 {
             panic!("max_multiplier_bps must be > 0");
         }
+        if config.max_multiplier_bps > ABSOLUTE_MAX_MULTIPLIER_BPS {
+            panic!("MultiplierTooHigh");
+        }
         if config.max_lifetime_reward <= 0 {
             panic!("max_lifetime_reward must be positive");
         }
@@ -261,6 +274,26 @@ impl ReferralContract {
             .has(&DataKey::Referral(referee.clone()))
         {
             panic!("Referee already registered");
+        }
+
+        // Reject circular referral chains: the referee must not already be an
+        // ancestor of the referrer (e.g. A→B then B→A). Walk the referrer's
+        // chain, bounded to avoid unbounded loops on malformed data.
+        const MAX_REFERRAL_CHAIN_DEPTH: u32 = 64;
+        let mut current = referrer.clone();
+        for _ in 0..MAX_REFERRAL_CHAIN_DEPTH {
+            let info: ReferralInfo = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Referral(current.clone()))
+            {
+                Some(info) => info,
+                None => break,
+            };
+            if info.referrer == referee {
+                panic!("Circular referral detected");
+            }
+            current = info.referrer;
         }
 
         let referee_type = if is_mentor {
@@ -994,6 +1027,18 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "Circular referral detected")]
+    fn test_circular_referral_rejection() {
+        let f = TestFixture::setup();
+        let a = Address::generate(&f.env);
+        let b = Address::generate(&f.env);
+
+        // A refers B, then B tries to refer A — would form a two-hop cycle.
+        f.client().register_referral(&a, &b, &true);
+        f.client().register_referral(&b, &a, &true);
+    }
+
+    #[test]
     #[should_panic(expected = "Referee already registered")]
     fn test_duplicate_referral_rejection() {
         let f = TestFixture::setup();
@@ -1221,6 +1266,39 @@ mod test {
 
         let expected = (REWARD_MENTOR * 15_000) / 10_000;
         assert_eq!(f.mnt_client().balance(&referrer), expected);
+    }
+
+    /// Boundary: exactly ABSOLUTE_MAX_MULTIPLIER_BPS (30_000 = 3x) is accepted.
+    #[test]
+    fn test_set_config_accepts_absolute_max_multiplier() {
+        let f = TestFixture::setup();
+
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: ABSOLUTE_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        });
+
+        // Config was persisted with the boundary value.
+        let referrer = Address::generate(&f.env);
+        let referee = Address::generate(&f.env);
+        f.client().register_referral(&referrer, &referee, &true);
+        f.client().fulfill_referral(&referee);
+        f.client().claim_reward(&referrer);
+        assert_eq!(f.mnt_client().balance(&referrer), (REWARD_MENTOR * 30_000) / 10_000);
+    }
+
+    /// Boundary: one bps above ABSOLUTE_MAX_MULTIPLIER_BPS (30_001) is rejected.
+    #[test]
+    #[should_panic(expected = "MultiplierTooHigh")]
+    fn test_set_config_rejects_multiplier_above_absolute_max() {
+        let f = TestFixture::setup();
+
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: ABSOLUTE_MAX_MULTIPLIER_BPS + 1,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        });
     }
 
     /// Referrer cannot claim beyond max_lifetime_reward.

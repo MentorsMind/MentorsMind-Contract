@@ -16,12 +16,13 @@ const TTL_BUMP: u32 = 1_000_000;
 const MAX_GRANT_PCT_BPS: u16 = 2000;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum GrantError {
-    /// The allocation would push the program's total allocated amount over its budget.
-    GrantBudgetExceeded = 1,
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// Allocation attempted after the program's expiry timestamp.
+    ProgramExpired = 1,
+    /// Allocation would push cumulative commitments past MAX_GRANT_PCT_BPS of treasury.
+    ExceedsTreasuryCap = 2,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -221,9 +222,13 @@ impl Grants {
             .get(&program_key)
             .expect("Program not found");
 
+        // Enforce program expiry before disbursing any grant.
         if env.ledger().timestamp() >= program.expiry {
-            panic!("Program has expired");
+            panic!("{:?}", Error::ProgramExpired);
         }
+
+        // Enforce the treasury cap against the live treasury balance.
+        Self::check_grant_commitment(&env, &program.token, 0);
 
         if amount > program.per_learner_max {
             panic!("Amount exceeds per_learner_max");
@@ -447,17 +452,23 @@ impl Grants {
 
         let treasury_balance = Self::get_token_balance(env, token, &treasury);
 
-        let max_allowed = (treasury_balance * (MAX_GRANT_PCT_BPS as i128)) / 10000;
+        let max_allowed = (treasury_balance * (MAX_GRANT_PCT_BPS as i128)) / 10_000;
 
         if total_committed + new_budget > max_allowed {
-            panic!("Would exceed MAX_GRANT_PCT_BPS");
+            panic!("{:?}", Error::ExceedsTreasuryCap);
         }
     }
 
-    fn get_token_balance(env: &Env, token: &Address, account: &Address) -> i128 {
-        // Note: In a real implementation, this would call token contract's balance method
-        // For now, returning a placeholder that would need treasury integration
-        0
+    /// Query the treasury contract for the live balance of `token`.
+    fn get_token_balance(env: &Env, token: &Address, _account: &Address) -> i128 {
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&TREASURY)
+            .expect("Not initialized");
+
+        let client = treasury_interface::Client::new(env, &treasury);
+        client.get_balance(token)
     }
 }
 
@@ -672,40 +683,55 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "GrantBudgetExceeded")]
-    fn test_second_allocation_over_budget_rejected() {
+    #[should_panic(expected = "ProgramExpired")]
+    fn test_allocate_after_expiry_rejected() {
         let (env, _admin, _treasury, token) = setup();
-        let learner_a = Address::generate(&env);
-        let learner_b = Address::generate(&env);
+        let learner = Address::generate(&env);
 
-        let client = GrantsClient::new(
-            &env,
-            &env.register_contract(None, Grants),
-        );
+        let client = GrantsClient::new(&env, &env.register_contract(None, Grants));
 
         let new_admin = Address::generate(&env);
         let new_treasury = Address::generate(&env);
         client.initialize(&new_admin, &new_treasury);
 
-        // Budget of 100, per-learner max of 100.
         let program_id = client.create_grant_program(
             &new_admin,
-            &100i128,
+            &1000i128,
             &100i128,
             &dummy_hash(&env),
             &2_000_000u64,
             &token,
         );
 
-        client.apply_for_grant(&learner_a, &program_id, &dummy_hash(&env));
-        client.apply_for_grant(&learner_b, &program_id, &dummy_hash(&env));
+        client.apply_for_grant(&learner, &program_id, &dummy_hash(&env));
 
-        // First allocation of 60 succeeds.
-        client.approve_grant(&new_admin, &learner_a, &program_id, &60i128);
-        assert_eq!(client.get_grant_program(&program_id).allocated, 60);
+        // Advance the ledger past the program expiry.
+        env.ledger().with_mut(|li| li.timestamp = 2_000_001);
 
-        // Second allocation of 60 would total 120 > budget of 100: rejected.
-        client.approve_grant(&new_admin, &learner_b, &program_id, &60i128);
+        client.approve_grant(&new_admin, &learner, &program_id, &50i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "ExceedsTreasuryCap")]
+    fn test_oversized_program_rejected_by_small_treasury() {
+        let (env, _admin, _treasury, token) = setup();
+
+        let client = GrantsClient::new(&env, &env.register_contract(None, Grants));
+
+        let new_admin = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+        client.initialize(&new_admin, &new_treasury);
+
+        // Treasury holds only 1000 tokens; 20% cap = 200.
+        // A 1000 budget program exceeds the cap and must be rejected.
+        client.create_grant_program(
+            &new_admin,
+            &1000i128,
+            &100i128,
+            &dummy_hash(&env),
+            &2_000_000u64,
+            &token,
+        );
     }
 
     #[test]

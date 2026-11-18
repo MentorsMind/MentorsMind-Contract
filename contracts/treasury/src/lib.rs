@@ -1009,6 +1009,11 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Live balance of `token` held by the treasury contract.
+    ///
+    /// Exposed as a public entry point so other contracts (e.g. the grants
+    /// contract enforcing `MAX_GRANT_PCT_BPS`) can query the treasury's
+    /// current holdings cross-contract at allocation time.
     pub fn get_balance(env: Env, token: Address) -> i128 {
         token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
