@@ -26,6 +26,11 @@ pub enum DataKey {
     Leaderboard,
 }
 
+/// Maximum number of entries retained in the on-chain leaderboard. Keeping the
+/// list bounded stops it growing without limit, which would otherwise run into
+/// Soroban's per-entry size limits and make every read O(n) (#1347).
+pub const MAX_LEADERBOARD_SIZE: u32 = 50;
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -116,14 +121,18 @@ impl StreakRewardsContract {
 
         let amount_i128 = (reward_amount as i128) * 10_000_000;
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::MntToken).unwrap();
-        let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(&env.current_contract_address(), &learner, &amount_i128);
-
+        // Checks-effects-interactions: flip and persist the claimed flag
+        // *before* the external token transfer. An adversarial token contract
+        // could otherwise re-enter `claim_streak_reward` between the transfer
+        // and this state update and claim the same week's reward again (#1346).
         record.claimed_this_week = true;
         env.storage()
             .persistent()
             .set(&DataKey::UserStreak(learner.clone()), &record);
+
+        let token_addr: Address = env.storage().instance().get(&DataKey::MntToken).unwrap();
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &learner, &amount_i128);
 
         env.events().publish(
             (symbol_short!("reward"), symbol_short!("claimed"), learner),
@@ -165,12 +174,14 @@ impl StreakRewardsContract {
         }
 
         if !found {
-            if leaderboard.len() < 10 {
+            if leaderboard.len() < MAX_LEADERBOARD_SIZE {
                 leaderboard.push_back((learner.clone(), streak));
             } else {
-                let (_, min_streak) = leaderboard.get(9).unwrap();
+                // The list is kept sorted descending, so the last entry is the
+                // weakest. Only displace it if the new streak beats it.
+                let (_, min_streak) = leaderboard.get(MAX_LEADERBOARD_SIZE - 1).unwrap();
                 if streak > min_streak {
-                    leaderboard.set(9, (learner.clone(), streak));
+                    leaderboard.set(MAX_LEADERBOARD_SIZE - 1, (learner.clone(), streak));
                 } else {
                     return;
                 }
@@ -212,6 +223,37 @@ mod test {
     impl MockToken {
         pub fn transfer(_e: Env, from: Address, _to: Address, _amount: i128) {
             from.require_auth();
+        }
+    }
+
+    /// Adversarial token: on every `transfer` it tries to re-enter
+    /// `claim_streak_reward` for the recipient, then records how many transfer
+    /// calls it actually served.
+    #[contract]
+    pub struct ReentrantToken;
+    #[contractimpl]
+    impl ReentrantToken {
+        pub fn transfer(e: Env, from: Address, to: Address, _amount: i128) {
+            from.require_auth();
+
+            // `from` is the rewards contract and `to` is the learner, so the
+            // token can attempt to double-claim from inside the transfer.
+            let rewards = StreakRewardsContractClient::new(&e, &from);
+            let _ = rewards.try_claim_streak_reward(&to);
+
+            let count: u32 = e
+                .storage()
+                .instance()
+                .get(&symbol_short!("COUNT"))
+                .unwrap_or(0);
+            e.storage().instance().set(&symbol_short!("COUNT"), &(count + 1));
+        }
+
+        pub fn transfer_count(e: Env) -> u32 {
+            e.storage()
+                .instance()
+                .get(&symbol_short!("COUNT"))
+                .unwrap_or(0)
         }
     }
 
@@ -275,5 +317,81 @@ mod test {
         env.mock_all_auths();
         client.claim_streak_reward(&learner);
         client.claim_streak_reward(&learner);
+    }
+
+    /// A token that re-enters `claim_streak_reward` from inside `transfer`
+    /// must not be able to claim the same week's reward twice. Because the
+    /// claimed flag is persisted before the transfer, the re-entrant attempt
+    /// is rejected and exactly one reward is ever paid.
+    #[test]
+    fn test_reentrant_token_cannot_double_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let learner = Address::generate(&env);
+
+        let token_addr = env.register_contract(None, ReentrantToken);
+        let token_client = ReentrantTokenClient::new(&env, &token_addr);
+
+        let contract_id = env.register_contract(None, StreakRewardsContract);
+        let client = StreakRewardsContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &token_addr);
+
+        client.record_session(&learner, &1);
+
+        // First claim: the re-entrant attempt made during the transfer is
+        // blocked, so only the single legitimate transfer goes through.
+        client.claim_streak_reward(&learner);
+        assert_eq!(token_client.transfer_count(), 1);
+        assert!(client.get_streak(&learner).claimed_this_week);
+
+        // Second claim in the same week: rejected and pays nothing (zero).
+        let second = client.try_claim_streak_reward(&learner);
+        assert!(second.is_err());
+        assert_eq!(token_client.transfer_count(), 1);
+    }
+
+    /// The leaderboard must never grow past `MAX_LEADERBOARD_SIZE`, however
+    /// many learners record a session.
+    #[test]
+    fn test_leaderboard_never_exceeds_cap() {
+        let env = Env::default();
+        let (_, _, _, client) = setup_test(&env);
+
+        for _i in 0..(MAX_LEADERBOARD_SIZE + 30) {
+            let u = Address::generate(&env);
+            client.record_session(&u, &1);
+            assert!(client.get_leaderboard().len() <= MAX_LEADERBOARD_SIZE);
+        }
+
+        assert_eq!(client.get_leaderboard().len(), MAX_LEADERBOARD_SIZE);
+    }
+
+    /// When the board is full, a learner with a higher streak evicts the
+    /// weakest (lowest-streak) entry rather than growing the list.
+    #[test]
+    fn test_leaderboard_evicts_lowest_when_full() {
+        let env = Env::default();
+        let (_, _, _, client) = setup_test(&env);
+
+        // Fill the board to the cap with streak-1 learners.
+        for _i in 0..MAX_LEADERBOARD_SIZE {
+            let u = Address::generate(&env);
+            client.record_session(&u, &1);
+        }
+        assert_eq!(client.get_leaderboard().len(), MAX_LEADERBOARD_SIZE);
+
+        // A stronger learner (streak 5) displaces the weakest entry.
+        let champion = Address::generate(&env);
+        for week in 1u32..=5u32 {
+            client.record_session(&champion, &week);
+        }
+
+        let lb = client.get_leaderboard();
+        assert_eq!(lb.len(), MAX_LEADERBOARD_SIZE);
+        let (top_addr, top_streak) = lb.get(0).unwrap();
+        assert_eq!(top_addr, champion);
+        assert_eq!(top_streak, 5);
     }
 }
