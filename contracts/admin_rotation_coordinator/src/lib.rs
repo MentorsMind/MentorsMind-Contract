@@ -90,16 +90,16 @@ mod tests {
 
         // Set up coordinator
         let coordinator_admin = Address::generate(&env);
-        let coordinator = env.register_contract(None, AdminRotationCoordinator);
+        let coordinator = env.register(AdminRotationCoordinator);
 
         // Initialize coordinator
         let mut client = AdminRotationCoordinatorClient::new(&env, &coordinator);
         client.initialize(&coordinator_admin);
 
         // Create 3 test contracts
-        let contract1 = env.register_contract_wasm(None, b"contract1");
-        let contract2 = env.register_contract_wasm(None, b"contract2");
-        let contract3 = env.register_contract_wasm(None, b"contract3");
+        let contract1 = env.register_contract_wasm(None, *b"contract1");
+        let contract2 = env.register_contract_wasm(None, *b"contract2");
+        let contract3 = env.register_contract_wasm(None, *b"contract3");
 
         // Register contracts
         client.register_contract(&coordinator_admin, &contract1);
