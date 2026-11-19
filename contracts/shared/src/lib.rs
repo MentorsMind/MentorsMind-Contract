@@ -8,6 +8,7 @@ use soroban_sdk::contracterror;
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod account_security;
+pub mod network_authentication;
 pub mod admin;
 pub mod cross_contract_auth;
 pub use cross_contract_auth::CrossContractAuth;
@@ -726,10 +727,16 @@ pub use algorithm_transparency::{
     REVERSE_ENGINEERING_RISK_THRESHOLD,
 };
 pub use account_security::{
-    compute_correlation_score, is_account_locked, is_identity_match, record_failed_attempt,
-    record_successful_login, AccountSecurityRecord, CrossPlatformIdentity, FraudAlert, FraudType,
-    BEHAVIORAL_WINDOW_SECS, CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS, LOCKOUT_DURATION_SECS,
-    MAX_DEVICE_SIGNATURES, MAX_FAILED_ATTEMPTS,
+    appeal_lockout, clamp_lockout_duration, compute_correlation_score, compute_lockout_duration,
+    is_account_locked, is_identity_match, lockout_started_at, record_failed_attempt,
+    record_successful_login, AccountSecurityRecord, AppealError, CrossPlatformIdentity,
+    FraudAlert, FraudType, BEHAVIORAL_WINDOW_SECS, CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS,
+    LOCKOUT_DURATION_SECS, MAX_DEVICE_SIGNATURES, MAX_FAILED_ATTEMPTS, MAX_LOCKOUT_SECS,
+};
+pub use network_authentication::{
+    get_peer_token, is_token_expired, issue_peer_token, peer_token_needs_rotation,
+    rotate_peer_token, token_expires_at, validate_peer_token, NetworkAuthError, NetworkAuthKey,
+    PeerAuthToken, TOKEN_ROTATION_INTERVAL_SECS,
 };
 pub use exit_facilitation::{
     evaluate_competition_protection, facilitate_migration, validate_dependency_necessity,
