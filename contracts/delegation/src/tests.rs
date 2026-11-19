@@ -375,3 +375,42 @@ fn test_views_require_initialization() {
 
     assert!(contract.try_get_voting_weight(&PROPOSAL, &voter).is_err());
 }
+
+#[test]
+fn test_delegators_pagination_returns_correct_slice() {
+    let f = Fixture::setup();
+    let contract = f.contract();
+
+    let delegate = f.voter(10);
+    let d1 = f.voter(10);
+    let d2 = f.voter(10);
+    let d3 = f.voter(10);
+    let d4 = f.voter(10);
+    let d5 = f.voter(10);
+
+    contract.delegate(&d1, &delegate);
+    contract.delegate(&d2, &delegate);
+    contract.delegate(&d3, &delegate);
+    contract.delegate(&d4, &delegate);
+    contract.delegate(&d5, &delegate);
+
+    assert_eq!(contract.get_delegator_count(&delegate), 5);
+
+    // Page 1: offset 0, limit 2 -> [d1, d2]
+    let page1 = contract.get_delegators_page(&delegate, &0, &2);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1.get(0).unwrap(), d1);
+    assert_eq!(page1.get(1).unwrap(), d2);
+
+    // Page 2: offset 2, limit 2 -> [d3, d4]
+    let page2 = contract.get_delegators_page(&delegate, &2, &2);
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2.get(0).unwrap(), d3);
+    assert_eq!(page2.get(1).unwrap(), d4);
+
+    // Page 3: offset 4, limit 2 -> [d5]
+    let page3 = contract.get_delegators_page(&delegate, &4, &2);
+    assert_eq!(page3.len(), 1);
+    assert_eq!(page3.get(0).unwrap(), d5);
+}
+

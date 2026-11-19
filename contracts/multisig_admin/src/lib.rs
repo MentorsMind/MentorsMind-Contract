@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
     compute_checksum, compute_justice_intervention, protect_arbitration_fairness,
@@ -14,11 +13,52 @@ use shared::{
     KeyRecord, KeyRotationProposal, KeyScheme,
     // #867 — Transaction intent / high-risk operation protection
     evaluate_transaction_intent, get_protection_state, TransactionIntent,
+    // #1271 — Admin rotation
+    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS,
 };
+use shared::ttl_utils::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
     Env, Symbol, TryIntoVal, Val, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
+
+// ---------------------------------------------------------------------------
+// Contract Events
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalCreatedEvent {
+    pub proposal_id: u32,
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub expiry: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalSignedEvent {
+    pub proposal_id: u32,
+    pub signer: Address,
+    pub approval_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalExecutedEvent {
+    pub proposal_id: u32,
+    pub target: Address,
+    pub function: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalCancelledEvent {
+    pub proposal_id: u32,
+    pub cancelled_by: Address,
+}
 
 
 // ---------------------------------------------------------------------------
@@ -45,6 +85,8 @@ pub enum Error {
     InvalidEmergencySignatures = 13,
     /// Duplicate or unregistered emergency signer in aggregation.
     InvalidEmergencySigner = 14,
+    /// Stored proposal arguments no longer match the checksum captured at proposal time.
+    ProposalArgsTampered = 15,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,8 +125,12 @@ pub enum DataKey {
     Threshold,
     SignerCount,
     ProposalCount,
+    /// Proposals created but not yet executed or cancelled.
+    ActiveProposalCount,
     Signer(Address),
     Proposal(u32),
+    /// SHA-256 checksum of the proposal argument XDR captured at proposal time.
+    ProposalArgsChecksum(u32),
     Approval(u32, Address),
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
@@ -115,6 +161,11 @@ pub enum DataKey {
     // -----------------------------------------------------------------------
     /// Key management namespace root for this multisig instance.
     KeyManagementRoot,
+    // -----------------------------------------------------------------------
+    // #1271 — Admin rotation keys
+    // -----------------------------------------------------------------------
+    /// Pending admin transfer with cooling-off period enforcement.
+    PendingAdminTransfer,
 }
 
 /// Record of a multisig-signer-reviewed dispute oversight audit.
@@ -181,6 +232,7 @@ impl MultisigAdminContract {
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::SignerCount, &(signers.len() as u32));
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        env.storage().instance().set(&DataKey::ActiveProposalCount, &0u32);
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("init")),
             (signers.len() as u32, threshold),
@@ -204,15 +256,25 @@ impl MultisigAdminContract {
             return Err(Error::NotSigner);
         }
         proposer.require_auth();
+        let args_checksum = compute_checksum(&env, &args.clone().to_xdr(&env));
         let count: u32 = env.storage().instance().get(&DataKey::ProposalCount).unwrap_or(0);
         let new_id = count.checked_add(1).expect("proposal count overflow");
         env.storage().instance().set(&DataKey::ProposalCount, &new_id);
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0);
+        let new_active_count = active_count.checked_add(1).expect("active proposal count overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveProposalCount, &new_active_count);
         let expiry = env.ledger().timestamp().checked_add(EXPIRY_SECONDS).expect("expiry overflow");
         let proposal = ProposalRecord {
             id: new_id,
             proposer: proposer.clone(),
-            target,
-            function,
+            target: target.clone(),
+            function: function.clone(),
             args,
             approval_count: 1,
             expiry,
@@ -220,10 +282,34 @@ impl MultisigAdminContract {
             cancelled: false,
         };
         env.storage().persistent().set(&DataKey::Proposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(new_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalArgsChecksum(new_id), &args_checksum);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProposalArgsChecksum(new_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage().persistent().set(&DataKey::Approval(new_id, proposer.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(new_id, proposer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("proposed"), new_id),
-            (proposer, expiry),
+            ProposalCreatedEvent {
+                proposal_id: new_id,
+                proposer,
+                target,
+                function,
+                expiry,
+            },
         );
         Ok(new_id)
     }
@@ -253,11 +339,25 @@ impl MultisigAdminContract {
         }
         signer.require_auth();
         env.storage().persistent().set(&DataKey::Approval(action_id, signer.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(action_id, signer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         proposal.approval_count = proposal.approval_count.checked_add(1).expect("approval count overflow");
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(action_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("signed"), action_id),
-            (signer, proposal.approval_count),
+            ProposalSignedEvent {
+                proposal_id: action_id,
+                signer,
+                approval_count: proposal.approval_count,
+            },
         );
         Ok(())
     }
@@ -282,10 +382,24 @@ impl MultisigAdminContract {
         if env.ledger().timestamp() > proposal.expiry { return Err(Error::Expired); }
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
         if proposal.approval_count < threshold { return Err(Error::BelowThreshold); }
+        let stored_checksum: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalArgsChecksum(action_id))
+            .ok_or(Error::ProposalArgsTampered)?;
+        let computed_checksum = compute_checksum(&env, &proposal.args.clone().to_xdr(&env));
+        if computed_checksum != stored_checksum {
+            return Err(Error::ProposalArgsTampered);
+        }
 
         // Mark executed before dispatch (prevents re-entrancy)
         proposal.executed = true;
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(action_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let event_target   = proposal.target.clone();
         let event_function = proposal.function.clone();
@@ -319,9 +433,22 @@ impl MultisigAdminContract {
             env.invoke_contract::<()>(&proposal.target, &proposal.function, proposal.args.clone());
         }
 
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveProposalCount, &active_count.saturating_sub(1));
+
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("executed"), action_id),
-            (action_id, event_target, event_function),
+            ProposalExecutedEvent {
+                proposal_id: action_id,
+                target: event_target,
+                function: event_function,
+            },
         );
         Ok(())
     }
@@ -351,9 +478,20 @@ impl MultisigAdminContract {
         caller.require_auth();
         proposal.cancelled = true;
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveProposalCount, &active_count.saturating_sub(1));
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("cancelled"), action_id),
-            caller,
+            ProposalCancelledEvent {
+                proposal_id: action_id,
+                cancelled_by: caller,
+            },
         );
         Ok(())
     }
@@ -388,6 +526,14 @@ impl MultisigAdminContract {
         env.storage().instance()
             .get(&DataKey::SignerCount)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Returns proposals not yet executed or cancelled; elapsed expiry is not reconciled.
+    pub fn get_active_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1265,6 +1411,96 @@ fn apply_update_threshold(env: &Env, new_threshold: u32) -> Result<(), Error> {
 }
 
 // ---------------------------------------------------------------------------
+// #1271 — Admin rotation (two-step with timelock)
+// ---------------------------------------------------------------------------
+
+/// Propose an admin key rotation with MIN_ADMIN_TIMELOCK_SECS cooling period.
+pub fn propose_admin_change(env: &Env, current_admin: Address, new_admin: Address) -> Result<AdminTransfer, Error> {
+    current_admin.require_auth();
+
+    if env.storage().persistent().has(&DataKey::PendingAdminTransfer) {
+        return Err(Error::AlreadyInitialized); // Transfer already pending
+    }
+
+    let proposed_at = env.ledger().timestamp();
+    let effective_at = proposed_at + MIN_ADMIN_TIMELOCK_SECS;
+
+    let transfer = AdminTransfer {
+        new_admin: new_admin.clone(),
+        effective_at,
+        status: AdminChangeProposal::Proposed,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingAdminTransfer, &transfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("adm_prop")),
+        (current_admin, new_admin),
+    );
+
+    Ok(transfer)
+}
+
+/// Accept a pending admin transfer after the timelock has expired.
+pub fn accept_admin_change(env: &Env, new_admin: Address) -> Result<(), Error> {
+    new_admin.require_auth();
+
+    let transfer: AdminTransfer = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PendingAdminTransfer)
+        .ok_or(Error::ProposalNotFound)?;
+
+    let now = env.ledger().timestamp();
+    if now < transfer.effective_at {
+        return Err(Error::Expired); // Timelock not yet expired
+    }
+
+    if transfer.new_admin != new_admin {
+        return Err(Error::NotAdmin); // Only the new admin can accept
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("adm_acc")),
+        (transfer.new_admin,),
+    );
+
+    Ok(())
+}
+
+/// Cancel a pending admin transfer (current admin only).
+pub fn cancel_admin_change(env: &Env, current_admin: Address) -> Result<(), Error> {
+    current_admin.require_auth();
+
+    let transfer: AdminTransfer = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PendingAdminTransfer)
+        .ok_or(Error::ProposalNotFound)?;
+
+    if transfer.status != AdminChangeProposal::Proposed {
+        return Err(Error::ProposalNotFound);
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("adm_canc")),
+        (current_admin, transfer.new_admin),
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1375,6 +1611,7 @@ mod test {
         assert_eq!(pid1, 1u32);
         let pid2 = f.propose(&target, "do_thing");
         assert_eq!(pid2, 2u32);
+        assert_eq!(f.client().get_active_proposal_count(), 2u32);
 
         let proposal = f.client().get_proposal(&pid1);
         assert_eq!(proposal.approval_count, 1u32);
@@ -1382,6 +1619,26 @@ mod test {
         assert_eq!(proposal.executed, false);
         assert_eq!(proposal.cancelled, false);
         assert_eq!(proposal.expiry, EXPIRY_SECONDS);
+    }
+
+    #[test]
+    fn test_active_proposal_count_tracks_mixed_outcomes() {
+        let f = Fixture::setup();
+        assert_eq!(f.client().get_active_proposal_count(), 0u32);
+
+        let executed = f.threshold_proposal(2);
+        let cancelled = f.propose(&Address::generate(&f.env), "do_thing");
+        let remaining = f.propose(&Address::generate(&f.env), "do_thing");
+        assert_eq!(f.client().get_active_proposal_count(), 3u32);
+
+        f.sign_n(executed, 3);
+        f.client().execute_action(&executed);
+        assert_eq!(f.client().get_active_proposal_count(), 2u32);
+
+        f.client().cancel_action(&f.signers[1], &cancelled);
+        assert_eq!(f.client().get_active_proposal_count(), 1u32);
+        assert!(!f.client().get_proposal(&remaining).executed);
+        assert!(!f.client().get_proposal(&remaining).cancelled);
     }
 
     #[test]
@@ -1412,6 +1669,40 @@ mod test {
 
         f.client().sign_action(&f.signers[1], &pid);
         assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::BelowThreshold)));
+    }
+
+    #[test]
+    fn test_execute_rejects_tampered_proposal_args() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let pid = f.propose(&target, "do_thing");
+        f.sign_n(pid, 3);
+
+        f.env.as_contract(&f.contract, || {
+            let mut proposal: ProposalRecord = f
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(pid))
+                .unwrap();
+            proposal.args = vec![&f.env, 7u32.into_val(&f.env)];
+            f.env.storage().persistent().set(&DataKey::Proposal(pid), &proposal);
+        });
+
+        assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::ProposalArgsTampered)));
+    }
+
+    #[test]
+    fn test_proposal_survives_default_ttl() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let pid = f.propose(&target, "do_thing");
+
+        f.env.ledger().with_mut(|li| li.sequence_number += 300_000);
+
+        assert_eq!(f.client().get_proposal(&pid).approval_count, 1u32);
+        f.client().sign_action(&f.signers[1], &pid);
+        assert_eq!(f.client().get_proposal(&pid).approval_count, 2u32);
     }
 
     #[test]
@@ -1508,5 +1799,53 @@ mod test {
         f.client().sign_action(&f.signers[2], &pid);
         let result = f.client().try_execute_action(&pid);
         assert_ne!(result, Err(Ok(Error::BelowThreshold)));
+    }
+
+    // ======================================================================
+    // Contract Event Tests
+    // ======================================================================
+
+    #[test]
+    fn test_proposal_created_event_emitted() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        f.env.mock_all_auths();
+        f.client().propose_action(
+            &f.signers[0],
+            &target,
+            &Symbol::new(&f.env, "test"),
+            &Vec::new(&f.env),
+        ).unwrap();
+        // Verify at least one event was emitted after the propose call
+        assert!(!f.env.events().all().is_empty(), "ProposalCreatedEvent not found");
+    }
+
+    #[test]
+    fn test_proposal_signed_event_emitted() {
+        let f = Fixture::setup();
+        let id = f.propose("test", &Address::generate(&f.env));
+        f.env.mock_all_auths();
+        f.client().sign_action(&f.signers[1], &id).unwrap();
+        assert!(!f.env.events().all().is_empty(), "ProposalSignedEvent not found");
+    }
+
+    #[test]
+    fn test_proposal_executed_event_emitted() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let proposal_id = f.propose("proposal", &target);
+        f.sign_n(proposal_id, 2);
+        f.env.mock_all_auths();
+        f.client().execute_action(&proposal_id).unwrap();
+        assert!(!f.env.events().all().is_empty(), "ProposalExecutedEvent not found");
+    }
+
+    #[test]
+    fn test_proposal_cancelled_event_emitted() {
+        let f = Fixture::setup();
+        let proposal_id = f.propose("test", &Address::generate(&f.env));
+        f.env.mock_all_auths();
+        f.client().cancel_action(&f.admin, &proposal_id).unwrap();
+        assert!(!f.env.events().all().is_empty(), "ProposalCancelledEvent not found");
     }
 }

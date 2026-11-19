@@ -114,8 +114,11 @@ impl Fixture {
             &mnt,
             &snapshot,
             &delegation,
-            &Some(60u64),
-            &Some(1_000u32),
+            &Some(60u64),   // voting_period_secs
+            &Some(500u32),  // quorum_bps
+            &None,          // proposal_deposit
+            &None,          // min_proposer_balance
+            &Some(10u32),   // max_active_proposals
         );
 
         Fixture { env, gov_id: gov, admin, proposer, voter, snapshot }

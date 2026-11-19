@@ -3,7 +3,7 @@
 //! Protects against attackers replaying recorded session data to fake session completion,
 //! manipulating session content, or bypassing verification systems.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, BytesN, Symbol};
 
 /// Maximum allowable time drift (seconds) for real-time session verification
 pub const MAX_SESSION_TIME_DRIFT_SECS: u64 = 300; // 5 minutes

@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)]
 #![allow(dead_code, unused_assignments)]
 
 //! # Escrow Contract
@@ -81,7 +80,6 @@ use shared::{
     ReleaseFailure, FailureClassification, RecoveryState,
     calculate_next_retry,
     MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD, StateTransitionContext,
-    CrossContractStateCheck,
     InvalidStateRecord,
     is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS, EmergencyAction, EmergencyAdminRole,
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
@@ -103,13 +101,19 @@ use shared::{
     EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval,
     EmergencyFundLock, PaymentAuditEntry,
 };
+use shared::session_uniqueness::{
+    validate_session_nonce, detect_temporal_replay, MAX_SESSION_TIME_DRIFT_SECS,
+};
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
     SessionAuthFailed = 1,
+    DuplicateEntry = 2,
 }
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -349,10 +353,14 @@ pub struct FeeAppliedEventData {
 }
 
 /// Event data emitted when the graduated fee schedule is updated.
+///
+/// `has_previous` distinguishes the first configuration (no prior schedule, in
+/// which case `old_schedule` mirrors `new_schedule`) from later updates.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeScheduleUpdatedEventData {
-    pub old_schedule: Option<FeeSchedule>,
+    pub has_previous: bool,
+    pub old_schedule: FeeSchedule,
     pub new_schedule: FeeSchedule,
 }
 
@@ -368,6 +376,15 @@ pub trait StakingTierTrait {
 pub trait MultisigAdminTrait {
     fn get_proposal(env: Env, action_id: u32) -> ProposalRecordMirror;
     fn get_threshold(env: Env) -> u32;
+}
+
+/// Cross-contract client for the Insurance contract used for coverage verification.
+#[soroban_sdk::contractclient(name = "InsuranceClient")]
+pub trait InsuranceContractTrait {
+    fn deposit(env: Env, provider: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+    fn claim(env: Env, escrow_id: Symbol, learner: Address, amount: i128) -> Result<(), soroban_sdk::Error>;
+    fn get_coverage_ratio(env: Env) -> u32;
+    fn get_pool_balance(env: Env) -> i128;
 }
 
 /// Local mirror of `multisig_admin::ProposalRecord` used for cross-contract
@@ -428,6 +445,9 @@ pub enum DataKey {
     InvalidStateRecord(u64),
     /// ATOMIC STATE TRANSITIONS: Cross-contract state verification
     CrossContractStateCheck(u64),
+    /// Session nonce tracking for replay protection (#1121).
+    UsedSessionNonce(BytesN<32>),
+
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
@@ -934,7 +954,7 @@ impl EscrowContract {
                 let multiplier = Self::_price_multiplier_bps(price);
                 schedule
                     .tier0_bps
-                    .safe_mul(&env, multiplier as i128)
+                    .safe_mul(&env, multiplier)
                     .safe_div(&env, 10_000) as u32
             }
             None => Self::_legacy_fee_from_price(price),
@@ -1142,6 +1162,8 @@ impl EscrowContract {
         Self::_validate_fee_schedule(&schedule);
 
         let old_schedule = env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule);
+        let has_previous = old_schedule.is_some();
+        let old_schedule = old_schedule.unwrap_or_else(|| schedule.clone());
 
         env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
         env.storage()
@@ -1151,6 +1173,7 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
             FeeScheduleUpdatedEventData {
+                has_previous,
                 old_schedule,
                 new_schedule: schedule,
             },
@@ -1223,7 +1246,8 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
             FeeScheduleUpdatedEventData {
-                old_schedule: Some(old_schedule),
+                has_previous: true,
+                old_schedule,
                 new_schedule: schedule,
             },
         );
@@ -1428,8 +1452,8 @@ impl EscrowContract {
 
             let multiplier = Self::_price_multiplier_bps(price);
             let scaled = tier_base
-                .safe_mul(env, multiplier as i128)
-                .safe_div(env, 10_000) as u32;
+                .safe_mul(env, multiplier)
+                .safe_div(env, 10_000);
             scaled.min(MAX_FEE_BPS)
         } else {
             tier_base
@@ -2180,19 +2204,11 @@ impl EscrowContract {
             .persistent()
             .get::<_, Address>(&DataKey::InsuranceContract)
         {
-            let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
-                &insurance,
-                &Symbol::new(env, "verify_coverage_on_release"),
-                (
-                    escrow.id,
-                    escrow.mentor.clone(),
-                    escrow.amount,
-                )
-                    .into_val(env),
-            );
+            let result = InsuranceClient::new(env, &insurance)
+                .try_get_coverage_ratio();
             let ok = match result {
-                Ok(inner_result) => inner_result.is_ok(),
-                Err(_) => false,
+                Ok(Ok(ratio)) => ratio > 0, // Coverage is available if ratio > 0
+                _ => false,
             };
             if !ok {
                 return false;
@@ -3763,7 +3779,7 @@ impl EscrowContract {
         let mut result = Vec::new(&env);
 
         let count_u32 = count.min(u32::MAX as u64) as u32;
-        let (start, end) = Pagination::new(offset, limit).bounds(count_u32);
+        let (start, end) = Pagination::bounds(count_u32, offset, limit);
 
         // Escrow ids are 1-indexed; `start`/`end` are 0-indexed offsets
         // into the id space [1, count].
@@ -4468,12 +4484,30 @@ impl EscrowContract {
             panic!("Insufficient token balance");
         }
 
-        // --- Session uniqueness ---
+        // --- Session uniqueness & replay protection (#1121) ---
+        let session_bytes: BytesN<32> = env.crypto().sha256(&session_id.clone().to_xdr(&env)).into();
+        let nonce_key = DataKey::UsedSessionNonce(session_bytes);
+        let is_used = env.storage().persistent().has(&nonce_key);
+        if !validate_session_nonce(1, 1, is_used) {
+            panic_with_error!(&env, Error::DuplicateEntry);
+        }
+
+        let now = env.ledger().timestamp();
+        if session_end_time > 0 && now > session_end_time {
+            let replay_res = detect_temporal_replay(session_end_time, now, MAX_SESSION_TIME_DRIFT_SECS);
+            if replay_res.is_replay && (now - session_end_time) > MAX_SESSION_TIME_DRIFT_SECS {
+                panic!("Session timestamp too old");
+            }
+        }
+
+        env.storage().persistent().set(&nonce_key, &true);
+
         let session_key = (SESSION_KEY, session_id.clone());
         if env.storage().persistent().has(&session_key) {
             panic!("Session already exists");
         }
         env.storage().persistent().set(&session_key, &true);
+
 
         // --- Auto-release delay ---
         let auto_release_delay: u64 = env
@@ -5834,7 +5868,7 @@ impl EscrowContract {
     /// Attempt automatic recovery for invalid states
     fn attempt_invalid_state_recovery(env: &Env, escrow_id: u64) -> Result<bool, &'static str> {
         let key = (symbol_short!("ESCROW"), escrow_id);
-        let mut escrow: Escrow = env.storage().persistent()
+        let escrow: Escrow = env.storage().persistent()
             .get(&key)
             .ok_or("Escrow not found")?;
         

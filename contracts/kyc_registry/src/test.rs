@@ -564,3 +564,62 @@ fn test_get_kyc_record_authorized_returns_expected_data() {
     assert_eq!(record.kyc_provider_hash, provider_hash);
 }
 
+#[test]
+fn test_get_expiring_kyc_returns_near_expiry_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Create test users with different expiry times
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let user3 = Address::generate(&env);
+    let user4 = Address::generate(&env);
+    
+    let provider_hash = BytesN::from_array(&env, &[0; 32]);
+    let current_time = 1000u64;
+    env.ledger().set_timestamp(current_time);
+
+    // Set up KYC records with different expiry times
+    client.set_kyc_level(&admin, &user1, &KycLevel::Basic, &900, &provider_hash); // Expired (900 < 1000)
+    client.set_kyc_level(&admin, &user2, &KycLevel::Enhanced, &1500, &provider_hash); // Expires soon (1500 <= 1600)
+    client.set_kyc_level(&admin, &user3, &KycLevel::Institutional, &2000, &provider_hash); // Not expiring soon (2000 > 1600)
+    client.set_kyc_level(&admin, &user4, &KycLevel::Basic, &1600, &provider_hash); // Expires exactly at threshold (1600 <= 1600)
+
+    // Test: Get KYC records expiring before timestamp 1600
+    let before_timestamp = 1600u64;
+    let expiring_users = client.get_expiring_kyc(&before_timestamp, &0, &10);
+
+    // Should return user1 (900), user2 (1500), and user4 (1600)
+    assert_eq!(expiring_users.len(), 3);
+    
+    // Verify all returned users have expiry <= before_timestamp
+    for user_addr in expiring_users.iter() {
+        let expiry = client.get_kyc_expiry(user_addr);
+        assert!(expiry.is_some());
+        assert!(expiry.unwrap() <= before_timestamp);
+    }
+
+    // Verify specific users are included/excluded
+    assert!(expiring_users.contains(&user1)); // 900 <= 1600
+    assert!(expiring_users.contains(&user2)); // 1500 <= 1600
+    assert!(expiring_users.contains(&user4)); // 1600 <= 1600
+    assert!(!expiring_users.contains(&user3)); // 2000 > 1600
+
+    // Test pagination: get only first 2 results
+    let paginated_results = client.get_expiring_kyc(&before_timestamp, &0, &2);
+    assert_eq!(paginated_results.len(), 2);
+
+    // Test with offset
+    let offset_results = client.get_expiring_kyc(&before_timestamp, &1, &2);
+    assert_eq!(offset_results.len(), 2);
+    
+    // Test edge case: no expiring KYC records
+    let no_expiring = client.get_expiring_kyc(&500, &0, &10);
+    assert_eq!(no_expiring.len(), 0);
+}
+

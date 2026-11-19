@@ -1019,6 +1019,21 @@ fn test_emergency_rollback_ready_after_full_authorization() {
     assert_eq!(preserved_audits, 0);
 }
 
+#[test]
+#[should_panic]
+fn test_create_escrow_duplicate_session_id_rejected() {
+    let f = TestFixture::setup_with_fee(0);
+    let session_time = f.env.ledger().timestamp() + 3600;
+    let session_id = "REPLAY_SESS_1";
+
+    // First escrow creation with session_id succeeds
+    f.create_escrow_at(1_000, session_time, session_id);
+
+    // Second escrow creation with same session_id must fail (Error::DuplicateEntry)
+    f.create_escrow_at(1_000, session_time, session_id);
+}
+
+
 // =======================================================================
 // Test Mock Contracts
 // =======================================================================

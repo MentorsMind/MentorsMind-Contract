@@ -1,8 +1,10 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, Address,
+    BytesN, Env, Symbol,
 };
+use shared::safe_math::SafeMath;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -25,6 +27,22 @@ pub enum Error {
     ProofRequired = 11,
     InsufficientOracleSignatures = 12,
     OracleAlreadyVoted = 13,
+    Overflow = 14,
+    InvalidOracle = 15,
+}
+
+// ---------------------------------------------------------------------------
+// Cross-contract client for the interface registry
+// ---------------------------------------------------------------------------
+
+/// Minimal client for the `interface_registry` contract.
+///
+/// The registry exposes `verify(address, expected_interface) -> bool` which
+/// returns `true` when `address` is registered as implementing the given
+/// interface identifier.
+#[contractclient(name = "InterfaceRegistryClient")]
+pub trait InterfaceRegistry {
+    fn verify(env: Env, address: Address, expected_interface: Symbol) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +94,8 @@ pub enum DataKey {
     ResolutionOracle(u32), // Stores the oracle address for a market
     ResolutionProof(u32),  // Stores the cryptographic proof for market resolution
     OracleVote(u32, Address), // Tracks oracle votes for multi-oracle consensus (market_id, oracle_address)
+    PauseGuardian,
+    InterfaceRegistry, // Address of the interface_registry contract used to validate oracles
 }
 
 // ---------------------------------------------------------------------------
@@ -94,17 +114,22 @@ const DEFAULT_LIQUIDITY_PARAMETER: i128 = 100_000_000_000_000_000; // 0.1 * SCAL
 /// x is in fixed-point format (scaled by 10^18).
 /// Accurate to ~0.01% for x in [-5, 5].
 /// Returns result in fixed-point format.
-fn exp_fixed_point(x: i128) -> i128 {
+/// All arithmetic uses checked operations; returns `Error::Overflow` on overflow.
+fn exp_fixed_point(env: &Env, x: i128) -> Result<i128, Error> {
     if x == 0 {
-        return FIXED_POINT_SCALE;
+        return Ok(FIXED_POINT_SCALE);
     }
 
     // Avoid overflow for very large x
-    if x > 5 * FIXED_POINT_SCALE {
-        return i128::MAX / 2; // Saturate instead of overflow
+    let upper_bound = match 5i128.checked_mul(FIXED_POINT_SCALE) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    if x > upper_bound {
+        return Ok(i128::MAX / 2); // Saturate instead of overflow
     }
-    if x < -5 * FIXED_POINT_SCALE {
-        return 0; // e^(-5+) ~= 0
+    if x < -upper_bound {
+        return Ok(0); // e^(-5+) ~= 0
     }
 
     let mut result = FIXED_POINT_SCALE; // 1.0
@@ -114,22 +139,29 @@ fn exp_fixed_point(x: i128) -> i128 {
     // Taylor series: e^x = 1 + x + x^2/2! + x^3/3! + ... (10 terms)
     for n in 1..=10 {
         // term = x^n / n!
-        term = (x_power / (n as i128)) / FIXED_POINT_SCALE;
+        term = x_power.safe_div(env, n as i128).safe_div(env, FIXED_POINT_SCALE);
         if term == 0 {
             break;
         }
-        result = result + term;
+        result = match result.checked_add(term) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
 
         // Prepare next term: x_power = x^(n+1)
-        x_power = x_power * x / FIXED_POINT_SCALE;
+        let mul = match x_power.checked_mul(x) {
+            Some(v) => v,
+            None => return Err(Error::Overflow),
+        };
+        x_power = mul.safe_div(env, FIXED_POINT_SCALE);
     }
 
-    result
+    Ok(result)
 }
 
 /// Compute ln(x) in fixed-point format using Newton's method.
 /// x is in fixed-point format. Accurate for x > 0.
-fn ln_fixed_point(x: i128) -> i128 {
+fn ln_fixed_point(env: &Env, x: i128) -> i128 {
     if x <= 0 {
         panic!("ln of non-positive number");
     }
@@ -148,9 +180,9 @@ fn ln_fixed_point(x: i128) -> i128 {
             break;
         }
         prev_y = y;
-        let exp_y = exp_fixed_point(y);
-        let delta = (x - exp_y) / exp_y;
-        y = y + delta;
+        let exp_y = exp_fixed_point(env, y).unwrap_or(i128::MAX / 2);
+        let delta = (x - exp_y).safe_div(env, exp_y);
+        y = y.safe_add(env, delta);
     }
 
     y
@@ -159,36 +191,57 @@ fn ln_fixed_point(x: i128) -> i128 {
 /// LMSR cost function: C(q_yes, q_no) = b * ln(e^(q_yes/b) + e^(q_no/b))
 /// where b is the liquidity parameter.
 /// Returns cost in fixed-point format.
-fn lmsr_cost(q_yes: i128, q_no: i128, b: i128) -> i128 {
-    let q_yes_scaled = q_yes * FIXED_POINT_SCALE / b;
-    let q_no_scaled = q_no * FIXED_POINT_SCALE / b;
+/// All arithmetic uses checked operations; returns `Error::Overflow` on overflow.
+fn lmsr_cost(env: &Env, q_yes: i128, q_no: i128, b: i128) -> Result<i128, Error> {
+    if b <= 0 {
+        return Err(Error::InvalidAmount);
+    }
 
-    let exp_yes = exp_fixed_point(q_yes_scaled);
-    let exp_no = exp_fixed_point(q_no_scaled);
-    let sum = exp_yes + exp_no;
+    let q_yes_mul = match q_yes.checked_mul(FIXED_POINT_SCALE) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    let q_yes_scaled = q_yes_mul.safe_div(env, b);
 
-    let ln_sum = ln_fixed_point(sum);
-    b * ln_sum / FIXED_POINT_SCALE
+    let q_no_mul = match q_no.checked_mul(FIXED_POINT_SCALE) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    let q_no_scaled = q_no_mul.safe_div(env, b);
+
+    let exp_yes = exp_fixed_point(env, q_yes_scaled)?;
+    let exp_no = exp_fixed_point(env, q_no_scaled)?;
+    let sum = match exp_yes.checked_add(exp_no) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+
+    let ln_sum = ln_fixed_point(env, sum);
+    let b_mul = match b.checked_mul(ln_sum) {
+        Some(v) => v,
+        None => return Err(Error::Overflow),
+    };
+    Ok(b_mul.safe_div(env, FIXED_POINT_SCALE))
 }
 
 /// Get current price for yes outcome as basis points (0-10000).
 /// price_yes = e^(q_yes/b) / (e^(q_yes/b) + e^(q_no/b))
-fn get_yes_price_bps(q_yes: i128, q_no: i128, b: i128) -> u32 {
-    let q_yes_scaled = q_yes * FIXED_POINT_SCALE / b;
-    let q_no_scaled = q_no * FIXED_POINT_SCALE / b;
+fn get_yes_price_bps(env: &Env, q_yes: i128, q_no: i128, b: i128) -> u32 {
+    let q_yes_scaled = q_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
+    let q_no_scaled = q_no.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, b);
 
-    let exp_yes = exp_fixed_point(q_yes_scaled);
-    let exp_no = exp_fixed_point(q_no_scaled);
-    let sum = exp_yes + exp_no;
+    let exp_yes = exp_fixed_point(env, q_yes_scaled).unwrap_or(i128::MAX / 2);
+    let exp_no = exp_fixed_point(env, q_no_scaled).unwrap_or(i128::MAX / 2);
+    let sum = exp_yes.safe_add(env, exp_no);
 
     let price = if sum == 0 {
         FIXED_POINT_SCALE / 2 // Default to 50/50
     } else {
-        exp_yes * FIXED_POINT_SCALE / sum
+        exp_yes.safe_mul(env, FIXED_POINT_SCALE).safe_div(env, sum)
     };
 
     // Convert to basis points: [0, 10000]
-    let bps = price * 10000 / FIXED_POINT_SCALE;
+    let bps = price.safe_mul(env, 10000).safe_div(env, FIXED_POINT_SCALE);
     (bps as u32).min(10000)
 }
 
@@ -201,19 +254,68 @@ pub struct PredictionMarket;
 
 #[contractimpl]
 impl PredictionMarket {
-    /// Initialize the prediction market contract
-    pub fn initialize(env: Env, admin: Address) {
+    /// Initialize the prediction market contract.
+    ///
+    /// `interface_registry` is the address of the registry contract used to
+    /// validate that a market's `resolution_oracle` is a registered oracle.
+    pub fn initialize(env: Env, admin: Address, interface_registry: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::InterfaceRegistry, &interface_registry);
         env.storage().instance().set(&DataKey::MarketCount, &0u32);
+    }
+
+    /// Admin-only: set or update the pause-guardian contract address.
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PauseGuardian)
+    }
+
+    /// Admin-only: set or update the interface registry address.
+    pub fn set_interface_registry(env: Env, admin: Address, registry: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::InterfaceRegistry, &registry);
+    }
+
+    pub fn get_interface_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::InterfaceRegistry)
     }
 
     /// Create a new prediction market with LMSR AMM.
     /// liquidity_parameter: higher = less slippage, lower efficiency. Default: 0.1
     /// resolution_oracle: Address of the oracle responsible for resolving this market
     /// resolution_requires_multi: If true, requires 2-of-3 oracle consensus
+    ///
+    /// The `resolution_oracle` must be a registered oracle in the configured
+    /// interface registry, otherwise the call fails with `Error::InvalidOracle`.
     pub fn create_market(
         env: Env,
         creator: Address,
@@ -224,13 +326,16 @@ impl PredictionMarket {
         liquidity_parameter: Option<i128>,
         resolution_oracle: Address,
         resolution_requires_multi: bool,
-    ) -> u32 {
+    ) -> Result<u32, Error> {
         creator.require_auth();
 
         let now = env.ledger().timestamp();
         if resolution_date <= now {
             panic!("resolution date must be in future");
         }
+
+        // Validate that the resolution oracle is a registered oracle contract.
+        Self::validate_oracle(&env, &resolution_oracle)?;
 
         let market_count: u32 = env
             .storage()
@@ -270,14 +375,38 @@ impl PredictionMarket {
         env.events()
             .publish((symbol_short!("mkt_crt"),), (market_id, creator, learner));
 
-        market_id
+        Ok(market_id)
+    }
+
+    /// Query the interface registry to confirm `oracle` is a registered oracle.
+    fn validate_oracle(env: &Env, oracle: &Address) -> Result<(), Error> {
+        let registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::InterfaceRegistry)
+            .ok_or(Error::NotInitialized)?;
+
+        let oracle_interface = Symbol::new(env, "oracle_v1");
+        let registry_client = InterfaceRegistryClient::new(env, &registry);
+
+        if registry_client.verify(oracle, &oracle_interface) {
+            Ok(())
+        } else {
+            Err(Error::InvalidOracle)
+        }
     }
 
     /// Place a bet on market outcome using LMSR pricing.
     /// Cost = C(new_state) - C(old_state) where C is LMSR cost function.
-    pub fn place_bet(env: Env, bettor: Address, market_id: u32, outcome: bool, amount: i128) {
+    pub fn place_bet(
+        env: Env,
+        bettor: Address,
+        market_id: u32,
+        outcome: bool,
+        amount: i128,
+    ) -> Result<(), Error> {
         if amount <= 0 {
-            panic!("invalid amount");
+            return Err(Error::InvalidAmount);
         }
 
         bettor.require_auth();
@@ -297,17 +426,30 @@ impl PredictionMarket {
             panic!("market resolution date passed");
         }
 
-        // Calculate cost using LMSR
-        let old_cost = lmsr_cost(market.yes_pool, market.no_pool, market.liquidity_parameter);
-
-        // Update pools for cost calculation
+        // Update pools for cost calculation, checking for overflow
         let (new_yes_pool, new_no_pool) = if outcome {
-            (market.yes_pool + amount, market.no_pool)
+            let next = match market.yes_pool.checked_add(amount) {
+                Some(v) => v,
+                None => return Err(Error::Overflow),
+            };
+            (next, market.no_pool)
         } else {
-            (market.yes_pool, market.no_pool + amount)
+            let next = match market.no_pool.checked_add(amount) {
+                Some(v) => v,
+                None => return Err(Error::Overflow),
+            };
+            (market.yes_pool, next)
         };
 
-        let new_cost = lmsr_cost(new_yes_pool, new_no_pool, market.liquidity_parameter);
+        if new_yes_pool.checked_mul(FIXED_POINT_SCALE).is_none()
+            || new_no_pool.checked_mul(FIXED_POINT_SCALE).is_none()
+        {
+            return Err(Error::Overflow);
+        }
+
+        // Calculate cost using LMSR with SafeMath
+        let old_cost = lmsr_cost(&env, market.yes_pool, market.no_pool, market.liquidity_parameter)?;
+        let new_cost = lmsr_cost(&env, new_yes_pool, new_no_pool, market.liquidity_parameter)?;
 
         // Cost to bettor
         let cost = if new_cost >= old_cost {
@@ -349,11 +491,21 @@ impl PredictionMarket {
             (symbol_short!("bet_pl"),),
             (bettor, market_id, outcome, amount),
         );
+
+        Ok(())
     }
 
     /// Resolve market with outcome and cryptographic proof (oracle only)
     /// outcome_proof: BytesN<32> hash of evidence supporting the resolution
     pub fn resolve_market(env: Env, market_id: u32, outcome: bool, outcome_proof: BytesN<32>) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let mut market: MarketRecord = env
             .storage()
             .instance()
@@ -493,10 +645,10 @@ impl PredictionMarket {
             market.no_pool
         };
 
-        let platform_fee = (losing_pool * PLATFORM_FEE_BPS) / 10_000;
-        let net_winnings = losing_pool - platform_fee;
-        let share = (net_winnings * bet.amount) / winning_pool;
-        let total_payout = bet.amount + share;
+        let platform_fee = losing_pool.safe_mul(&env, PLATFORM_FEE_BPS).safe_div(&env, 10_000);
+        let net_winnings = losing_pool.safe_sub(&env, platform_fee);
+        let share = net_winnings.safe_mul(&env, bet.amount).safe_div(&env, winning_pool);
+        let total_payout = bet.amount.safe_add(&env, share);
 
         // Transfer winnings to bettor
         let token_client = token::Client::new(&env, &market.token);
@@ -581,7 +733,7 @@ impl PredictionMarket {
             .expect("market not found");
 
         let yes_bps =
-            get_yes_price_bps(market.yes_pool, market.no_pool, market.liquidity_parameter);
+            get_yes_price_bps(&env, market.yes_pool, market.no_pool, market.liquidity_parameter);
         let no_bps = 10000u32.saturating_sub(yes_bps);
 
         (yes_bps, no_bps)
@@ -599,12 +751,303 @@ impl PredictionMarket {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pause guardian helper
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "PauseGuardianClient")]
+pub trait PauseGuardian {
+    fn is_paused(env: Env) -> bool;
+}
+
+fn require_not_paused(env: &Env, guardian: &Address) {
+    let client = PauseGuardianClient::new(env, guardian);
+    if client.is_paused() {
+        panic!("contract is paused");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Mock interface registry used by the tests. It stores a whitelist of
+    /// addresses that are considered registered oracles.
+    #[contract]
+    pub struct MockInterfaceRegistry;
+
+    #[contractimpl]
+    impl MockInterfaceRegistry {
+        pub fn set_registered(env: Env, address: Address, registered: bool) {
+            env.storage()
+                .instance()
+                .set(&address, &registered);
+        }
+
+        pub fn verify(env: Env, address: Address, _expected_interface: Symbol) -> bool {
+            env.storage()
+                .instance()
+                .get(&address)
+                .unwrap_or(false)
+        }
+    }
+
+    fn setup(env: &Env) -> (PredictionMarketClient<'_>, Address, Address) {
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(env, &contract_id);
+
+        let registry_id = env.register_contract(None, MockInterfaceRegistry);
+        let registry_client = MockInterfaceRegistryClient::new(env, &registry_id);
+
+        let admin = Address::generate(env);
+        env.mock_all_auths();
+        client.initialize(&admin, &registry_id);
+
+        (client, registry_id, admin)
+    }
 
     #[test]
-    fn test_create_market() {
+    fn test_create_market_with_valid_oracle() {
+        let env = Env::default();
+        let (client, registry_id, _admin) = setup(&env);
+        let registry_client = MockInterfaceRegistryClient::new(&env, &registry_id);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        // Register the oracle as valid.
+        registry_client.set_registered(&oracle, &true);
+
+        let market_id = client
+            .create_market(
+                &creator,
+                &learner,
+                &hash,
+                &1000,
+                &token,
+                &None,
+                &oracle,
+                &false,
+            )
+            .unwrap();
+        assert_eq!(market_id, 1);
+
+        // Verify oracle is stored
+        let stored_oracle = client.get_market_oracle(&market_id);
+        assert_eq!(stored_oracle, oracle);
+    }
+
+    #[test]
+    fn test_create_market_with_invalid_oracle() {
+        let env = Env::default();
+        let (client, _registry_id, _admin) = setup(&env);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        // Oracle is NOT registered, so creation must fail.
+        let res = client.try_create_market(
+            &creator,
+            &learner,
+            &hash,
+            &1000,
+            &token,
+            &None,
+            &oracle,
+            &false,
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidOracle)));
+    }
+
+    #[test]
+    fn test_place_bet() {
+        let env = Env::default();
+        let (client, registry_id, _admin) = setup(&env);
+        let registry_client = MockInterfaceRegistryClient::new(&env, &registry_id);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let bettor = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        registry_client.set_registered(&oracle, &true);
+
+        let market_id = client
+            .create_market(
+                &creator,
+                &learner,
+                &hash,
+                &1000,
+                &token,
+                &None,
+                &oracle,
+                &false,
+            )
+            .unwrap();
+        client.place_bet(&bettor, &market_id, &true, &100);
+
+        let (yes_pool, no_pool) = client.get_odds(&market_id);
+        assert_eq!(yes_pool, 100);
+        assert_eq!(no_pool, 0);
+
+        // Verify LMSR prices sum to 10000
+        let (yes_price, no_price) = client.get_current_price(&market_id);
+        assert_eq!(yes_price + no_price, 10000);
+    }
+
+    #[test]
+    fn test_resolve_market() {
+        let env = Env::default();
+        let (client, registry_id, _admin) = setup(&env);
+        let registry_client = MockInterfaceRegistryClient::new(&env, &registry_id);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let proof = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+        registry_client.set_registered(&oracle, &true);
+
+        let market_id = client
+            .create_market(
+                &creator,
+                &learner,
+                &hash,
+                &100,
+                &token,
+                &None,
+                &oracle,
+                &false,
+            )
+            .unwrap();
+
+        // Advance ledger past resolution date
+        env.ledger().set_timestamp(101);
+
+        client.resolve_market(&market_id, &true, &proof);
+        let market = client.get_market(&market_id);
+        assert!(market.resolved);
+        assert_eq!(market.outcome, Some(true));
+        
+        // Verify proof is stored
+        let stored_proof = client.get_resolution_proof(&market_id);
+        assert_eq!(stored_proof, proof);
+    }
+
+    #[test]
+    #[should_panic(expected = "not oracle")]
+    fn test_admin_cannot_resolve() {
+        let env = Env::default();
+        let (client, registry_id, _admin) = setup(&env);
+        let registry_client = MockInterfaceRegistryClient::new(&env, &registry_id);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let proof = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+        registry_client.set_registered(&oracle, &true);
+
+        let market_id = client
+            .create_market(
+                &creator,
+                &learner,
+                &hash,
+                &100,
+                &token,
+                &None,
+                &oracle,
+                &false,
+            )
+            .unwrap();
+
+        // Advance ledger past resolution date
+        env.ledger().set_timestamp(101);
+
+        // Try to resolve as admin (should fail - only oracle can resolve)
+        client.resolve_market(&market_id, &true, &proof);
+    }
+
+    #[test]
+    fn test_resolution_with_proof() {
+        let env = Env::default();
+        let (client, registry_id, _admin) = setup(&env);
+        let registry_client = MockInterfaceRegistryClient::new(&env, &registry_id);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let proof = BytesN::<32>::from_array(&env, &[42u8; 32]);
+
+        registry_client.set_registered(&oracle, &true);
+
+        let market_id = client
+            .create_market(
+                &creator,
+                &learner,
+                &hash,
+                &100,
+                &token,
+                &None,
+                &oracle,
+                &false,
+            )
+            .unwrap();
+
+        // Advance ledger past resolution date
+        env.ledger().set_timestamp(101);
+
+        // Resolve with proof
+        client.resolve_market(&market_id, &false, &proof);
+        
+        // Verify proof is stored and retrievable
+        let stored_proof = client.get_resolution_proof(&market_id);
+        assert_eq!(stored_proof, proof);
+        
+        let market = client.get_market(&market_id);
+        assert!(market.resolved);
+        assert_eq!(market.outcome, Some(false));
+    }
+
+    #[test]
+    fn test_multi_oracle_market() {
+        let env = Env::default();
+        let (client, registry_id, _admin) = setup(&env);
+        let registry_client = MockInterfaceRegistryClient::new(&env, &registry_id);
+
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle1 = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        let market = client.get_market(&market_id);
+        assert!(market.resolution_requires_multi);
+        assert_eq!(market.resolution_oracle, oracle1);
+    }
+
+    #[test]
+    #[should_panic(expected = "resolution date must be in future")]
+    fn test_invalid_resolution_date() {
         let env = Env::default();
         let contract_id = env.register_contract(None, PredictionMarket);
         let client = PredictionMarketClient::new(&env, &contract_id);
@@ -619,25 +1062,11 @@ mod tests {
         env.mock_all_auths();
         client.initialize(&admin);
 
-        let market_id = client.create_market(
-            &creator,
-            &learner,
-            &hash,
-            &1000,
-            &token,
-            &None,
-            &oracle,
-            &false,
-        );
-        assert_eq!(market_id, 1);
-        
-        // Verify oracle is stored
-        let stored_oracle = client.get_market_oracle(&market_id);
-        assert_eq!(stored_oracle, oracle);
+        client.create_market(&creator, &learner, &hash, &0, &token, &None, &oracle, &false);
     }
 
     #[test]
-    fn test_place_bet() {
+    fn test_near_max_pool_overflow_protection() {
         let env = Env::default();
         let contract_id = env.register_contract(None, PredictionMarket);
         let client = PredictionMarketClient::new(&env, &contract_id);
@@ -663,188 +1092,50 @@ mod tests {
             &oracle,
             &false,
         );
-        client.place_bet(&bettor, &market_id, &true, &100);
 
-        let (yes_pool, no_pool) = client.get_odds(&market_id);
-        assert_eq!(yes_pool, 100);
-        assert_eq!(no_pool, 0);
-
-        // Verify LMSR prices sum to 10000
-        let (yes_price, no_price) = client.get_current_price(&market_id);
-        assert_eq!(yes_price + no_price, 10000);
+        // Near-max amount that would cause overflow
+        let near_max_amount = i128::MAX;
+        let res = client.try_place_bet(&bettor, &market_id, &true, &near_max_amount);
+        assert!(res.is_err());
+        assert_eq!(res, Err(Ok(Error::Overflow)));
     }
 
     #[test]
-    fn test_resolve_market() {
+    fn test_lmsr_cost_fuzz_no_panic() {
         let env = Env::default();
         let contract_id = env.register_contract(None, PredictionMarket);
-        let client = PredictionMarketClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let token = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
-        let proof = BytesN::<32>::from_array(&env, &[1u8; 32]);
+        let half_max = i128::MAX / 2;
+        // Representative large values within [0, i128::MAX / 2]
+        let values: [i128; 8] = [
+            0,
+            1,
+            FIXED_POINT_SCALE,
+            half_max / 4,
+            half_max / 2,
+            half_max - 1,
+            half_max,
+            i128::MAX / 4,
+        ];
 
-        env.mock_all_auths();
-        client.initialize(&admin);
-
-        let market_id = client.create_market(
-            &creator,
-            &learner,
-            &hash,
-            &100,
-            &token,
-            &None,
-            &oracle,
-            &false,
-        );
-
-        // Advance ledger past resolution date
-        env.ledger().set_timestamp(101);
-
-        client.resolve_market(&market_id, &true, &proof);
-        let market = client.get_market(&market_id);
-        assert!(market.resolved);
-        assert_eq!(market.outcome, Some(true));
-        
-        // Verify proof is stored
-        let stored_proof = client.get_resolution_proof(&market_id);
-        assert_eq!(stored_proof, proof);
-    }
-
-    #[test]
-    #[should_panic(expected = "not oracle")]
-    fn test_admin_cannot_resolve() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, PredictionMarket);
-        let client = PredictionMarketClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let token = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
-        let proof = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-        env.mock_all_auths();
-        client.initialize(&admin);
-
-        let market_id = client.create_market(
-            &creator,
-            &learner,
-            &hash,
-            &100,
-            &token,
-            &None,
-            &oracle,
-            &false,
-        );
-
-        // Advance ledger past resolution date
-        env.ledger().set_timestamp(101);
-
-        // Try to resolve as admin (should fail - only oracle can resolve)
-        client.resolve_market(&market_id, &true, &proof);
-    }
-
-    #[test]
-    fn test_resolution_with_proof() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, PredictionMarket);
-        let client = PredictionMarketClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let token = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
-        let proof = BytesN::<32>::from_array(&env, &[42u8; 32]);
-
-        env.mock_all_auths();
-        client.initialize(&admin);
-
-        let market_id = client.create_market(
-            &creator,
-            &learner,
-            &hash,
-            &100,
-            &token,
-            &None,
-            &oracle,
-            &false,
-        );
-
-        // Advance ledger past resolution date
-        env.ledger().set_timestamp(101);
-
-        // Resolve with proof
-        client.resolve_market(&market_id, &false, &proof);
-        
-        // Verify proof is stored and retrievable
-        let stored_proof = client.get_resolution_proof(&market_id);
-        assert_eq!(stored_proof, proof);
-        
-        let market = client.get_market(&market_id);
-        assert!(market.resolved);
-        assert_eq!(market.outcome, Some(false));
-    }
-
-    #[test]
-    fn test_multi_oracle_market() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, PredictionMarket);
-        let client = PredictionMarketClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let token = Address::generate(&env);
-        let oracle1 = Address::generate(&env);
-        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
-        let proof = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-        env.mock_all_auths();
-        client.initialize(&admin);
-
-        // Create market with multi-oracle requirement
-        let market_id = client.create_market(
-            &creator,
-            &learner,
-            &hash,
-            &100,
-            &token,
-            &None,
-            &oracle1,
-            &true,
-        );
-
-        let market = client.get_market(&market_id);
-        assert!(market.resolution_requires_multi);
-        assert_eq!(market.resolution_oracle, oracle1);
-    }
-
-    #[test]
-    #[should_panic(expected = "resolution date must be in future")]
-    fn test_invalid_resolution_date() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, PredictionMarket);
-        let client = PredictionMarketClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let token = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
-
-        env.mock_all_auths();
-        client.initialize(&admin);
-
-        client.create_market(&creator, &learner, &hash, &0, &token, &None, &oracle, &false);
+        env.as_contract(&contract_id, || {
+            for &q_yes in values.iter() {
+                for &q_no in values.iter() {
+                    for &b in values.iter() {
+                        // b must be positive for a valid LMSR; skip zero
+                        if b <= 0 {
+                            continue;
+                        }
+                        // Must never panic; only Ok or Err(Error::Overflow)
+                        let res = lmsr_cost(&env, q_yes, q_no, b);
+                        match res {
+                            Ok(_) => {}
+                            Err(Error::Overflow) => {}
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        });
     }
 }

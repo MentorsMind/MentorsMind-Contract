@@ -7,7 +7,7 @@
 //! - Behavioral fraud detection using anomaly scoring
 //! - Emergency account protection with automatic transaction blocking
 
-use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, Vec, xdr::ToXdr};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, xdr::ToXdr};
 
 // ---------------------------------------------------------------------------
 // Constants

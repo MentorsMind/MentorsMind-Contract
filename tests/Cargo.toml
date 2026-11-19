@@ -34,6 +34,7 @@ mentorminds-rbac = { path = "../contracts/rbac", features = ["testutils"] }
 mentorminds-performance-bond = { path = "../contracts/performance_bond", features = ["testutils"] }
 mentorminds-subscription = { path = "../contracts/subscription", features = ["testutils"] }
 mentorminds-escrow-factory = { path = "../contracts/escrow_factory", features = ["testutils"] }
+mentorminds-delegation = { path = "../contracts/delegation", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -96,3 +97,7 @@ path = "protocol_params_integration.rs"
 [[test]]
 name = "gas_estimation_accuracy_tests"
 path = "gas_estimation_accuracy_tests.rs"
+
+[[test]]
+name = "delegation_governance"
+path = "delegation_governance.rs"

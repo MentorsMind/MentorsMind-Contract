@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::events::{
     emit_staking_event, evt_staking_staked, evt_staking_unstaked, evt_staking_admin_proposed,
@@ -11,16 +10,14 @@ use shared::pause_guard::require_not_paused;
 use shared::{
     action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
     compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
-    correlate_attack_vectors, detect_suspicious_pattern, push_snapshot_index,
-    validate_amount_limits, exceeds_extraction_rate, detect_coordinated_timing,
-    EconomicVelocityReport, MultiVectorThreatReport, PenaltyCalculation,
-    ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath, SnapshotMeta, StakeRecord,
-    StakedEventData, StakingActionRecord, StateSnapshot, StateVerificationReport,
-    SuspiciousPatternFlag, Validator, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
-    MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
-    REWARD_MULTIPLIER_MIN_BPS, MIN_POSITION_DELTA_SECS,
-    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult, TokenomicsAuditResult,
-    Pagination,
+    correlate_attack_vectors, detect_suspicious_pattern,
+    exceeds_extraction_rate, push_snapshot_index, validate_amount_limits, CollusionDetection,
+    EconomicVelocityReport, GameTheoryState, IncentiveCompatibilityResult, MultiVectorThreatReport,
+    Pagination, PenaltyCalculation, ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath,
+    SnapshotMeta, StakeRecord, StakedEventData, StakingActionRecord, StateSnapshot,
+    StateVerificationReport, SuspiciousPatternFlag, TokenomicsAuditResult, Validator,
+    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, MIN_POSITION_DELTA_SECS, MIN_STAKING_DURATION_SECS,
+    PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS, REWARD_MULTIPLIER_MIN_BPS,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -87,15 +84,6 @@ pub struct PendingAdminChange {
     pub effective_at: u64,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminChangeProposedEvent {
-    pub contract: Address,
-    pub old_admin: Address,
-    pub new_admin: Address,
-    pub effective_at: u64,
-}
-
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 
 /// Economic sanity ceiling for a single stake or reward-distribution
@@ -127,6 +115,7 @@ const MAX_EXTRACTION_RATE_BPS: u32 = 500; // 5% per epoch
 const MIN_SUSTAINABILITY_RATIO: u32 = 150; // 1.5x coverage required
 
 /// Maximum trading volume variance to detect coordination
+#[allow(dead_code)]
 const MAX_TRADING_VARIANCE_BPS: u32 = 750; // 7.5% deviation threshold
 
 /// Minimum time between large stake positions for coordination detection
@@ -144,6 +133,8 @@ const EXIT_COORDINATION_THRESHOLD: u32 = 10;
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
+
+type DistributionEpoch = u64;
 
 #[contracttype]
 #[derive(Clone)]
@@ -240,7 +231,12 @@ pub enum DataKey {
     StakerActionLogIndex(Address),
     /// RewardLockup entry for (staker, epoch) — contains the scaled
     /// reward amount and its unlock timestamp.
-    StakerRewardLockup(Address, u64),
+    StakerRewardLockup(Address, DistributionEpoch),
+    /// Dense index of all currently pending reward lockups.
+    PendingDistributionIndex(u32),
+    /// Reverse lookup used to remove a pending lockup from the dense index.
+    PendingDistributionPosition(Address, DistributionEpoch),
+    PendingDistributionCount,
     /// The highest epoch for which a RewardLockup has already been
     /// recorded for `staker` — avoids double-writing on re-settlement.
     StakerLockupSettledUntil(Address),
@@ -1264,12 +1260,54 @@ impl StakingContract {
             .ok_or(Error::NoStakeFound)
     }
 
-    /// Return the tier for a mentor.
-    /// 0 = None, 1 = Bronze, 2 = Silver, 3 = Gold
-    pub fn get_tier(env: Env, mentor: Address) -> u32 {
+    /// Get the staking tier for a mentor without deserializing the full StakeRecord.
+    ///
+    /// Returns the tier level of a mentor's stake, or 0 if the mentor has no stake.
+    /// This is a cheap read-only query intended for other contracts (verification, escrow)
+    /// that need to determine a mentor's tier without loading the complete stake record.
+    ///
+    /// The tier value indicates the mentor's participation level:
+    /// * `0` - No stake (default)
+    /// * `1` - Bronze tier (minimum stake threshold met)
+    /// * `2` - Silver tier (increased stake + quality requirements)
+    /// * `3` - Gold tier (highest stake + quality requirements)
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `mentor` - Address of the mentor to query.
+    ///
+    /// # Returns
+    /// A `u32` representing the tier level (0-3). Returns 0 if no stake exists.
+    ///
+    /// # Storage Effects
+    /// Extends the TTL of the mentor's `DataKey::Stake` entry, resetting the
+    /// expiration counter. This ensures frequently-queried tier data remains
+    /// available across ledger boundaries.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mentor = Address::generate(&env);
+    /// let tier = staking.get_staking_tier(&env, &mentor);
+    /// match tier {
+    ///     0 => println!("No active stake"),
+    ///     1 => println!("Bronze tier"),
+    ///     2 => println!("Silver tier"),
+    ///     3 => println!("Gold tier"),
+    ///     _ => panic!("Invalid tier"),
+    /// }
+    /// ```
+    pub fn get_staking_tier(env: Env, mentor: Address) -> u32 {
+        let key = DataKey::Stake(mentor);
+        // Extend TTL on read to keep frequently-accessed tier data fresh
+        let threshold = 100_000u32;
+        let bump = 200_000u32;
         env.storage()
             .persistent()
-            .get::<DataKey, StakeRecord>(&DataKey::Stake(mentor))
+            .extend_ttl(&key, threshold, bump);
+        
+        env.storage()
+            .persistent()
+            .get::<DataKey, StakeRecord>(&key)
             .map(|r| r.tier)
             .unwrap_or(0)
     }
@@ -1811,6 +1849,7 @@ impl StakingContract {
                         .expect("Overflow");
                     lockup.claimed = true;
                     env.storage().persistent().set(&key, &lockup);
+                    Self::remove_pending_distribution(&env, &staker, epoch);
                 }
             }
         }
@@ -2378,9 +2417,13 @@ impl StakingContract {
                             unlocks_at,
                             claimed: false,
                         };
+                        let lockup_key = DataKey::StakerRewardLockup(staker.clone(), epoch);
+                        if !env.storage().persistent().has(&lockup_key) {
+                            Self::add_pending_distribution(env, staker, epoch);
+                        }
                         env.storage()
                             .persistent()
-                            .set(&DataKey::StakerRewardLockup(staker.clone(), epoch), &lockup);
+                            .set(&lockup_key, &lockup);
                         env.events().publish(
                             (
                                 Symbol::new(env, "reward_lockup"),
@@ -2404,6 +2447,112 @@ impl StakingContract {
                 .persistent()
                 .set(&DataKey::StakerNextClaimEpoch(staker.clone()), &epoch);
         }
+    }
+
+    fn add_pending_distribution(env: &Env, staker: &Address, epoch: DistributionEpoch) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingDistributionCount)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PendingDistributionIndex(count),
+            &(staker.clone(), epoch),
+        );
+        env.storage().persistent().set(
+            &DataKey::PendingDistributionPosition(staker.clone(), epoch),
+            &count,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingDistributionCount, &count.checked_add(1).expect("Overflow"));
+    }
+
+    fn remove_pending_distribution(env: &Env, staker: &Address, epoch: DistributionEpoch) {
+        let position_key = DataKey::PendingDistributionPosition(staker.clone(), epoch);
+        let Some(position) = env.storage().persistent().get::<_, u32>(&position_key) else {
+            return;
+        };
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingDistributionCount)
+            .unwrap_or(0);
+        if count == 0 || position >= count {
+            return;
+        }
+
+        let last_position = count - 1;
+        if position != last_position {
+            if let Some((last_staker, last_epoch)) = env
+                .storage()
+                .persistent()
+                .get::<_, (Address, DistributionEpoch)>(
+                    &DataKey::PendingDistributionIndex(last_position),
+                )
+            {
+                env.storage().persistent().set(
+                    &DataKey::PendingDistributionIndex(position),
+                    &(last_staker.clone(), last_epoch),
+                );
+                env.storage().persistent().set(
+                    &DataKey::PendingDistributionPosition(last_staker, last_epoch),
+                    &position,
+                );
+            }
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingDistributionIndex(last_position));
+        env.storage().persistent().remove(&position_key);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingDistributionCount, &last_position);
+    }
+
+    /// Number of currently unclaimed reward lockups across all stakers.
+    pub fn get_pending_distribution_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingDistributionCount)
+            .unwrap_or(0)
+    }
+
+    /// Paginated pending reward lockups across all stakers.
+    /// `limit` is capped to `MAX_PAGE_SIZE` by the shared pagination helper.
+    pub fn get_pending_distributions_page(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<(Address, RewardLockup)> {
+        let count = Self::get_pending_distribution_count(env.clone());
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for index in start..end {
+            if let Some((staker, epoch)) = env
+                .storage()
+                .persistent()
+                .get::<_, (Address, DistributionEpoch)>(
+                    &DataKey::PendingDistributionIndex(index),
+                )
+            {
+                if let Some(lockup) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, RewardLockup>(&DataKey::StakerRewardLockup(
+                        staker.clone(),
+                        epoch,
+                    ))
+                {
+                    if !lockup.claimed {
+                        result.push_back((staker, lockup));
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Look up the RewardLockup for (staker, epoch), if any.
@@ -2432,6 +2581,42 @@ impl StakingContract {
             }
         }
         total
+    }
+
+    /// Paginated reward history view for a staker. Returns a page of RewardLockup
+    /// entries representing each epoch's reward distribution, lockup, and claim status.
+    /// `limit` is clamped to `MAX_PAGE_SIZE`. Offset and limit follow standard pagination
+    /// semantics over the staker's complete reward history (epoch 0..current_epoch).
+    pub fn get_reward_history_page(
+        env: Env,
+        staker: Address,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<RewardLockup> {
+        use shared::Pagination;
+
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        let total_epochs = current_epoch as u32;
+        let (start, end) = Pagination::bounds(total_epochs, offset, limit);
+
+        let mut result = soroban_sdk::Vec::new(&env);
+
+        for epoch in start..end {
+            if let Some(lockup) = env
+                .storage()
+                .persistent()
+                .get::<_, RewardLockup>(&DataKey::StakerRewardLockup(staker.clone(), epoch as u64))
+            {
+                result.push_back(lockup);
+            }
+        }
+
+        result
     }
 
     /// Duration-based multiplier the staker would earn for a reward
@@ -3063,7 +3248,7 @@ impl StakingContract {
     pub fn detect_trading_coordination(
         env: Env,
         staker: Address,
-        amount: i128,
+        _amount: i128,
     ) -> Result<bool, Error> {
         let action_log: Vec<StakingActionRecord> = env
             .storage()
@@ -3097,15 +3282,17 @@ impl StakingContract {
     /// Monitor governance token accumulation to prevent vote manipulation
     pub fn monitor_governance_accumulation(env: Env, staker: Address) -> Result<u32, Error> {
         let total_staked = Self::get_total_staked(env.clone());
-        let staker_stake: Option<StakeRecord> =
-            env.storage().persistent().get(&DataKey::Stake(staker.clone()));
+        let staker_stake: Option<StakeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stake(staker.clone()));
 
         if let Some(stake_record) = staker_stake {
             let accumulation_bps = if total_staked > 0 {
-                ((stake_record.amount as u128)
+                (stake_record.amount as u128)
                     .checked_mul(10000)
                     .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
-                    .unwrap_or(10000))
+                    .unwrap_or(10000)
             } else {
                 0
             };
@@ -3254,10 +3441,10 @@ impl StakingContract {
         }
 
         let gini_bps = if total_staked > 0 {
-            ((top_10_pct as u128)
+            (top_10_pct as u128)
                 .checked_mul(10000)
                 .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
-                .unwrap_or(10000))
+                .unwrap_or(10000)
         } else {
             0
         };
@@ -3406,10 +3593,7 @@ impl StakingContract {
     }
 
     /// Detect coordinated staking patterns that suggest manipulation.
-    pub fn detect_staking_coordination(
-        env: Env,
-        staker: Address,
-    ) -> bool {
+    pub fn detect_staking_coordination(env: Env, staker: Address) -> bool {
         let action_log: Vec<u64> = env
             .storage()
             .persistent()
@@ -3439,10 +3623,7 @@ impl StakingContract {
     }
 
     /// Audit tokenomics fairness for a given epoch.
-    pub fn audit_epoch_fairness(
-        env: Env,
-        epoch: u64,
-    ) -> TokenomicsAuditResult {
+    pub fn audit_epoch_fairness(env: Env, epoch: u64) -> TokenomicsAuditResult {
         let epoch_reward: i128 = env
             .storage()
             .persistent()
@@ -3738,6 +3919,27 @@ mod test {
         assert_eq!(f.client().get_tier(&mentor), 0);
     }
 
+    #[test]
+    fn test_get_staking_tier_returns_correct_tier_level() {
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+
+        // Test 1: No stake should return tier 0
+        assert_eq!(f.client().get_staking_tier(&mentor), 0);
+
+        // Test 2: Small stake (below Bronze) should return tier 0
+        f.fund(&mentor, 50);
+        f.client().stake(&mentor, &50, &30);
+        assert_eq!(f.client().get_staking_tier(&mentor), 0);
+
+        // Test 3: Larger stake (Bronze tier) should return tier 1
+        let mentor2 = Address::generate(&f.env);
+        f.fund(&mentor2, 500);
+        f.client().stake(&mentor2, &500, &30);
+        let tier = f.client().get_staking_tier(&mentor2);
+        assert!(tier >= 1, "Expected tier >= 1 for 500 token stake, got {}", tier);
+    }
+
     // -----------------------------------------------------------------------
     // double-initialize guard
     // -----------------------------------------------------------------------
@@ -3900,6 +4102,61 @@ mod test {
         assert_eq!(f.client().get_pending_rewards(&staker), 200);
         f.client().claim_rewards(&staker, &f.mnt_id);
         assert_eq!(f.mnt().balance(&staker), 1_000 + 200);
+    }
+
+    #[test]
+    fn test_pending_distributions_page_paginates_across_stakers() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(0);
+
+        let first = Address::generate(&f.env);
+        let second = Address::generate(&f.env);
+        for staker in [&first, &second] {
+            f.fund(staker, 1_000);
+            f.client().stake(staker, &1_000, &1);
+        }
+
+        fund_treasury_and_distribute(&f, 0);
+        fund_treasury_and_distribute(&f, 200);
+        fund_treasury_and_distribute(&f, 200);
+
+        f.env.ledger().set_timestamp(86_401);
+        f.client().unstake(&first);
+        f.client().unstake(&second);
+
+        assert_eq!(f.client().get_pending_distribution_count(), 4);
+
+        let first_page = f.client().get_pending_distributions_page(&0, &2);
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page.get(0).unwrap().0, first);
+        assert_eq!(first_page.get(0).unwrap().1.epoch_id, 1);
+        assert_eq!(first_page.get(1).unwrap().0, first);
+        assert_eq!(first_page.get(1).unwrap().1.epoch_id, 2);
+
+        let second_page = f.client().get_pending_distributions_page(&2, &2);
+        assert_eq!(second_page.len(), 2);
+        assert_eq!(second_page.get(0).unwrap().0, second);
+        assert_eq!(second_page.get(0).unwrap().1.epoch_id, 1);
+        assert_eq!(second_page.get(1).unwrap().0, second);
+        assert_eq!(second_page.get(1).unwrap().1.epoch_id, 2);
+
+        assert_eq!(
+            f.client()
+                .get_pending_distributions_page(&0, &(shared::MAX_PAGE_SIZE + 1))
+                .len(),
+            4
+        );
+
+        f.env
+            .ledger()
+            .set_timestamp(86_401 + REWARD_LOCKUP_SECS + 1);
+        f.client().claim_rewards(&first, &f.mnt_id);
+
+        assert_eq!(f.client().get_pending_distribution_count(), 2);
+        let remaining = f.client().get_pending_distributions_page(&0, &2);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.get(0).unwrap().0, second);
+        assert_eq!(remaining.get(1).unwrap().0, second);
     }
 
     #[test]
@@ -4136,13 +4393,12 @@ mod test {
         client.initialize(&admin, &token_id, &None);
 
         client.stake(&mentor, &100, &30);
-        let mut index: Vec<u32> = env
-            .as_contract(&staking_id, || {
-                env.storage()
-                    .persistent()
-                    .get(&DataKey::StakeSnapshotIndex)
-                    .unwrap()
-            });
+        let mut index: Vec<u32> = env.as_contract(&staking_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::StakeSnapshotIndex)
+                .unwrap()
+        });
         assert_eq!(index.len(), 1);
         assert_eq!(index.get(0), Some(1));
 

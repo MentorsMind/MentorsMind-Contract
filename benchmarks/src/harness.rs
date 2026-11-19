@@ -70,11 +70,15 @@ pub struct CostSnapshot {
 ///   - `env.budget().cpu_instruction_cost()` returns the CPU instructions consumed.
 ///   - `env.budget().memory_bytes()` returns the memory bytes consumed (when
 ///     available; falls back to 0 on older SDK versions).
+#[allow(deprecated)] // Env::budget() is deprecated in favour of cost_estimate().budget()
 pub fn measure<F: FnOnce()>(env: &Env, f: F) -> CostSnapshot {
-    env.budget().reset_default();
+    // Reset counters and lift the budget ceiling so heavy benchmark
+    // operations (contract uploads/deployments) don't abort mid-measurement.
+    // The consumed CPU/memory counters still reflect the real cost.
+    env.budget().reset_unlimited();
     f();
     let cpu = env.budget().cpu_instruction_cost();
-    let mem = env.budget().memory_bytes();
+    let mem = env.budget().memory_bytes_cost();
     CostSnapshot {
         cpu_instructions: cpu,
         mem_bytes: mem,
@@ -283,7 +287,8 @@ pub fn check_gas_accuracy(results: &[GasAccuracyResult]) -> Vec<&GasAccuracyResu
 
 /// Write gas accuracy results to `benchmarks/results/gas_accuracy.json`.
 pub fn write_gas_accuracy_report(results: &[GasAccuracyResult]) {
-    extern crate std;
+extern crate std;
+
     use std::fs;
     let dir = "benchmarks/results";
     let _ = fs::create_dir_all(dir);

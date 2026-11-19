@@ -1,4 +1,5 @@
 #![no_std]
+use shared::storage::EternalStorage;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
 };
@@ -81,7 +82,7 @@ impl OnboardingEscrow {
     pub fn init_mentor(env: Env, mentor: Address) {
         mentor.require_auth();
         let key = DataKey::MentorOnboardingStatus(mentor.clone());
-        if env.storage().persistent().has(&key) {
+        if EternalStorage::has_persistent(&env, &key) {
             return; // already initialised
         }
         let status = OnboardingStatus {
@@ -90,10 +91,8 @@ impl OnboardingEscrow {
             has_completed_first_session: false,
             onboarding_complete: false,
         };
-        env.storage().persistent().set(&key, &status);
-        env.storage()
-            .persistent()
-            .set(&DataKey::FirstEscrowExtended(mentor), &true);
+        EternalStorage::set_persistent(&env, &key, &status);
+        EternalStorage::set_persistent(&env, &DataKey::FirstEscrowExtended(mentor), &true);
     }
 
     /// Mark a step as completed. Callable by the relevant subsystem contract
@@ -101,10 +100,7 @@ impl OnboardingEscrow {
     pub fn complete_onboarding_step(env: Env, mentor: Address, step: OnboardingStep) {
         mentor.require_auth();
         let key = DataKey::MentorOnboardingStatus(mentor.clone());
-        let mut status: OnboardingStatus = env
-            .storage()
-            .persistent()
-            .get(&key)
+        let mut status: OnboardingStatus = EternalStorage::get_persistent(&env, &key)
             .expect("mentor not initialised");
 
         if status.onboarding_complete {
@@ -126,7 +122,7 @@ impl OnboardingEscrow {
             status.onboarding_complete = true;
         }
 
-        env.storage().persistent().set(&key, &status);
+        EternalStorage::set_persistent(&env, &key, &status);
 
         // Event: step completed
         env.events().publish(
@@ -142,17 +138,13 @@ impl OnboardingEscrow {
 
     /// Returns the current onboarding status for a mentor.
     pub fn get_onboarding_status(env: Env, mentor: Address) -> OnboardingStatus {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MentorOnboardingStatus(mentor))
+        EternalStorage::get_persistent(&env, &DataKey::MentorOnboardingStatus(mentor))
             .expect("mentor not initialised")
     }
 
     /// Whether the mentor's first escrow should use the extended delay.
     pub fn is_first_escrow_extended(env: Env, mentor: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::FirstEscrowExtended(mentor))
+        EternalStorage::get_persistent(&env, &DataKey::FirstEscrowExtended(mentor))
             .unwrap_or(false)
     }
 

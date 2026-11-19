@@ -328,7 +328,7 @@ impl<'a> ProtocolFixture<'a> {
         {
             use mentorminds_staking::StakingContractClient;
             let staking = StakingContractClient::new(env, &staking_addr);
-            staking.initialize(&admin, &token);
+            staking.initialize(&admin, &token, &None);
         }
         let snapshot_addr = env.register_contract(None, SnapshotContract);
         {
@@ -341,8 +341,12 @@ impl<'a> ProtocolFixture<'a> {
             &admin,
             &mock_token,
             &snapshot_addr,
+            &Address::generate(env),
             &Some(120u64),
             &Some(1_000u32),
+            &None,
+            &None,
+            &None,
         );
 
         // --- Pause Guardian ---
@@ -609,7 +613,17 @@ fn test_disaster_recovery_treasury_outage() {
     let mock_snapshot = Address::generate(&env);
     let gov_addr = env.register_contract(None, GovernanceContract);
     let governance = GovernanceContractClient::new(&env, &gov_addr);
-    governance.initialize(&admin, &mock_token, &mock_snapshot, &Some(120u64), &Some(1_000u32));
+    governance.initialize(
+        &admin,
+        &mock_token,
+        &mock_snapshot,
+        &Address::generate(&env),
+        &Some(120u64),
+        &Some(1_000u32),
+        &None,
+        &None,
+        &None,
+    );
 
     let pause_addr = env.register_contract(None, PauseGuardian);
     let pause = PauseGuardianClient::new(&env, &pause_addr);
@@ -703,6 +717,40 @@ fn test_disaster_recovery_treasury_outage() {
         "treasury outage recovery failed:\n{}",
         report.summary()
     );
+}
+
+#[test]
+fn test_treasury_outage_escrow_release_and_refund_remain_safe() {
+    let env = Env::default();
+    let f = ProtocolFixture::setup(&env);
+    let token = f.token_client();
+
+    // Two active escrows created before the outage.
+    let released_id = f.create_escrow(100_000);
+    let refunded_id = f.create_escrow(50_000);
+    assert_eq!(f.escrow.get_escrow(&released_id).status, EscrowStatus::Active);
+    assert_eq!(f.escrow.get_escrow(&refunded_id).status, EscrowStatus::Active);
+    assert_eq!(token.balance(&f.escrow_id), 150_000);
+
+    // Outage: the configured treasury becomes an unreachable address that
+    // was never registered as a contract.
+    let dead_treasury = Address::generate(&env);
+    f.escrow.update_treasury(&dead_treasury);
+
+    // Release still succeeds: mentor is paid net of the 5% fee.
+    f.escrow.release_funds(&f.learner, &released_id);
+    assert_eq!(f.escrow.get_escrow(&released_id).status, EscrowStatus::Released);
+    assert_eq!(token.balance(&f.mentor), 95_000);
+    assert_eq!(token.balance(&dead_treasury), 5_000);
+
+    // Refund still succeeds: learner recovers the full escrowed amount.
+    let learner_before = token.balance(&f.learner);
+    f.escrow.refund(&refunded_id);
+    assert_eq!(f.escrow.get_escrow(&refunded_id).status, EscrowStatus::Refunded);
+    assert_eq!(token.balance(&f.learner), learner_before + 50_000);
+
+    // No escrow funds are stranded in the escrow contract.
+    assert_eq!(token.balance(&f.escrow_id), 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -832,7 +880,17 @@ fn test_disaster_recovery_mass_dispute_spike() {
     let mock_snapshot = Address::generate(&env);
     let gov_addr = env.register_contract(None, GovernanceContract);
     let governance = GovernanceContractClient::new(&env, &gov_addr);
-    governance.initialize(&admin, &mock_token, &mock_snapshot, &Some(120u64), &Some(1_000u32));
+    governance.initialize(
+        &admin,
+        &mock_token,
+        &mock_snapshot,
+        &Address::generate(&env),
+        &Some(120u64),
+        &Some(1_000u32),
+        &None,
+        &None,
+        &None,
+    );
 
     let pause_addr = env.register_contract(None, PauseGuardian);
     let pause = PauseGuardianClient::new(&env, &pause_addr);

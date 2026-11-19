@@ -227,6 +227,36 @@ pub fn protect_arbitration_fairness(favor_history: &Vec<bool>) -> ArbitrationBia
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balanced_history_is_fair() {
+        let env = Env::default();
+        let history = Vec::from_array(&env, [true, false, true, false]);
+        let result = protect_arbitration_fairness(&history);
+        assert!(result.fair);
+        assert_eq!(result.one_sided_ratio_bps, 5_000);
+    }
+
+    #[test]
+    fn strongly_one_sided_history_is_flagged() {
+        let env = Env::default();
+        let history = Vec::from_array(&env, [true, true, true, true, true]);
+        let result = protect_arbitration_fairness(&history);
+        assert!(!result.fair);
+        assert_eq!(result.bias_risk_score, 70);
+    }
+
+    #[test]
+    fn short_history_is_not_treated_as_statistically_meaningful() {
+        let env = Env::default();
+        let history = Vec::from_array(&env, [true, true]);
+        assert!(protect_arbitration_fairness(&history).fair);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Automatic intervention & restoration
 // ---------------------------------------------------------------------------

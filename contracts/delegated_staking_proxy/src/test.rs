@@ -220,3 +220,52 @@ fn min_deposit_rejects_dust() {
     let res = fx.client().try_deposit_and_stake(&owner, &10);
     assert!(res.is_err());
 }
+
+#[test]
+fn near_max_deposit_on_large_accumulator_does_not_overflow_silently() {
+    const MAX_AMOUNT: i128 = 1_000_000_000_000_000;
+
+    let fx = Fixture::setup(0);
+    let small = Address::generate(&fx.env);
+    let funder = Address::generate(&fx.env);
+    let large = Address::generate(&fx.env);
+
+    fx.fund(&small, 1);
+    fx.client().deposit_and_stake(&small, &1);
+
+    fx.fund(&funder, MAX_AMOUNT);
+    fx.client().distribute_rewards(&funder, &MAX_AMOUNT);
+
+    fx.fund(&large, MAX_AMOUNT);
+    assert!(fx.client().try_deposit_and_stake(&large, &MAX_AMOUNT).is_err());
+    assert_eq!(fx.client().get_beneficial_owner(&large), 0);
+}
+
+#[test]
+fn owners_page_enumerates_with_bounds() {
+    let fx = Fixture::setup(0);
+    let a = Address::generate(&fx.env);
+    let b = Address::generate(&fx.env);
+    let c = Address::generate(&fx.env);
+
+    for (owner, amount) in [(&a, 100i128), (&b, 200), (&c, 300)] {
+        fx.fund(owner, amount);
+        fx.client().deposit_and_stake(owner, &amount);
+    }
+
+    fx.fund(&a, 50);
+    fx.client().deposit_and_stake(&a, &50);
+    assert_eq!(fx.client().get_owner_count(), 3);
+
+    let first = fx.client().get_owners_page(&0, &2);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first.get(0).unwrap(), (a.clone(), 150));
+    assert_eq!(first.get(1).unwrap(), (b.clone(), 200));
+
+    let rest = fx.client().get_owners_page(&2, &10);
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest.get(0).unwrap(), (c.clone(), 300));
+
+    assert_eq!(fx.client().get_owners_page(&0, &0).len(), 1);
+    assert_eq!(fx.client().get_owners_page(&5, &10).len(), 0);
+}

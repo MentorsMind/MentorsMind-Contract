@@ -28,6 +28,8 @@
 ///   18. Minimum feeders enforced before get_price
 ///   19. Duplicate feeder registration is idempotent
 ///   20. Secondary source cap (max 5) is enforced
+///   21. Security: 2 agreeing feeders + 1 divergent feeder (Issue #1031)
+///   22. Security: 3 compromised feeders all submit manipulated price (Issue #1031)
 extern crate std;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -702,5 +704,115 @@ fn test_secondary_source_cap_enforced() {
     assert!(
         result.is_err(),
         "registering more than 5 secondary sources must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 21. Security: 2 agreeing feeders + 1 divergent feeder
+//     (Circuit-breaker bypass via feeder collusion — Issue #1031)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_two_agreeing_feeders_one_divergent() {
+    let env = Env::default();
+    let (client, _, feeders) = setup_oracle(&env, 3);
+    let asset = symbol_short!("XLM");
+
+    // Establish baseline TWAP at 100 with all 3 feeders agreeing.
+    submit_all(&client, &feeders, &asset, 100, 1_000);
+    submit_all(&client, &feeders, &asset, 100, 2_000);
+
+    // Now simulate partial compromise: 2 feeders agree on 100, 1 submits wildly divergent price.
+    // Feeder 0 and 1 submit 100 (legitimate).
+    client.submit_price(&feeders[0], &asset, &100, &3_000);
+    client.submit_price(&feeders[1], &asset, &100, &3_000);
+
+    // Feeder 2 attempts to manipulate with a wildly divergent price: 500 (5x the TWAP).
+    // This should be rejected by the circuit breaker (50% default threshold = 150 max).
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        client.submit_price(&feeders[2], &asset, &500, &3_000);
+    }));
+    assert!(
+        result.is_err(),
+        "wildly divergent price from single feeder must be rejected by circuit breaker"
+    );
+
+    // Verify the TWAP is still computed from the 2 agreeing feeders (should remain ~100).
+    let twap = client.get_twap(&asset);
+    assert!(
+        (twap - 100).abs() < 5,
+        "TWAP should remain close to 100, computed from agreeing feeders only; got {twap}"
+    );
+
+    // Verify get_price also returns the median of the agreeing feeders.
+    let (price, _) = client.get_price(&asset);
+    assert_eq!(price, 100, "median price should be 100 from the 2 agreeing feeders");
+}
+
+// ---------------------------------------------------------------------------
+// 22. Security: 3 compromised feeders all submit manipulated price
+//     (Circuit-breaker trips — Issue #1031)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_three_compromised_feeders_circuit_breaker_trips() {
+    let env = Env::default();
+    let (client, _, feeders) = setup_oracle(&env, 3);
+    let asset = symbol_short!("BTC");
+
+    // Establish baseline TWAP at 50_000 with all 3 feeders.
+    submit_all(&client, &feeders, &asset, 50_000, 1_000);
+    submit_all(&client, &feeders, &asset, 50_000, 2_000);
+
+    // Verify TWAP is established at 50_000.
+    let twap = client.get_twap(&asset);
+    assert!(
+        (twap - 50_000).abs() < 500,
+        "baseline TWAP should be ~50_000; got {twap}"
+    );
+
+    // Now all 3 feeders are compromised and attempt to submit 100_000 (2x the TWAP).
+    // This is a 100% deviation, which exceeds the 50% circuit breaker threshold.
+    // The circuit breaker must trip for each feeder attempting this.
+    
+    // Feeder 0 attempts 100_000 — must be rejected.
+    let result0 = catch_unwind(AssertUnwindSafe(|| {
+        client.submit_price(&feeders[0], &asset, &100_000, &3_000);
+    }));
+    assert!(
+        result0.is_err(),
+        "feeder 0 manipulated price must trip circuit breaker"
+    );
+
+    // Feeder 1 attempts 100_000 — must be rejected.
+    let result1 = catch_unwind(AssertUnwindSafe(|| {
+        client.submit_price(&feeders[1], &asset, &100_000, &3_000);
+    }));
+    assert!(
+        result1.is_err(),
+        "feeder 1 manipulated price must trip circuit breaker"
+    );
+
+    // Feeder 2 attempts 100_000 — must be rejected.
+    let result2 = catch_unwind(AssertUnwindSafe(|| {
+        client.submit_price(&feeders[2], &asset, &100_000, &3_000);
+    }));
+    assert!(
+        result2.is_err(),
+        "feeder 2 manipulated price must trip circuit breaker"
+    );
+
+    // Verify TWAP remains at the pre-attack value.
+    let twap_after = client.get_twap(&asset);
+    assert!(
+        (twap_after - 50_000).abs() < 500,
+        "TWAP should remain ~50_000 after failed manipulation; got {twap_after}"
+    );
+
+    // Verify no manipulated prices were stored.
+    let (price, _) = client.get_price(&asset);
+    assert_eq!(
+        price, 50_000,
+        "price should still be 50_000, not manipulated value"
     );
 }

@@ -3,6 +3,7 @@ use serde_json::to_string_pretty;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::process;
 
 fn main() {
     println!("🔍 Analyzing state machine transitions...\n");
@@ -88,7 +89,27 @@ fn main() {
         ],
     );
 
-    let state_machines = vec![escrow_sm, subscription_sm, loan_sm, isa_sm];
+    let proposal_sm = StateMachine::new(
+        "ProposalStatus".to_string(),
+        vec![
+            "Active".to_string(),
+            "Passed".to_string(),
+            "Queued".to_string(),
+            "Failed".to_string(),
+            "Executed".to_string(),
+            "Cancelled".to_string(),
+        ],
+        vec![
+            ("Active".to_string(), "Passed".to_string()),
+            ("Active".to_string(), "Failed".to_string()),
+            ("Active".to_string(), "Cancelled".to_string()),
+            ("Passed".to_string(), "Queued".to_string()),
+            ("Passed".to_string(), "Executed".to_string()),
+            ("Queued".to_string(), "Executed".to_string()),
+        ],
+    );
+
+    let state_machines = vec![escrow_sm, subscription_sm, loan_sm, isa_sm, proposal_sm];
 
     // Simulate tested transitions (based on existing tests)
     let mut tested_transitions = HashSet::new();
@@ -113,8 +134,17 @@ fn main() {
     tested_transitions.insert(("Pending".to_string(), "StudyPeriod".to_string()));
     tested_transitions.insert(("GracePeriod".to_string(), "Repayment".to_string()));
 
+    // Proposal tested transitions
+    tested_transitions.insert(("Active".to_string(), "Passed".to_string()));
+    tested_transitions.insert(("Active".to_string(), "Failed".to_string()));
+    tested_transitions.insert(("Active".to_string(), "Cancelled".to_string()));
+    tested_transitions.insert(("Passed".to_string(), "Queued".to_string()));
+    tested_transitions.insert(("Passed".to_string(), "Executed".to_string()));
+    tested_transitions.insert(("Queued".to_string(), "Executed".to_string()));
+
     // Generate coverage reports
     let mut coverage_reports = Vec::new();
+    let mut below_threshold = false;
     for sm in &state_machines {
         let report = sm.analyze_coverage(tested_transitions.clone());
         println!("📊 {}: {:.2}% coverage ({}/{})",
@@ -122,6 +152,12 @@ fn main() {
                  report.coverage_percentage,
                  report.tested_transitions,
                  report.valid_transitions);
+        
+        if report.coverage_percentage < 80.0 {
+            eprintln!("❌ {} coverage is below 80% threshold!", sm.name);
+            below_threshold = true;
+        }
+        
         coverage_reports.push(report);
     }
 
@@ -174,4 +210,10 @@ fn main() {
     }
 
     println!("\n✨ Analysis complete!");
+
+    // Exit with code 1 if any state machine has coverage below 80%
+    if below_threshold {
+        eprintln!("\n⚠️  State machine coverage below 80% threshold detected. Exiting with code 1.");
+        process::exit(1);
+    }
 }

@@ -106,3 +106,29 @@ fn proof_cancel_authorization() {
         assert!(allowed);
     }
 }
+
+/// Invariant 5: Delay arithmetic is overflow-safe when preconditions hold.
+///
+/// When the delay is valid (MIN_DELAY <= delay <= MAX_DELAY) and the current
+/// timestamp is bounded such that now + MAX_DELAY fits in u64, the computed
+/// execute_after = now + delay never overflows.
+#[kani::proof]
+#[kani::unwind(32)]
+fn proof_delay_arithmetic_overflow_safe() {
+    let now: u64 = kani::any();
+    let delay: u64 = kani::any();
+
+    // Precondition 1: delay is valid
+    kani::assume(logic::is_valid_delay(delay));
+
+    // Precondition 2: now is bounded such that overflow is impossible
+    kani::assume(now <= u64::MAX - MAX_DELAY);
+
+    // The result should never overflow
+    let result = logic::compute_ready_at(now, delay);
+    assert!(result.is_some(), "compute_ready_at should not overflow given preconditions");
+
+    let ready_at = result.unwrap();
+    // Verify the computation is correct
+    assert_eq!(ready_at, now + delay, "ready_at must equal now + delay");
+}

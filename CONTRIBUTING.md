@@ -113,15 +113,16 @@ patterns. The minimum required components are:
 - [ ] Define typed storage keys with a `DataKey` enum and include a
       `DataKey::NamespaceRoot` entry. Follow the
       [DataKey::NamespaceRoot guide (Issue #53)](https://github.com/MentorsMind/MentorsMind-Contract/issues/53)
-      and the [storage pattern documentation](docs/storage-guide.md).
+      and the [storage pattern documentation](docs/storage-pattern.md).
 - [ ] Define a `#[contracterror]` error enum for all expected contract
       failures.
 - [ ] Add an `initialize` entrypoint with an initialization guard so it cannot
       be run twice.
 - [ ] Choose the correct Soroban storage tier and bump TTLs for persistent or
-      instance data according to the [storage pattern documentation](docs/storage-guide.md).
+      instance data according to the [storage pattern documentation](docs/storage-pattern.md).
 - [ ] Emit events for state-changing operations. Document the event topics and
-      payloads in [`docs/events.md`](docs/events.md) (Issue #21).
+      payloads in [`docs/events.md`](docs/events.md) following the standardized
+      3-element topic tuple format.
 - [ ] Add unit and integration tests for successful and failing paths.
 - [ ] Add a benchmark suite entry when the contract has measurable critical
       entry points, following [`benchmarks/README.md`](benchmarks/README.md).
@@ -156,7 +157,9 @@ Use this checklist in the PR description:
 - [ ] `cargo fmt --all -- --check` and the relevant Clippy checks pass.
 - [ ] Benchmarks were run when contract performance or a benchmarked entry
       point changed; any baseline update is justified.
-- [ ] Documentation and event schemas were updated where needed.
+- [ ] Documentation and event schemas were updated where needed. New events
+      must follow the standardized format documented in
+      [`docs/events.md`](docs/events.md).
 - [ ] No generated deployment artifacts, secrets, or unrelated formatting
       changes are included.
 - [ ] Related issues are linked, including the relevant security or storage

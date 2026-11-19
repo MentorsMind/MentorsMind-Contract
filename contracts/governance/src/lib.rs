@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::events::{
     emit_governance_event, evt_gov_appeal_resolved, evt_gov_appeal_submitted,
@@ -9,27 +8,32 @@ use shared::events::{
     evt_gov_proposal_passed, evt_gov_proposal_queued, evt_gov_timelock_set,
     evt_gov_vote_cast,
 };
-use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS, SecureStorageAccess};
 use shared::{
-    // market control protection
-    detect_network_concentration as gov_detect_network_concentration,
-    assess_competition_barriers as gov_assess_competition_barriers,
-    detect_pricing_coordination as gov_detect_pricing_coordination,
+    detect_coordinated_timing, GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS,
+    SecureStorageAccess,
+};
+
+/// Number of recent vote timestamps retained per proposal for timing checks.
+const COORDINATED_VOTE_HISTORY: u32 = 32;
+use shared::market_control_protection::{
     analyze_market_networks as gov_analyze_market_networks,
     audit_market_competition as gov_audit_market_competition,
     compute_market_protection_intervention as gov_compute_market_protection_intervention,
+    detect_network_concentration as gov_detect_network_concentration,
+    assess_competition_barriers as gov_assess_competition_barriers,
+    detect_pricing_coordination as gov_detect_pricing_coordination,
     is_market_restoration_eligible as gov_is_market_restoration_eligible,
-    DecentralizationMonitoring, MarketFairness,
-    MarketProtectionRecord, CompetitionAuditRecord,
-    CoordinationFlag, SocialProofRecord,
-    PriceCoordinationFlag, MarketRateValidation, DemandAuthenticity,
+    CompetitionAuditRecord,
+    DecentralizationMonitoring, MarketFairness, MarketProtectionRecord,
+};
+use shared::{
+    // market control protection (non-duplicated imports)
+    ensure_dispute_independence,
     // #869 — Validator accountability and consensus oversight
     assess_incentive_alignment, get_validator_record, is_validator_ejected,
     register_validator, IncentiveAlignmentScore, ValidatorRecord,
     // #867 — Transaction intent protection
     evaluate_transaction_intent, RiskLevel, TransactionIntent,
-    // #124 — Arbitrator dispute independence protection
-    ensure_dispute_independence, DisputeIndependenceFlag,
 };
 use shared::governance_voting::{
     detect_vote_manipulation, validate_minimum_holding_period, ManipulationFlag,
@@ -68,9 +72,9 @@ const CANCEL_ESCALATION_THRESHOLD: u32 = 3; // > 3 cancels in 30 days triggers m
 
 // Proposal spam-prevention and deposit config keys (stored in instance storage)
 const PROPOSAL_DEPOSIT_SYM: Symbol = symbol_short!("PROP_DEP");
-const MIN_PROPOSER_BALANCE_SYM: Symbol = symbol_short!("MIN_PROP_BAL");
-const MAX_ACTIVE_PROPOSALS_SYM: Symbol = symbol_short!("MAX_ACT_PROPS");
-const TREASURY_BALANCE_SYM: Symbol = symbol_short!("TREASURY_BAL");
+const MIN_PROPOSER_BALANCE_SYM: Symbol = symbol_short!("MIN_P_BAL");
+const MAX_ACTIVE_PROPOSALS_SYM: Symbol = symbol_short!("MAX_ACT_P");
+const TREASURY_BALANCE_SYM: Symbol = symbol_short!("TRES_BAL");
 
 // ---------------------------------------------------------------------------
 // Gas-estimation heuristic constants (#761). Calibrated against
@@ -110,6 +114,10 @@ pub enum Error {
     InvalidAdminChange = 6,
     /// Arbitrator was previously involved in a dispute between the same parties
     ArbitratorConflict = 7,
+    /// Too many active proposals; cap reached
+    TooManyActiveProposals = 8,
+    /// Proposer has not held tokens for the minimum holding period
+    HoldingPeriodNotMet = 9,
 }
 
 #[contracttype]
@@ -237,6 +245,9 @@ pub enum DataKey {
     /// Per-proposal escrow deposit amount (in token smallest units)
     ProposalDeposit(u32),
     Vote(u32, Address),
+    /// Rolling window of recent vote timestamps for a proposal, used by
+    /// coordinated-timing detection (capped at `COORDINATED_VOTE_HISTORY`).
+    VoteTimestamps(u32),
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
     Timelock,
@@ -305,6 +316,10 @@ pub enum DataKey {
     /// Staking contract queried for the proposer's `staked_at` timestamp
     /// when enforcing the minimum holding period on `create_proposal`.
     StakingContract,
+    /// Sequential index of proposal IDs grouped by status for paginated filtering.
+    ProposalsByStatus(ProposalStatus, u32),
+    /// Per-status proposal count used as the next write index.
+    ProposalStatusCount(ProposalStatus),
 }
 
 #[contracttype]
@@ -347,6 +362,20 @@ impl GovernanceContract {
         if !ProposalStatus::is_valid_transition(env, &from, &to) {
             panic!("invalid transition from {:?} to {:?}", from, to);
         }
+
+        // Maintain ProposalsByStatus index: append proposal.id under new status
+        let new_count = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProposalStatusCount(to.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalsByStatus(to.clone(), new_count), &proposal.id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalStatusCount(to.clone()), &(new_count + 1));
+
         proposal.status = to;
     }
 
@@ -360,7 +389,7 @@ impl GovernanceContract {
         quorum_bps: Option<u32>,
         proposal_deposit: Option<i128>,
         min_proposer_balance: Option<i128>,
-        max_active_proposals_per_address: Option<u32>,
+        max_active_proposals: Option<u32>,
     ) {
         SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, GOV_STORAGE_SCOPE);
 
@@ -387,7 +416,7 @@ impl GovernanceContract {
         // Configure proposal spam / deposit defaults
         let deposit_val: i128 = proposal_deposit.unwrap_or(0i128);
         let min_bal: i128 = min_proposer_balance.unwrap_or(0i128);
-        let max_active: u32 = max_active_proposals_per_address.unwrap_or(3u32);
+        let max_active: u32 = max_active_proposals.unwrap_or(3u32);
 
         env.storage().instance().set(&PROPOSAL_DEPOSIT_SYM, &deposit_val);
         env.storage()
@@ -856,6 +885,33 @@ impl GovernanceContract {
                 .checked_add(weight)
                 .expect("votes against overflow");
         }
+
+        // ─── Coordinated-timing detection ───────────────────────────────
+        // Compare this vote's timestamp against the recent votes on the same
+        // proposal. Votes landing suspiciously close together are flagged
+        // (non-blocking) so governance monitors can review them.
+        let now = env.ledger().timestamp();
+        let window_secs = proposal.voting_ends_at.saturating_sub(proposal.created_at);
+        let history_key = DataKey::VoteTimestamps(proposal_id);
+        let mut history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        for prior in history.iter() {
+            if detect_coordinated_timing(&[prior, now], window_secs) {
+                env.events().publish(
+                    (symbol_short!("gov"), symbol_short!("coord")),
+                    (proposal_id, voter.clone(), now),
+                );
+                break;
+            }
+        }
+        if history.len() >= COORDINATED_VOTE_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(now);
+        env.storage().persistent().set(&history_key, &history);
 
         // Store raw vote and weight
         env.storage().persistent().set(&key, &support);
@@ -1832,17 +1888,6 @@ impl GovernanceContract {
         }
     }
 
-    fn compute_args_hash(env: &Env, args: &Vec<u64>) -> BytesN<32> {
-        let mut buf = Bytes::new(env);
-        for arg in args.iter() {
-            let b = arg.to_be_bytes();
-            for byte in b.iter() {
-                buf.push_back(*byte);
-            }
-        }
-        env.crypto().sha256(&buf).into()
-    }
-
     // ── Market control & decentralization protection ──────────────────────────
 
     /// Regulate market concentration based on on-chain network metrics.
@@ -1907,14 +1952,8 @@ impl GovernanceContract {
         }
 
         // 1. Concentration detection.
-        let new_members_per_day = if network_session_counts.len() > 0 {
-            network_session_counts.get(0).unwrap_or(0)
-        } else {
-            0
-        };
-        let distinct_sources = network_session_counts.len() as u32;
         let monitoring =
-            gov_detect_network_concentration(new_members_per_day, total_sessions, distinct_sources);
+            gov_detect_network_concentration(&network_session_counts, total_sessions);
         env.storage()
             .persistent()
             .set(&DataKey::GovDecentralizationRecord, &monitoring);
@@ -1932,18 +1971,9 @@ impl GovernanceContract {
             .unwrap_or(0);
         let competition = gov_assess_competition_barriers(
             &env,
-            CoordinationFlag {
-                suspicious: independent_mentor_count < total_active_mentors / 2,
-                risk_score: if independent_mentor_count < total_active_mentors / 2 { 70 } else { 20 },
-                repeated_pair_count: barrier_count,
-                clustered_timing_count: 0,
-            },
-            SocialProofRecord {
-                genuine: independent_mentor_count > total_active_mentors / 3,
-                gaming_risk_score: if independent_mentor_count < total_active_mentors / 3 { 60 } else { 10 },
-                distinct_endorser_bps: (independent_mentor_count * 10000) / total_active_mentors.max(1),
-                burst_count: 0,
-            },
+            independent_mentor_count,
+            total_active_mentors,
+            barrier_count,
         );
         env.storage()
             .persistent()
@@ -1958,36 +1988,21 @@ impl GovernanceContract {
         let fairness: MarketFairness = env
             .storage()
             .persistent()
-            .get(&DataKey::GovMarketFairnessRecord)
+            .get::<_, MarketFairness>(&DataKey::GovMarketFairnessRecord)
             .unwrap_or(MarketFairness {
-                access_granted: true,
-                restriction_reason: None,
-                review_required: false,
+                fair_pricing: true,
+                coordination_detected: false,
+                suspicious_price_moves: 0,
+                risk_score: 0,
             });
 
         // 4. Combined protection record.
         let protection = gov_compute_market_protection_intervention(
             &env,
-            PriceCoordinationFlag {
-                suspicious: false,
-                risk_score: 10,
-                matching_price_count: 0,
-                clustered_timing_count: 0,
-            },
-            MarketRateValidation {
-                within_bounds: true,
-                deviation_bps: 100,
-                inflated: false,
-            },
-            DemandAuthenticity {
-                genuine: true,
-                distinct_requester_bps: 8000,
-                artificial_risk_score: 10,
-                burst_count: 0,
-            },
-            1000i128, // benchmark_rate
-            500i128,  // floor
-            2000i128, // ceiling
+            &monitoring,
+            &competition,
+            &fairness,
+            7_200u64, // restoration cooldown: 2 hours
         );
         env.storage()
             .persistent()
@@ -2084,18 +2099,9 @@ impl GovernanceContract {
             .unwrap_or(0);
         let competition = gov_assess_competition_barriers(
             &env,
-            CoordinationFlag {
-                suspicious: independent_count < total_count / 2,
-                risk_score: if independent_count < total_count / 2 { 70 } else { 20 },
-                repeated_pair_count: barrier_signal_count,
-                clustered_timing_count: 0,
-            },
-            SocialProofRecord {
-                genuine: independent_count > total_count / 3,
-                gaming_risk_score: if independent_count < total_count / 3 { 60 } else { 10 },
-                distinct_endorser_bps: (independent_count * 10000) / total_count.max(1),
-                burst_count: 0,
-            },
+            independent_count,
+            total_count,
+            barrier_signal_count,
         );
         env.storage()
             .persistent()
@@ -2141,35 +2147,20 @@ impl GovernanceContract {
         let monitoring: DecentralizationMonitoring = env
             .storage()
             .persistent()
-            .get(&DataKey::GovDecentralizationRecord)
+            .get::<_, DecentralizationMonitoring>(&DataKey::GovDecentralizationRecord)
             .unwrap_or(DecentralizationMonitoring {
-                suspicious: false,
+                healthy: true,
+                hhi_score: 0,
+                dominant_share_bps: 0,
+                network_count: 0,
                 risk_score: 0,
-                repeated_pair_count: 0,
-                clustered_timing_count: 0,
             });
         let protection = gov_compute_market_protection_intervention(
             &env,
-            PriceCoordinationFlag {
-                suspicious: false,
-                risk_score: 20,
-                matching_price_count: 0,
-                clustered_timing_count: 0,
-            },
-            MarketRateValidation {
-                within_bounds: true,
-                deviation_bps: 150,
-                inflated: false,
-            },
-            DemandAuthenticity {
-                genuine: true,
-                distinct_requester_bps: 7500,
-                artificial_risk_score: 15,
-                burst_count: 0,
-            },
-            1000i128, // benchmark_rate
-            500i128,  // floor
-            2000i128, // ceiling
+            &monitoring,
+            &competition,
+            &fairness,
+            7_200u64, // restoration cooldown: 2 hours
         );
         env.storage()
             .persistent()
@@ -2275,7 +2266,7 @@ impl GovernanceContract {
     pub fn get_gov_decentralization(env: Env) -> DecentralizationMonitoring {
         env.storage()
             .persistent()
-            .get(&DataKey::GovDecentralizationRecord)
+            .get::<_, DecentralizationMonitoring>(&DataKey::GovDecentralizationRecord)
             .unwrap_or(DecentralizationMonitoring {
                 healthy: true,
                 hhi_score: 0,
@@ -2289,11 +2280,12 @@ impl GovernanceContract {
     pub fn get_gov_market_fairness(env: Env) -> MarketFairness {
         env.storage()
             .persistent()
-            .get(&DataKey::GovMarketFairnessRecord)
+            .get::<_, MarketFairness>(&DataKey::GovMarketFairnessRecord)
             .unwrap_or(MarketFairness {
-                access_granted: true,
-                restriction_reason: None,
-                review_required: false,
+                fair_pricing: true,
+                coordination_detected: false,
+                suspicious_price_moves: 0,
+                risk_score: 0,
             })
     }
 
@@ -2435,6 +2427,47 @@ impl GovernanceContract {
             (symbol_short!("govtx"), symbol_short!("flag_clr")),
             voter,
         );
+    }
+
+    /// Returns a paginated list of proposal IDs filtered by status.
+    ///
+    /// Used by governance UIs to show Active, Passed, Executed, or Failed proposals.
+    ///
+    /// # Arguments
+    /// * `status` - Proposal status to filter by (Active, Passed, Executed, etc.)
+    /// * `offset` - Starting index in the status-filtered list
+    /// * `limit` - Maximum results (clamped to MAX_PAGE_SIZE)
+    ///
+    /// # Returns
+    /// Vector of proposal IDs in the specified status, paginated.
+    pub fn get_proposals_by_status(
+        env: Env,
+        status: ProposalStatus,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        use shared::pagination::Pagination;
+
+        let total = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProposalStatusCount(status.clone()))
+            .unwrap_or(0);
+
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut result = vec![&env];
+
+        for idx in start..end {
+            if let Some(proposal_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::ProposalsByStatus(status.clone(), idx))
+            {
+                result.push_back(proposal_id);
+            }
+        }
+
+        result
     }
 }
 

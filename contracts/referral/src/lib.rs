@@ -1,6 +1,9 @@
 #![no_std]
 
-use shared::{pagination::Pagination, pause_guard::require_not_paused, ReentrancyGuard};
+use shared::{
+    assess_token_velocity, pagination::Pagination, pause_guard::require_not_paused,
+    EconomicVelocityReport, ReentrancyGuard,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec,
 };
@@ -31,6 +34,22 @@ pub struct ReferralRegisteredEventData {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewardClaimedEventData {
     pub amount: i128,
+}
+
+/// Emitted when `claim_reward` defers minting because referral mint velocity
+/// in the current window requires stabilization. The referrer's pending
+/// reward is left untouched so it can be claimed once the window resets.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityAlertEventData {
+    pub amount: i128,
+    /// Referral MNT minted in the current window, including `amount`.
+    pub window_minted: i128,
+    pub velocity_bps: u32,
+    pub concentration_bps: u32,
+    pub health_score: u32,
+    /// Timestamp at which the current velocity window ends.
+    pub retry_after: u64,
 }
 
 #[contracttype]
@@ -66,6 +85,10 @@ pub enum DataKey {
     PendingAdmin,
     /// Stores pending rewards deferred for manual review due to suspicious pattern.
     SuspiciousClaim(Address),
+    /// Total referral MNT minted in a velocity window (window id).
+    VelocityWindowMinted(u64),
+    /// Referral MNT minted to one referrer in a velocity window.
+    ReferrerWindowMinted(u64, Address),
 }
 
 const REWARD_MENTOR: i128 = 50 * 10_000_000; // 50 MNT (7 decimals)
@@ -77,6 +100,10 @@ const TOP_REFERRER_BONUS_COUNT: u32 = 3;
 
 const LEADERBOARD_MAX_SIZE: u32 = 10;
 
+/// Length of the session window over which referral mints are accumulated
+/// for the `assess_token_velocity` check in `claim_reward`.
+pub const REFERRAL_VELOCITY_WINDOW_SECS: u64 = 24 * 60 * 60; // 1 day
+
 /// Default config values used when none is set at initialize time.
 /// max_multiplier_bps = 20000 (2x), matching the leaderboard top tier.
 /// max_lifetime_reward = 10_000 MNT per referrer.
@@ -84,6 +111,16 @@ const LEADERBOARD_MAX_SIZE: u32 = 10;
 const DEFAULT_MAX_MULTIPLIER_BPS: u32 = 20_000;
 const DEFAULT_MAX_LIFETIME_REWARD: i128 = 10_000 * 10_000_000;
 const DEFAULT_GLOBAL_REFERRAL_MINT_CAP: i128 = 5_000_000 * 10_000_000;
+
+/// Absolute ceiling for `ReferralConfig::max_multiplier_bps` (30_000 bps = 3x).
+///
+/// Economic justification: the multiplier scales every referral reward before
+/// the per-address and global caps are applied. If an admin could set it
+/// arbitrarily high, a single referral tree could mint an unbounded amount of
+/// MNT in a handful of claims and drain the token supply. Capping the
+/// multiplier at 3x keeps referral emissions a bounded fraction of supply even
+/// in the worst case, while still leaving headroom above the 2x default.
+pub const ABSOLUTE_MAX_MULTIPLIER_BPS: u32 = 30_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,6 +244,9 @@ impl ReferralContract {
         if config.max_multiplier_bps == 0 {
             panic!("max_multiplier_bps must be > 0");
         }
+        if config.max_multiplier_bps > ABSOLUTE_MAX_MULTIPLIER_BPS {
+            panic!("MultiplierTooHigh");
+        }
         if config.max_lifetime_reward <= 0 {
             panic!("max_lifetime_reward must be positive");
         }
@@ -234,6 +274,26 @@ impl ReferralContract {
             .has(&DataKey::Referral(referee.clone()))
         {
             panic!("Referee already registered");
+        }
+
+        // Reject circular referral chains: the referee must not already be an
+        // ancestor of the referrer (e.g. A→B then B→A). Walk the referrer's
+        // chain, bounded to avoid unbounded loops on malformed data.
+        const MAX_REFERRAL_CHAIN_DEPTH: u32 = 64;
+        let mut current = referrer.clone();
+        for _ in 0..MAX_REFERRAL_CHAIN_DEPTH {
+            let info: ReferralInfo = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Referral(current.clone()))
+            {
+                Some(info) => info,
+                None => break,
+            };
+            if info.referrer == referee {
+                panic!("Circular referral detected");
+            }
+            current = info.referrer;
         }
 
         let referee_type = if is_mentor {
@@ -468,6 +528,29 @@ impl ReferralContract {
         }
         let actual_amount = actual_amount.min(global_remaining);
 
+        // --- velocity protection: defer bulk farming surges ---
+        let velocity = Self::assess_mint_velocity(&env, &referrer, actual_amount, &config);
+        if velocity.stabilization_required {
+            let window_end = (Self::velocity_window(&env) + 1)
+                .saturating_mul(REFERRAL_VELOCITY_WINDOW_SECS);
+            env.events().publish(
+                (
+                    Symbol::new(&env, "Referral"),
+                    Symbol::new(&env, "VelocityAlert"),
+                    referrer.clone(),
+                ),
+                VelocityAlertEventData {
+                    amount: actual_amount,
+                    window_minted: velocity.observed_volume,
+                    velocity_bps: velocity.velocity_bps,
+                    concentration_bps: velocity.concentration_bps,
+                    health_score: velocity.health_score,
+                    retry_after: window_end,
+                },
+            );
+            return;
+        }
+
         let client = mentorminds_mnt_token::MNTTokenClient::new(&env, &mnt_token);
         client.mint(&referrer, &total);
         if actual_amount <= 0 {
@@ -487,6 +570,7 @@ impl ReferralContract {
         env.storage()
             .instance()
             .set(&DataKey::GlobalMinted, &(global_minted + actual_amount));
+        Self::record_window_mint(&env, &referrer, actual_amount);
 
         env.events().publish(
             (
@@ -496,6 +580,68 @@ impl ReferralContract {
             ),
             RewardClaimedEventData { amount: actual_amount },
         );
+    }
+
+    // --- Mint velocity protection ---
+
+    fn velocity_window(env: &Env) -> u64 {
+        env.ledger().timestamp() / REFERRAL_VELOCITY_WINDOW_SECS
+    }
+
+    /// Score a prospective referral mint with `assess_token_velocity`.
+    ///
+    /// * circulating supply — the referral program's global mint budget.
+    /// * observed volume    — referral MNT minted this window plus `amount`.
+    /// * concentration      — share of that window volume going to `referrer`;
+    ///   a single address farming many completions scores high.
+    fn assess_mint_velocity(
+        env: &Env,
+        referrer: &Address,
+        amount: i128,
+        config: &ReferralConfig,
+    ) -> EconomicVelocityReport {
+        let window = Self::velocity_window(env);
+        let window_minted = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::VelocityWindowMinted(window))
+            .unwrap_or(0)
+            .saturating_add(amount);
+        let referrer_minted = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::ReferrerWindowMinted(window, referrer.clone()))
+            .unwrap_or(0)
+            .saturating_add(amount);
+        let concentration_bps = if window_minted > 0 && referrer_minted > 0 {
+            ((referrer_minted as u128).saturating_mul(10_000) / (window_minted as u128))
+                .min(10_000) as u32
+        } else {
+            0
+        };
+        assess_token_velocity(config.global_referral_mint_cap, window_minted, concentration_bps)
+    }
+
+    fn record_window_mint(env: &Env, referrer: &Address, amount: i128) {
+        let window = Self::velocity_window(env);
+        let total_key = DataKey::VelocityWindowMinted(window);
+        let referrer_key = DataKey::ReferrerWindowMinted(window, referrer.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let mine: i128 = env.storage().persistent().get(&referrer_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&total_key, &total.saturating_add(amount));
+        env.storage()
+            .persistent()
+            .set(&referrer_key, &mine.saturating_add(amount));
+    }
+
+    /// Referral MNT minted in the current velocity window.
+    pub fn get_window_minted(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VelocityWindowMinted(Self::velocity_window(&env)))
+            .unwrap_or(0)
     }
 
     // --- Epoch leaderboard ---
@@ -881,6 +1027,18 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "Circular referral detected")]
+    fn test_circular_referral_rejection() {
+        let f = TestFixture::setup();
+        let a = Address::generate(&f.env);
+        let b = Address::generate(&f.env);
+
+        // A refers B, then B tries to refer A — would form a two-hop cycle.
+        f.client().register_referral(&a, &b, &true);
+        f.client().register_referral(&b, &a, &true);
+    }
+
+    #[test]
     #[should_panic(expected = "Referee already registered")]
     fn test_duplicate_referral_rejection() {
         let f = TestFixture::setup();
@@ -1108,6 +1266,39 @@ mod test {
 
         let expected = (REWARD_MENTOR * 15_000) / 10_000;
         assert_eq!(f.mnt_client().balance(&referrer), expected);
+    }
+
+    /// Boundary: exactly ABSOLUTE_MAX_MULTIPLIER_BPS (30_000 = 3x) is accepted.
+    #[test]
+    fn test_set_config_accepts_absolute_max_multiplier() {
+        let f = TestFixture::setup();
+
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: ABSOLUTE_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        });
+
+        // Config was persisted with the boundary value.
+        let referrer = Address::generate(&f.env);
+        let referee = Address::generate(&f.env);
+        f.client().register_referral(&referrer, &referee, &true);
+        f.client().fulfill_referral(&referee);
+        f.client().claim_reward(&referrer);
+        assert_eq!(f.mnt_client().balance(&referrer), (REWARD_MENTOR * 30_000) / 10_000);
+    }
+
+    /// Boundary: one bps above ABSOLUTE_MAX_MULTIPLIER_BPS (30_001) is rejected.
+    #[test]
+    #[should_panic(expected = "MultiplierTooHigh")]
+    fn test_set_config_rejects_multiplier_above_absolute_max() {
+        let f = TestFixture::setup();
+
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: ABSOLUTE_MAX_MULTIPLIER_BPS + 1,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        });
     }
 
     /// Referrer cannot claim beyond max_lifetime_reward.
@@ -1381,5 +1572,88 @@ mod test {
             0,
             "Pending reward should be cleared"
         );
+    }
+
+    // --- Mint velocity protection tests (#1085) ---
+
+    /// Fixture with a small referral mint budget so a burst of completions
+    /// is a large share of it.
+    fn setup_velocity_fixture() -> TestFixture {
+        let f = TestFixture::setup();
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: 500 * 10_000_000,
+        });
+        f
+    }
+
+    /// Completes one mentor referral for `referrer` and claims the reward.
+    /// Returns true if the claim was deferred with a `VelocityAlert` event.
+    fn complete_and_claim(f: &TestFixture, referrer: &Address) -> bool {
+        let referee = Address::generate(&f.env);
+        f.client().register_referral(referrer, &referee, &true);
+        f.client().fulfill_referral(&referee);
+        f.client().claim_reward(referrer);
+
+        let events = f.env.events().all();
+        let last = events.last().unwrap();
+        last.1
+            == (
+                Symbol::new(&f.env, "Referral"),
+                Symbol::new(&f.env, "VelocityAlert"),
+                referrer.clone(),
+            )
+                .into_val(&f.env)
+    }
+
+    #[test]
+    fn test_rapid_referral_completions_trigger_velocity_alert() {
+        let f = setup_velocity_fixture();
+        let referrer = Address::generate(&f.env);
+
+        // Stay within the 5-referrals-per-epoch suspicious-pattern threshold so
+        // the velocity check is the guard that fires.
+        let mut deferred_on = None;
+        for i in 0..5 {
+            let minted_before = f.client().get_global_referral_minted();
+            let window_before = f.client().get_window_minted();
+            if complete_and_claim(&f, &referrer) {
+                // Nothing minted or recorded; reward stays pending.
+                assert_eq!(f.client().get_global_referral_minted(), minted_before);
+                assert_eq!(f.client().get_window_minted(), window_before);
+                assert!(f.client().get_pending_rewards(&referrer) > 0);
+                deferred_on = Some(i);
+                break;
+            }
+            assert_eq!(f.client().get_pending_rewards(&referrer), 0);
+        }
+
+        let deferred_on = deferred_on.expect("rapid completions should trigger a VelocityAlert");
+        assert!(deferred_on > 0, "a single claim should not trip velocity protection");
+    }
+
+    #[test]
+    fn test_velocity_deferred_reward_claimable_after_window_resets() {
+        let f = setup_velocity_fixture();
+        let referrer = Address::generate(&f.env);
+
+        let mut deferred = false;
+        for _ in 0..5 {
+            if complete_and_claim(&f, &referrer) {
+                deferred = true;
+                break;
+            }
+        }
+        assert!(deferred, "rapid completions should trigger a VelocityAlert");
+        assert!(f.client().get_pending_rewards(&referrer) > 0);
+
+        f.env
+            .ledger()
+            .with_mut(|li| li.timestamp += REFERRAL_VELOCITY_WINDOW_SECS);
+        f.client().claim_reward(&referrer);
+
+        assert_eq!(f.client().get_pending_rewards(&referrer), 0);
+        assert!(f.client().get_window_minted() > 0);
     }
 }

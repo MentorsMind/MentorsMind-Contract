@@ -8,3 +8,6 @@ target-dir = "target"
 # Using wasm32v1-none for Soroban SDK v25.3.2+ compatibility with Rust 1.84+
 [target.wasm32v1-none]
 rustflags = ["-C", "opt-level=z", "-C", "strip=symbols"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]

@@ -102,6 +102,15 @@ pub struct UserReputation {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForumStats {
+    pub total_posts: u32,
+    pub total_replies: u32,
+    pub active_posts: u32,
+    pub total_staked_mnt: i128,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
@@ -116,6 +125,10 @@ pub enum DataKey {
     CategoryPost(u32, u32), // category_id, post_id
     UserPost(Address, u32),
     UserReply(Address, u32),
+    TotalPosts,
+    TotalReplies,
+    ActivePosts,
+    TotalStakedMnt,
 }
 
 #[contract]
@@ -160,6 +173,10 @@ impl ForumContract {
             .set(&MODERATION_THRESHOLD, &mod_threshold);
         env.storage().persistent().set(&POST_COUNT, &0u32);
         env.storage().persistent().set(&CATEGORY_COUNT, &0u32);
+        env.storage().persistent().set(&DataKey::TotalPosts, &0u32);
+        env.storage().persistent().set(&DataKey::TotalReplies, &0u32);
+        env.storage().persistent().set(&DataKey::ActivePosts, &0u32);
+        env.storage().persistent().set(&DataKey::TotalStakedMnt, &0i128);
 
         // Create default categories
         Self::create_default_categories(&env);
@@ -247,6 +264,12 @@ impl ForumContract {
         env.storage()
             .persistent()
             .set(&DataKey::UserPost(author.clone(), count), &true);
+        let total_posts = env.storage().persistent().get(&DataKey::TotalPosts).unwrap_or(0u32);
+        env.storage().persistent().set(&DataKey::TotalPosts, &total_posts.checked_add(1).expect("total posts overflow"));
+        let active_posts = env.storage().persistent().get(&DataKey::ActivePosts).unwrap_or(0u32);
+        env.storage().persistent().set(&DataKey::ActivePosts, &active_posts.checked_add(1).expect("active posts overflow"));
+        let total_staked = env.storage().persistent().get(&DataKey::TotalStakedMnt).unwrap_or(0i128);
+        env.storage().persistent().set(&DataKey::TotalStakedMnt, &total_staked.checked_add(stake_amount).expect("total stake overflow"));
 
         // Update user reputation
         Self::update_user_reputation(&env, &author, |rep| UserReputation {
@@ -325,6 +348,10 @@ impl ForumContract {
         env.storage()
             .persistent()
             .set(&DataKey::Post(post_id), &updated_post);
+        let total_replies = env.storage().persistent().get(&DataKey::TotalReplies).unwrap_or(0u32);
+        env.storage().persistent().set(&DataKey::TotalReplies, &total_replies.checked_add(1).expect("total replies overflow"));
+        let total_staked = env.storage().persistent().get(&DataKey::TotalStakedMnt).unwrap_or(0i128);
+        env.storage().persistent().set(&DataKey::TotalStakedMnt, &total_staked.checked_add(stake_amount).expect("total stake overflow"));
 
         // Update user reputation
         Self::update_user_reputation(&env, &author, |rep| UserReputation {
@@ -563,7 +590,12 @@ impl ForumContract {
                 ModerationAction::Hide => post.status = PostStatus::Hidden,
                 ModerationAction::Lock => post.status = PostStatus::Locked,
                 ModerationAction::Delete => {
+                    let was_active = post.status == PostStatus::Active;
                     post.status = PostStatus::Deleted;
+                    if was_active {
+                        let active_posts = env.storage().persistent().get(&DataKey::ActivePosts).unwrap_or(0u32);
+                        env.storage().persistent().set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
+                    }
                     // Refund stakes proportionally
                     let refund_amount = post.stake_amount / 2;
                     Self::transfer_tokens(
@@ -664,6 +696,15 @@ impl ForumContract {
                 downvotes_received: 0,
                 moderation_actions: 0,
             })
+    }
+
+    pub fn get_forum_stats(env: Env) -> ForumStats {
+        ForumStats {
+            total_posts: env.storage().persistent().get(&DataKey::TotalPosts).unwrap_or(0),
+            total_replies: env.storage().persistent().get(&DataKey::TotalReplies).unwrap_or(0),
+            active_posts: env.storage().persistent().get(&DataKey::ActivePosts).unwrap_or(0),
+            total_staked_mnt: env.storage().persistent().get(&DataKey::TotalStakedMnt).unwrap_or(0),
+        }
     }
 
     pub fn get_posts_by_category(env: Env, category_id: u32, limit: u32) -> Vec<u32> {

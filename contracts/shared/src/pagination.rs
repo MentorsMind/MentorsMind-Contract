@@ -21,8 +21,13 @@
 
 use soroban_sdk::Env;
 
+/// Hard ceiling on the number of items a single view may return.
+///
+/// Liquidation bots and governance tooling enumerate positions off-chain, so a
+/// page must stay small enough to fit inside a single transaction's budget.
 pub const MAX_PAGE_SIZE: u32 = 50;
 
+/// Inclusive/exclusive page window helper shared by every paginated view.
 pub struct Pagination {
     pub offset: u32,
     pub limit: u32,
@@ -33,16 +38,6 @@ impl Pagination {
         Self { offset, limit }
     }
 
-/// Hard ceiling on the number of items a single view may return.
-///
-/// Liquidation bots and governance tooling enumerate positions off-chain, so a
-/// page must stay small enough to fit inside a single transaction's budget.
-pub const MAX_PAGE_SIZE: u32 = 50;
-
-/// Inclusive/exclusive page window helper shared by every paginated view.
-pub struct Pagination;
-
-impl Pagination {
     /// Clamps `limit` and resolves `(offset, offset + limit)` against `total`.
     ///
     /// Returns a half-open range `[start, end)` that is always within
@@ -89,19 +84,45 @@ pub trait BoundedIteration {
     }
 }
 
+/// Explicit ceiling on the number of units of work a single invocation may do.
+///
+/// Soroban contracts cannot inspect their own remaining CPU/memory budget at
+/// runtime (see the module docs), so loops over on-chain collections use an
+/// `OperationBudget` instead: call [`consume`](Self::consume) once before each
+/// unit of work and stop (or return a partial page) when it returns
+/// [`BudgetExceeded`].
+///
+/// ```ignore
+/// let mut budget = OperationBudget::new(MAX_PAGE_SIZE);
+/// for id in start..end {
+///     if budget.consume().is_err() {
+///         break;
+///     }
+///     // ... process `id` ...
+/// }
+/// ```
 pub struct OperationBudget {
+    /// Units of work already consumed in this invocation.
     consumed: u32,
+    /// Maximum units of work allowed; [`consume`](Self::consume) fails once reached.
     max: u32,
 }
 
+/// Returned by [`OperationBudget::consume`] when the budget's ceiling has
+/// already been reached. The caller should stop iterating.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BudgetExceeded;
 
 impl OperationBudget {
+    /// Creates a budget allowing at most `max` calls to [`consume`](Self::consume).
     pub fn new(max: u32) -> Self {
         Self { consumed: 0, max }
     }
 
+    /// Records one unit of work.
+    ///
+    /// Returns `Err(BudgetExceeded)` without changing state if `max` units have
+    /// already been consumed.
     pub fn consume(&mut self) -> Result<(), BudgetExceeded> {
         if self.consumed >= self.max {
             return Err(BudgetExceeded);
@@ -110,10 +131,12 @@ impl OperationBudget {
         Ok(())
     }
 
+    /// Units of work consumed so far.
     pub fn consumed(&self) -> u32 {
         self.consumed
     }
 
+    /// Units of work still available before [`consume`](Self::consume) fails.
     pub fn remaining(&self) -> u32 {
         self.max.saturating_sub(self.consumed)
     }
@@ -141,12 +164,48 @@ mod tests {
     }
 
     #[test]
-    fn operation_budget_allows_up_to_max() {
-        let mut budget = OperationBudget::new(3);
-        assert!(budget.consume().is_ok());
-        assert!(budget.consume().is_ok());
-        assert!(budget.consume().is_ok());
+    fn operation_budget_succeeds_exactly_max_times() {
+        let max = 3;
+        let mut budget = OperationBudget::new(max);
+
+        for _ in 0..max {
+            assert_eq!(budget.consume(), Ok(()));
+        }
+
+        assert_eq!(budget.consumed(), max);
+    }
+
+    #[test]
+    fn operation_budget_rejects_max_plus_one_consume() {
+        let max = 3;
+        let mut budget = OperationBudget::new(max);
+
+        for _ in 0..max {
+            budget.consume().unwrap();
+        }
+
         assert_eq!(budget.consume(), Err(BudgetExceeded));
-        assert_eq!(budget.consumed(), 3);
+        assert_eq!(budget.consumed(), max);
+    }
+
+    #[test]
+    fn operation_budget_with_zero_max_fails_immediately() {
+        let mut budget = OperationBudget::new(0);
+
+        assert_eq!(budget.consume(), Err(BudgetExceeded));
+        assert_eq!(budget.consumed(), 0);
+    }
+
+    #[test]
+    fn operation_budget_remaining_decrements_after_consumption() {
+        let mut budget = OperationBudget::new(3);
+
+        assert_eq!(budget.remaining(), 3);
+        budget.consume().unwrap();
+        assert_eq!(budget.remaining(), 2);
+        budget.consume().unwrap();
+        assert_eq!(budget.remaining(), 1);
+        budget.consume().unwrap();
+        assert_eq!(budget.remaining(), 0);
     }
 }

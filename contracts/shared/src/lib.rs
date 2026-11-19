@@ -79,17 +79,18 @@ pub mod bft_consensus;
 pub mod payment_integrity;
 pub mod threat_intelligence;
 pub mod tokenomics_protection;
+pub mod market_control_protection;
 
 // Content protection modules 
 pub mod content_protection;
 pub mod ip_verification; 
 pub mod usage_rights_management;
 
-pub use pagination::{Pagination, MAX_PAGE_SIZE};
+pub use pagination::{BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE};
 pub use pause_guard::{
-    is_paused, is_paused_local, pause, pause_guardian, pause_state, require_not_paused,
-    require_not_paused_local, require_pause_guardian, set_pause_guardian, set_paused, unpause,
-    PauseState,
+    is_paused, is_paused_local, pause, pause_guard_is_paused, pause_guardian, pause_state,
+    require_not_paused, require_not_paused_local, require_not_paused_locally,
+    require_pause_guardian, set_pause_guardian, set_paused, unpause, PauseState,
 };
 
 #[cfg(test)]
@@ -102,65 +103,85 @@ mod tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env};
 
+    #[soroban_sdk::contract]
+    struct DummyContract;
+    #[soroban_sdk::contractimpl]
+    impl DummyContract {}
+
+    fn test_env() -> (Env, Address) {
+        let env = Env::default();
+        let id = env.register_contract(None, DummyContract);
+        (env, id)
+    }
+
     // ── pause_guard ──────────────────────────────────────────────────────────
 
     #[test]
     fn pause_state_defaults_to_active() {
-        let env = Env::default();
-        assert_eq!(pause_state(&env), PauseState::Active);
-        assert!(!pause_guard_is_paused(&env));
-        assert!(!is_paused_local(&env));
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            assert_eq!(pause_state(&env), PauseState::Active);
+            assert!(!pause_guard_is_paused(&env));
+            assert!(!is_paused_local(&env));
+        });
     }
 
     #[test]
     fn pause_and_unpause_toggle_the_flag() {
-        let env = Env::default();
+        let (env, id) = test_env();
         env.mock_all_auths();
+        env.as_contract(&id, || {
+            let admin = Address::generate(&env);
+            let guardian = Address::generate(&env);
+            set_pause_guardian(&env, &admin, &guardian);
+            assert_eq!(pause_guardian(&env), Some(guardian.clone()));
 
-        let admin = Address::generate(&env);
-        let guardian = Address::generate(&env);
-        set_pause_guardian(&env, &admin, &guardian);
-        assert_eq!(pause_guardian(&env), Some(guardian.clone()));
+            pause(&env);
+            assert!(pause_guard_is_paused(&env));
+            require_pause_guardian(&env);
 
-        pause(&env);
-        assert!(pause_guard_is_paused(&env));
-        require_pause_guardian(&env);
+            unpause(&env);
+            assert!(!pause_guard_is_paused(&env));
+            assert!(!is_paused_local(&env));
+            require_pause_guardian(&env);
 
-        unpause(&env);
-        assert!(!pause_guard_is_paused(&env));
-        assert!(is_paused_local(&env));
-        require_pause_guardian(&env);
-
-        unpause(&env);
-        assert!(!is_paused_local(&env));
+            unpause(&env);
+            assert!(!is_paused_local(&env));
+        });
     }
 
     #[test]
     fn set_paused_writes_the_flag_without_auth() {
-        let env = Env::default();
-        set_paused(&env, true);
-        assert!(pause_guard_is_paused(&env));
-        set_paused(&env, false);
-        assert!(!pause_guard_is_paused(&env));
-        assert!(is_paused_local(&env));
-        set_paused(&env, false);
-        assert!(!is_paused_local(&env));
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            set_paused(&env, true);
+            assert!(pause_guard_is_paused(&env));
+            set_paused(&env, false);
+            assert!(!pause_guard_is_paused(&env));
+            assert!(!is_paused_local(&env));
+            set_paused(&env, false);
+            assert!(!is_paused_local(&env));
+        });
     }
 
     #[test]
     #[should_panic(expected = "contract paused")]
     fn require_not_paused_panics_while_paused() {
-        let env = Env::default();
-        set_paused(&env, true);
-        require_not_paused_locally(&env);
-        require_not_paused_local(&env);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            set_paused(&env, true);
+            require_not_paused_locally(&env);
+            require_not_paused_local(&env);
+        });
     }
 
     #[test]
     fn require_not_paused_passes_while_active() {
-        let env = Env::default();
-        require_not_paused_locally(&env);
-        require_not_paused_local(&env);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            require_not_paused_locally(&env);
+            require_not_paused_local(&env);
+        });
     }
 
     // ── pagination ───────────────────────────────────────────────────────────
@@ -204,112 +225,126 @@ mod tests {
 
     #[test]
     fn session_owner_is_recorded_and_read_back() {
-        let env = Env::default();
-        let mentor = Address::generate(&env);
-        let learner = Address::generate(&env);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let mentor = Address::generate(&env);
+            let learner = Address::generate(&env);
 
-        p::record_session_owner(&env, &learner, &mentor);
-        assert_eq!(p::session_owner(&env, &learner), Some(mentor));
+            p::record_session_owner(&env, &learner, &mentor);
+            assert_eq!(p::session_owner(&env, &learner), Some(mentor));
+        });
     }
 
     #[test]
     fn owner_read_is_not_a_leak() {
-        let env = Env::default();
-        let mentor = Address::generate(&env);
-        let learner = Address::generate(&env);
-        p::record_session_owner(&env, &learner, &mentor);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let mentor = Address::generate(&env);
+            let learner = Address::generate(&env);
+            p::record_session_owner(&env, &learner, &mentor);
 
-        let result = p::detect_cross_session_leak(&env, &mentor, &learner);
-        assert_eq!(result, p::CrossSessionLeakResult::NoLeak);
-        assert_eq!(result.severity(), 0);
+            let result = p::detect_cross_session_leak(&env, &mentor, &learner);
+            assert_eq!(result, p::CrossSessionLeakResult::NoLeak);
+            assert_eq!(result.severity(), 0);
+        });
     }
 
     #[test]
     fn learner_self_read_is_not_a_leak() {
-        let env = Env::default();
-        let mentor = Address::generate(&env);
-        let learner = Address::generate(&env);
-        p::record_session_owner(&env, &learner, &mentor);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let mentor = Address::generate(&env);
+            let learner = Address::generate(&env);
+            p::record_session_owner(&env, &learner, &mentor);
 
-        assert_eq!(
-            p::detect_cross_session_leak(&env, &learner, &learner),
-            p::CrossSessionLeakResult::NoLeak
-        );
+            assert_eq!(
+                p::detect_cross_session_leak(&env, &learner, &learner),
+                p::CrossSessionLeakResult::NoLeak
+            );
+        });
     }
 
     #[test]
     fn foreign_mentor_read_is_logged_as_a_leak() {
-        let env = Env::default();
-        let owner = Address::generate(&env);
-        let accessor = Address::generate(&env);
-        let learner = Address::generate(&env);
-        p::record_session_owner(&env, &learner, &owner);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let owner = Address::generate(&env);
+            let accessor = Address::generate(&env);
+            let learner = Address::generate(&env);
+            p::record_session_owner(&env, &learner, &owner);
 
-        let result = p::detect_cross_session_leak(&env, &accessor, &learner);
-        assert!(result.is_leak());
-        assert_eq!(result.severity(), 1);
-        assert_eq!(
-            result,
-            p::CrossSessionLeakResult::Leak(owner, accessor.clone(), 0)
-        );
+            let result = p::detect_cross_session_leak(&env, &accessor, &learner);
+            assert!(result.is_leak());
+            assert_eq!(result.severity(), 1);
+            assert_eq!(
+                result,
+                p::CrossSessionLeakResult::Leak(owner, accessor.clone(), 0)
+            );
+        });
     }
 
     #[test]
     fn repeat_foreign_reads_escalate_severity() {
-        let env = Env::default();
-        let owner = Address::generate(&env);
-        let accessor = Address::generate(&env);
-        let learner = Address::generate(&env);
-        p::record_session_owner(&env, &learner, &owner);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let owner = Address::generate(&env);
+            let accessor = Address::generate(&env);
+            let learner = Address::generate(&env);
+            p::record_session_owner(&env, &learner, &owner);
 
-        assert_eq!(
-            p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
-            1
-        );
-        assert_eq!(
-            p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
-            2
-        );
-        assert_eq!(
-            p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
-            3
-        );
+            assert_eq!(
+                p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
+                1
+            );
+            assert_eq!(
+                p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
+                2
+            );
+            assert_eq!(
+                p::detect_cross_session_leak(&env, &accessor, &learner).severity(),
+                3
+            );
 
-        let log = p::leak_log(&env);
-        assert_eq!(log.len(), 1);
-        assert_eq!(log.get(0).unwrap().hits, 3);
+            let log = p::leak_log(&env);
+            assert_eq!(log.len(), 1);
+            assert_eq!(log.get(0).unwrap().hits, 3);
+        });
     }
 
     #[test]
     fn contain_data_breach_lists_distinct_offenders() {
-        let env = Env::default();
-        let owner = Address::generate(&env);
-        let learner = Address::generate(&env);
-        let first = Address::generate(&env);
-        let second = Address::generate(&env);
-        p::record_session_owner(&env, &learner, &owner);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let owner = Address::generate(&env);
+            let learner = Address::generate(&env);
+            let first = Address::generate(&env);
+            let second = Address::generate(&env);
+            p::record_session_owner(&env, &learner, &owner);
 
-        p::detect_cross_session_leak(&env, &first, &learner);
-        p::detect_cross_session_leak(&env, &first, &learner);
-        p::detect_cross_session_leak(&env, &second, &learner);
+            p::detect_cross_session_leak(&env, &first, &learner);
+            p::detect_cross_session_leak(&env, &first, &learner);
+            p::detect_cross_session_leak(&env, &second, &learner);
 
-        let offenders = p::contain_data_breach(&env, &learner);
-        assert_eq!(offenders.len(), 2);
-        assert!(offenders.contains(&first));
-        assert!(offenders.contains(&second));
+            let offenders = p::contain_data_breach(&env, &learner);
+            assert_eq!(offenders.len(), 2);
+            assert!(offenders.contains(&first));
+            assert!(offenders.contains(&second));
+        });
     }
 
     #[test]
     fn breach_report_is_scoped_per_learner() {
-        let env = Env::default();
-        let learner_a = Address::generate(&env);
-        let learner_b = Address::generate(&env);
-        let accessor = Address::generate(&env);
+        let (env, id) = test_env();
+        env.as_contract(&id, || {
+            let learner_a = Address::generate(&env);
+            let learner_b = Address::generate(&env);
+            let accessor = Address::generate(&env);
 
-        p::detect_cross_session_leak(&env, &accessor, &learner_a);
+            p::detect_cross_session_leak(&env, &accessor, &learner_a);
 
-        assert_eq!(p::contain_data_breach(&env, &learner_a).len(), 1);
-        assert_eq!(p::contain_data_breach(&env, &learner_b).len(), 0);
+            assert_eq!(p::contain_data_breach(&env, &learner_a).len(), 1);
+            assert_eq!(p::contain_data_breach(&env, &learner_b).len(), 0);
+        });
     }
 }
 // Additional module declarations
@@ -382,9 +417,6 @@ pub use outcome_authenticity::{
     OUTCOME_BURST_WINDOW_SECS, OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_MIN_DISTINCT_BPS,
     OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
 };
-pub use pagination::{
-    BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
-};
 pub use params::{
     get_all_params, get_param, governance_admin_role, init_protocol_params, key_cooldown_days,
     key_interest_rate_bps, key_min_bond, key_min_credit_score, key_platform_fee_bps,
@@ -392,10 +424,6 @@ pub use params::{
     DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
     DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
     DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
-};
-pub use pause_guard::{
-    pause, pause_guard_is_paused, pause_guardian, pause_state, require_not_paused_locally,
-    require_pause_guardian, set_pause_guardian, set_paused, unpause, PauseState,
 };
 pub use pricing_protection::{
     compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,
@@ -525,7 +553,7 @@ pub use cross_contract_recovery::{
 // #866 — Cross-Chain State Synchronization
 // ---------------------------------------------------------------------------
 pub use cross_chain_sync::{
-    acknowledge_prepare, begin_atomic_xchain_op, compute_state_merkle_root, confirm_commit,
+    acknowledge_prepare, begin_atomic_xchain_op, cleanup_expired_op, compute_state_merkle_root, confirm_commit,
     confirm_rollback, expire_xchain_op, get_chain_isolation, get_inconsistency,
     get_xchain_op, initiate_rollback, is_chain_isolated, is_reorg_safe, isolate_chain,
     lift_chain_isolation, record_inconsistency, record_reorg_event, require_finality,
@@ -666,16 +694,18 @@ pub enum SharedError {
     ValidationError = 11,
     /// A cross-contract caller failed interface-registry verification.
     UnauthorizedContract = 12,
+    /// Division by zero attempted.
+    DivisionByZero = 13,
     /// Content access is denied due to insufficient permissions or invalid license.
-    ContentAccessDenied = 13,
+    ContentAccessDenied = 14,
     /// Intellectual property ownership cannot be verified or is disputed.
-    IPOwnershipInvalid = 14,
+    IPOwnershipInvalid = 15,
     /// Usage rights have been violated or exceeded allowed limits.
-    UsageRightsViolation = 15,
+    UsageRightsViolation = 16,
     /// Content encryption/decryption failed.
-    EncryptionError = 16,
+    EncryptionError = 17,
     /// Content piracy or unauthorized distribution detected.
-    PiracyDetected = 17,
+    PiracyDetected = 18,
 }
 
 // ---------------------------------------------------------------------------
@@ -804,3 +834,63 @@ pub use attack_detection::{
     evaluate_attack_risk, AttackDetectionResult, AttackEvent, AttackType,
     ATTACK_DETECTION_WINDOW_SECS, ATTACK_FLAG_THRESHOLD,
 };
+
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L2Integration {
+    pub network_id: u32,
+    pub finality_delay_secs: u64,
+    pub challenge_period_secs: u64,
+    pub last_l2_block: u64,
+    pub last_l1_commitment: u64,
+    pub emergency_shutdown: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossLayerAuditLog {
+    pub operation_id: BytesN<32>,
+    pub contract_id: Address,
+    pub source_layer: Symbol,
+    pub target_layer: Symbol,
+    pub synchronized: bool,
+    pub observed_at: u64,
+}
+
+pub fn l2_finality_reached(env: &Env, integration: &L2Integration, l2_block_age_secs: u64) -> bool {
+    !integration.emergency_shutdown
+        && l2_block_age_secs >= integration.finality_delay_secs + integration.challenge_period_secs
+        && env.ledger().timestamp() >= integration.last_l1_commitment
+}
+
+pub fn record_cross_layer_audit(
+    env: &Env,
+    contract_id: &Address,
+    operation_id: &BytesN<32>,
+    source_layer: Symbol,
+    target_layer: Symbol,
+    synchronized: bool,
+) -> CrossLayerAuditLog {
+    let log = CrossLayerAuditLog {
+        operation_id: operation_id.clone(),
+        contract_id: contract_id.clone(),
+        source_layer,
+        target_layer,
+        synchronized,
+        observed_at: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (symbol_short!("xl"), symbol_short!("audit")),
+        (
+            log.operation_id.clone(),
+            log.contract_id.clone(),
+            log.source_layer.clone(),
+            log.target_layer.clone(),
+            log.synchronized,
+            log.observed_at,
+        ),
+    );
+    log
+}

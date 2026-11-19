@@ -23,7 +23,6 @@
 //! cryptographic verification, selective redaction, consent management,
 //! and role-based access control.
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
     compute_justice_intervention, ensure_dispute_independence as shared_ensure_dispute_independence,
@@ -1628,6 +1627,90 @@ mod tests {
         let events = env.events().all();
         let last = events.last().unwrap();
         assert_eq!(last.1, (Symbol::new(&env, "dispute_appealed"), 1u64).into_val(&env));
+    }
+
+    #[test]
+    fn test_submission_cooldown_enforced() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission should succeed
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Immediate resubmission should fail with cooldown error
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        assert_eq!(
+            client.try_submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None),
+            Err(Ok(Error::SubmissionCooldown))
+        );
+
+        // Advance time past cooldown
+        env.ledger().with_mut(|li| li.timestamp += SUBMISSION_COOLDOWN_SECS);
+
+        // Now resubmission should succeed
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify we have 2 evidence items
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn test_submission_cooldown_can_be_disabled() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        // Disable cooldown
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Immediate resubmission should now succeed
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify we have 2 evidence items
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn test_cooldown_blocks_resubmission_within_one_hour() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission succeeds
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Second submission immediately should fail with cooldown error
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        assert_eq!(
+            client.try_submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None),
+            Err(Ok(Error::SubmissionCooldown))
+        );
+
+        // Advance time past cooldown (3600 seconds = 1 hour)
+        env.ledger().with_mut(|li| li.timestamp += SUBMISSION_COOLDOWN_SECS);
+
+        // Now resubmission succeeds
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify both submissions are recorded
+        assert_eq!(client.get_evidence_count(&1), 2);
     }
 
     #[test]

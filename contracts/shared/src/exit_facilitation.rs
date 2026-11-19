@@ -3,7 +3,7 @@
 //! Provides seamless data portability, switching cost minimization,
 //! competition protection, and ecosystem lock-in prevention.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
 
 /// Maximum acceptable switching cost (basis points, where 10000 = 100%)
 pub const MAX_SWITCHING_COST_BPS: u32 = 1500; // 15% max friction
@@ -60,7 +60,7 @@ pub fn validate_dependency_necessity(
 ) -> DependencyValidationResult {
     let is_artificial_lock_in = !is_core_protocol && !has_open_standard && switching_cost_bps > MAX_SWITCHING_COST_BPS;
     DependencyValidationResult {
-        dependency_id: Symbol::short("DEP_EVAL"),
+        dependency_id: symbol_short!("DEP_EVAL"),
         is_necessary: is_core_protocol || has_open_standard,
         is_artificial_lock_in,
     }

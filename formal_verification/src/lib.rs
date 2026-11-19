@@ -86,4 +86,89 @@ mod proofs {
         kani::assume(dishonest.saturating_sub((penalty.saturating_mul(probability as i128)) / 10_000) > honest);
         assert!(!honest_strategy_is_compatible(honest, dishonest, probability, penalty));
     }
+
+    // Issue #1254: temporal_progress Kani proofs
+    #[kani::proof]
+    fn temporal_progress_same_timestamp_is_always_true() {
+        let a: u64 = kani::any();
+        let max_age: u64 = kani::any();
+        assert!(temporal_progress(a, a, max_age));
+    }
+
+    #[kani::proof]
+    fn temporal_progress_zero_max_age_only_accepts_equal_timestamps() {
+        let a: u64 = kani::any();
+        let b: u64 = kani::any();
+        let result = temporal_progress(a, b, 0);
+        if a == b {
+            assert!(result);
+        } else {
+            assert!(!result);
+        }
+    }
+
+    #[kani::proof]
+    fn temporal_progress_rejects_backwards_time() {
+        assert!(!temporal_progress(10, 5, 100));
+    }
+
+    // Issue #1255: honest_strategy_is_compatible Kani proofs
+    #[kani::proof]
+    fn honest_strategy_compatible_with_perfect_detection() {
+        let honest_payoff: i128 = kani::any();
+        let dishonest_payoff: i128 = kani::any();
+        let penalty: i128 = kani::any();
+        kani::assume(penalty >= 0);
+        kani::assume(honest_payoff >= dishonest_payoff - penalty);
+        assert!(honest_strategy_is_compatible(honest_payoff, dishonest_payoff, 10_000, penalty));
+    }
+
+    #[kani::proof]
+    fn honest_strategy_rejects_invalid_detection_probability() {
+        let honest_payoff: i128 = kani::any();
+        let dishonest_payoff: i128 = kani::any();
+        let detection_probability_bps: u128 = kani::any();
+        let penalty: i128 = kani::any();
+        kani::assume(detection_probability_bps > 10_000);
+        assert!(!honest_strategy_is_compatible(honest_payoff, dishonest_payoff, detection_probability_bps, penalty));
+    }
+
+    #[kani::proof]
+    fn honest_strategy_rejects_negative_penalty() {
+        let honest_payoff: i128 = kani::any();
+        let dishonest_payoff: i128 = kani::any();
+        let detection_probability_bps: u128 = kani::any();
+        let penalty: i128 = kani::any();
+        kani::assume(penalty < 0);
+        assert!(!honest_strategy_is_compatible(honest_payoff, dishonest_payoff, detection_probability_bps, penalty));
+    }
+
+    // Issue #1256: rewards_conserved Kani proofs
+    #[kani::proof]
+    fn rewards_conserved_exact_match_is_always_true() {
+        let total: u128 = kani::any();
+        let allocations = [total];
+        assert!(rewards_conserved(total, &allocations));
+    }
+
+    #[kani::proof]
+    fn rewards_conserved_rejects_excess_over_tolerance() {
+        let total: u128 = kani::any();
+        kani::assume(total <= u128::MAX - 2);
+        let allocations = [total + 2];
+        assert!(!rewards_conserved(total, &allocations));
+    }
+
+    #[kani::proof]
+    fn rewards_conserved_overflow_safety() {
+        let a: u128 = kani::any();
+        let b: u128 = kani::any();
+        let c: u128 = kani::any();
+        let allocations = [a, b, c];
+        let total: u128 = kani::any();
+        // This proof verifies that rewards_conserved handles overflow correctly
+        // by returning false when checked_add would overflow
+        let _ = rewards_conserved(total, &allocations);
+        // If we reach here without panic, overflow is handled safely
+    }
 }

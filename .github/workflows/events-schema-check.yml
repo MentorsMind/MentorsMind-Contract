@@ -1,0 +1,35 @@
+name: Events Schema Check
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'contracts/shared/src/events.rs'
+      - 'events_schema.json'
+      - 'scripts/check_events_schema.py'
+      - '.github/workflows/events-schema-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/shared/src/events.rs'
+      - 'events_schema.json'
+      - 'scripts/check_events_schema.py'
+  workflow_dispatch:
+
+jobs:
+  events-schema:
+    name: Validate events_schema.json against events.rs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check every event in events.rs has a schema entry
+        run: python3 scripts/check_events_schema.py

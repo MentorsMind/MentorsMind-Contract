@@ -20,6 +20,7 @@ pub enum PenaltyTier {
     Warning,
     TemporarySuspension,
     PermanentBan,
+    Permanent,
 }
 
 #[contracttype]
@@ -121,7 +122,9 @@ pub fn detect_fee_evasion(
     let deviation_bps = dev as u32;
 
     let is_evading = deviation_bps > FEE_EVASION_TOLERANCE_BPS;
-    let penalty = if deviation_bps > 5000 {
+    let penalty = if deviation_bps >= 8000 {
+        PenaltyTier::Permanent
+    } else if deviation_bps > 5000 {
         PenaltyTier::TemporarySuspension
     } else if is_evading {
         PenaltyTier::Warning

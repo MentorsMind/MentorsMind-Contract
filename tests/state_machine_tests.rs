@@ -43,6 +43,7 @@ fn test_governance_state_machine_transitions() {
     let states = [
         ProposalStatus::Active,
         ProposalStatus::Passed,
+        ProposalStatus::Queued,
         ProposalStatus::Failed,
         ProposalStatus::Executed,
         ProposalStatus::Cancelled,
@@ -56,7 +57,9 @@ fn test_governance_state_machine_transitions() {
                 (ProposalStatus::Active, ProposalStatus::Passed)
                     | (ProposalStatus::Active, ProposalStatus::Failed)
                     | (ProposalStatus::Active, ProposalStatus::Cancelled)
+                    | (ProposalStatus::Passed, ProposalStatus::Queued)
                     | (ProposalStatus::Passed, ProposalStatus::Executed)
+                    | (ProposalStatus::Queued, ProposalStatus::Executed)
             );
             assert_eq!(
                 is_valid, expected_valid,
@@ -64,6 +67,44 @@ fn test_governance_state_machine_transitions() {
                 from, to
             );
         }
+    }
+}
+
+#[test]
+fn test_governance_passed_to_queued_is_valid() {
+    let env = Env::default();
+    assert!(ProposalStatus::is_valid_transition(
+        &env,
+        &ProposalStatus::Passed,
+        &ProposalStatus::Queued
+    ));
+}
+
+#[test]
+fn test_governance_queued_to_executed_is_valid() {
+    let env = Env::default();
+    assert!(ProposalStatus::is_valid_transition(
+        &env,
+        &ProposalStatus::Queued,
+        &ProposalStatus::Executed
+    ));
+}
+
+#[test]
+fn test_governance_invalid_transitions_from_queued() {
+    let env = Env::default();
+    for to in [
+        ProposalStatus::Active,
+        ProposalStatus::Passed,
+        ProposalStatus::Queued,
+        ProposalStatus::Failed,
+        ProposalStatus::Cancelled,
+    ] {
+        assert!(
+            !ProposalStatus::is_valid_transition(&env, &ProposalStatus::Queued, &to),
+            "Queued -> {:?} must be rejected",
+            to
+        );
     }
 }
 
@@ -247,4 +288,60 @@ fn test_isa_state_machine_transitions() {
             );
         }
     }
+}
+
+#[test]
+fn test_atomic_transition_escrow_valid() {
+    let env = Env::default();
+    let result = EscrowStatus::atomic_transition(
+        &env,
+        &EscrowStatus::Pending,
+        &EscrowStatus::Active,
+        false,
+        false,
+    );
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), EscrowStatus::Active);
+}
+
+#[test]
+fn test_atomic_transition_escrow_invalid() {
+    let env = Env::default();
+    let result = EscrowStatus::atomic_transition(
+        &env,
+        &EscrowStatus::Released,
+        &EscrowStatus::Pending,
+        false,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "Invalid state transition");
+}
+
+#[test]
+fn test_atomic_transition_proposal_valid() {
+    let env = Env::default();
+    let result = ProposalStatus::atomic_transition(
+        &env,
+        &ProposalStatus::Active,
+        &ProposalStatus::Passed,
+        false,
+        false,
+    );
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), ProposalStatus::Passed);
+}
+
+#[test]
+fn test_atomic_transition_proposal_invalid() {
+    let env = Env::default();
+    let result = ProposalStatus::atomic_transition(
+        &env,
+        &ProposalStatus::Executed,
+        &ProposalStatus::Passed,
+        false,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "Invalid state transition");
 }

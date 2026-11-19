@@ -115,6 +115,7 @@ Most of the “how it works” knowledge lives under `docs/` and the key root ma
 - `ARCHITECTURE.md` – security + upgrade architecture, system diagrams references, fee strategy
 - `LOCAL_DEVELOPMENT.md` – local Docker-based environment setup and test accounts
 - `docs/TYPES.md` – all contract types, enums, and structs with field constraints, usage examples, and type-relationship diagrams
+- `docs/events.md` – standardized event schema reference with topic layout, event types per contract, and contributor guidelines
 - `docs/DEPLOYMENT_GUIDE.md` – deployment + initialization parameters and script usage
 - `docs/STATE_MACHINE.md` and `docs/state-machines.md` – state transition rules and diagrams
 - `docs/TROUBLESHOOTING.md` – operational issues and quick fixes
@@ -241,3 +242,11 @@ See `CONTRIBUTING.md` for workflow guidelines.
 ## 13. License
 
 MIT License (see `LICENSE` if present in the repository).
+
+## Handsoff notes
+
+<!-- handsoff-issue-1029 -->
+- #1029: Add OperationBudget usage to  lib.rs  proposal iteration loops
+
+<!-- handsoff-issue-1030 -->
+- #1030: Add get_schedule_page paginated view to  lib.rs

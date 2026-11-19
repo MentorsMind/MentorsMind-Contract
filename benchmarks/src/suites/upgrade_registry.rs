@@ -41,6 +41,10 @@ impl Fixture {
         env.mock_all_auths();
         env.ledger().with_mut(|li| li.timestamp = 14_400);
 
+        // Contract uploads are expensive; lift the test budget ceiling so the
+        // fixture setup doesn't abort before measurement begins.
+        env.cost_estimate().budget().reset_unlimited();
+
         let registry_id = env.register(UpgradeRegistryContract, ());
         let admin = Address::generate(&env);
         let signer1 = Address::generate(&env);

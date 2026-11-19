@@ -1,5 +1,77 @@
 //! Enhanced RAII reentrancy guard for Soroban contracts with cross-contract
 //! protection, state validation, rollback mechanisms, and emergency pause.
+//!
+//! # Guard model
+//!
+//! [`ReentrancyGuard`] is a named, storage-backed mutex that follows the RAII
+//! pattern:
+//!
+//! 1. **Acquire** — [`ReentrancyGuard::enter`] (or
+//!    [`ReentrancyGuard::enter_with_caller`]) sets an instance-storage flag
+//!    keyed by `("RGUARD", lock_name)`. Distinct lock names are independent,
+//!    so a contract can protect unrelated entry points with separate locks.
+//! 2. **Hold** — while the returned guard is alive, any attempt to enter the
+//!    *same* lock name is treated as a reentrant call.
+//! 3. **Release** — the lock is cleared when the guard is dropped (end of
+//!    scope, early `return`, or `?`), or explicitly via
+//!    [`ReentrancyGuard::release`]. Release is idempotent.
+//!
+//! Bind the guard to a named variable (`let _guard = ...`). Binding it to a
+//! bare `_` drops it immediately, releasing the lock before the protected
+//! code runs.
+//!
+//! ```ignore
+//! pub fn withdraw(env: Env, user: Address, amount: i128) -> Result<(), Error> {
+//!     let _guard = ReentrancyGuard::enter(&env, symbol_short!("withdraw"));
+//!     // ... checks, effects, then external interactions ...
+//!     Ok(())
+//! } // lock released here
+//! ```
+//!
+//! ## What happens on reentry
+//!
+//! A reentrant `enter` is not just rejected; it is treated as an attack:
+//!
+//! * the offending lock **and** a global pause flag are set,
+//! * the caller address (if known) is recorded, retrievable via
+//!   [`ReentrancyGuard::get_last_attacker`],
+//! * `("rg", "paused", lock)` and `("rg", "attempt", lock)` events are
+//!   emitted, and
+//! * the call panics.
+//!
+//! Because Soroban reverts all storage writes of a failed invocation, the
+//! pause flags only persist if the reentrancy is detected in a frame whose
+//! failure does not unwind the whole transaction. Once persisted, every
+//! later `enter` on any lock panics until an admin calls
+//! [`ReentrancyGuard::admin_resume`]. Check state with
+//! [`ReentrancyGuard::is_paused`].
+//!
+//! ## Cross-contract caller tracking
+//!
+//! [`ReentrancyGuard::enter_with_caller`] also pushes the caller onto a
+//! bounded caller stack (maximum depth 8). Entering when the stack is full
+//! panics, and so does a caller that already appears on a stack of depth 2
+//! or more (a circular `A -> B -> A` call pattern).
+//!
+//! ## State checksum
+//!
+//! On entry the guard records a lightweight checksum. On release, a
+//! `("rg", "state_chg", lock)` event is emitted if it differs. The checksum
+//! is derived only from ledger timestamp and sequence, so it is an audit
+//! signal, **not** a validation of contract storage.
+//!
+//! ## Events
+//!
+//! All events use the topic prefix `"rg"`: `entered`, `exited`,
+//! `state_chg`, `paused`, `attempt`, `resumed`.
+//!
+//! # Other items
+//!
+//! * [`AtomicBatch`] / [`BatchOp`] — ordered, fail-fast batching of
+//!   transfers and invocations. See [`AtomicBatch`] for the atomicity model.
+//! * [`StateSnapshot`] — ledger-monotonicity check across a call.
+//! * [`validate_caller_is_authorized`], [`validate_amount_limits`] — small
+//!   stateless helpers.
 
 #![allow(unused_imports)]
 
@@ -11,14 +83,32 @@ const PAUSE_TRIGGERED_KEY: Symbol = symbol_short!("RG_PAUSE");
 const LAST_ATTACKER_KEY: Symbol = symbol_short!("RG_ATK");
 const MAX_CALLER_DEPTH: u32 = 8;
 
+/// Details of a detected reentrancy attempt.
+///
+/// Built internally when a reentrant or circular call is detected. Its
+/// `lock_name`, `timestamp` and `ledger_seq` are published in the
+/// `("rg", "attempt", lock_name)` event. The attacker address is stored
+/// separately and exposed through [`ReentrancyGuard::get_last_attacker`].
 #[derive(Clone)]
 pub struct ReentrancyAttemptLog {
+    /// Address that triggered the attempt, if the guard was entered with
+    /// [`ReentrancyGuard::enter_with_caller`].
     pub attacker: Option<Address>,
+    /// Lock the attempt targeted (`"call_loop"` for circular caller
+    /// patterns).
     pub lock_name: Symbol,
+    /// Ledger timestamp at detection.
     pub timestamp: u64,
+    /// Ledger sequence number at detection.
     pub ledger_seq: u32,
 }
 
+/// RAII reentrancy lock over a named storage slot.
+///
+/// Acquired with [`enter`](Self::enter) or
+/// [`enter_with_caller`](Self::enter_with_caller), released on drop or with
+/// [`release`](Self::release). See the [module docs](self) for the full
+/// guard model, pause behaviour and events.
 pub struct ReentrancyGuard<'a> {
     env: &'a Env,
     lock_name: Symbol,
@@ -28,10 +118,26 @@ pub struct ReentrancyGuard<'a> {
 }
 
 impl<'a> ReentrancyGuard<'a> {
+    /// Acquire the lock named `lock_name`.
+    ///
+    /// # Panics
+    ///
+    /// * If this lock or the global pause is active.
+    /// * If the lock is already held. This also triggers the emergency pause.
     pub fn enter(env: &'a Env, lock_name: Symbol) -> Self {
         Self::enter_internal(env, lock_name, None)
     }
 
+    /// Acquire the lock named `lock_name` and push `caller` onto the
+    /// cross-contract caller stack.
+    ///
+    /// # Panics
+    ///
+    /// Everything [`enter`](Self::enter) panics on, plus:
+    ///
+    /// * The caller stack is already at maximum depth (8).
+    /// * `caller` already appears on a stack of depth 2 or more (a circular
+    ///   call). This also triggers the emergency pause under `"call_loop"`.
     pub fn enter_with_caller(env: &'a Env, lock_name: Symbol, caller: Address) -> Self {
         Self::enter_internal(env, lock_name, Some(caller))
     }
@@ -74,6 +180,11 @@ impl<'a> ReentrancyGuard<'a> {
         }
     }
 
+    /// Release the lock now instead of at end of scope.
+    ///
+    /// This consumes the guard, and the later drop does nothing. Use it to
+    /// release the lock before non-reentrancy-sensitive work at the end of a
+    /// function.
     pub fn release(mut self) {
         self.do_release();
     }
@@ -218,6 +329,11 @@ impl<'a> ReentrancyGuard<'a> {
         }
     }
 
+    /// Whether an emergency pause is active.
+    ///
+    /// `Some(lock)` checks that lock's pause flag only. `None` checks the
+    /// global flag. Note that [`enter`](Self::enter) refuses to proceed if
+    /// *either* flag is set.
     pub fn is_paused(env: &Env, lock_name: Option<Symbol>) -> bool {
         if let Some(name) = lock_name {
             let pause_key = (PAUSE_TRIGGERED_KEY, name);
@@ -228,6 +344,15 @@ impl<'a> ReentrancyGuard<'a> {
         }
     }
 
+    /// Clear an emergency pause and emit `("rg", "resumed", ...)`.
+    ///
+    /// `Some(lock)` clears that lock's flag. `None` clears the global flag.
+    /// A triggered pause sets **both**, so fully resuming a lock takes two
+    /// calls.
+    ///
+    /// This only calls `admin.require_auth()`. It does **not** check that
+    /// `admin` is actually the contract's admin, so the calling contract
+    /// must do that before invoking this.
     pub fn admin_resume(env: &Env, admin: &Address, lock_name: Option<Symbol>) {
         admin.require_auth();
         if let Some(name) = lock_name {
@@ -247,6 +372,9 @@ impl<'a> ReentrancyGuard<'a> {
         }
     }
 
+    /// Address recorded for the most recent reentrancy attempt on
+    /// `lock_name`, or `None` if none was recorded. Use `"call_loop"` for
+    /// circular caller detections.
     pub fn get_last_attacker(env: &Env, lock_name: Symbol) -> Option<Address> {
         let attacker_key = (LAST_ATTACKER_KEY, lock_name);
         env.storage().instance().get(&attacker_key)
@@ -265,19 +393,55 @@ impl Drop for ReentrancyGuard<'_> {
 /// gas limit mid-execution (#831/#830).
 pub const MAX_BATCH_SIZE: u32 = 100;
 
+/// A single operation queued in an [`AtomicBatch`].
+///
+/// Both variants are **positional tuples**, and field order matters. Several
+/// fields share a type (`Transfer` has three `Address`es in a row), so the
+/// compiler will not catch a pattern that binds them in the wrong order.
+/// Always destructure in the documented order and name bindings after the
+/// fields:
+///
+/// ```ignore
+/// match op {
+///     BatchOp::Transfer(token, from, to, amount, _executed) => { /* ... */ }
+///     BatchOp::Invoke(contract, function, _executed) => { /* ... */ }
+/// }
+/// ```
+///
+/// Prefer [`AtomicBatch::add_transfer`] / [`AtomicBatch::add_invoke`] over
+/// constructing variants by hand. Their parameters are named.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum BatchOp {
-    /// (token, from, to, amount, executed)
+    /// Token transfer: `(token, from, to, amount, executed)`.
+    ///
+    /// * `.0 token: Address`: token contract (SEP-41) to transfer.
+    /// * `.1 from: Address`: account debited. Must authorise the transfer.
+    /// * `.2 to: Address`: account credited.
+    /// * `.3 amount: i128`: amount in the token's smallest unit.
+    /// * `.4 executed: bool`: reserved status flag. It is always `false`
+    ///   when queued via [`AtomicBatch::add_transfer`], and
+    ///   [`AtomicBatch::execute_all`] does **not** update it, so do not
+    ///   rely on it to tell which operations ran.
     Transfer(Address, Address, Address, i128, bool),
-    /// (contract, function, executed)
+    /// Cross-contract call: `(contract, function, executed)`.
+    ///
+    /// * `.0 contract: Address`: contract to invoke.
+    /// * `.1 function: Symbol`: name of the function to call on `contract`.
+    /// * `.2 executed: bool`: reserved status flag, same caveat as
+    ///   `Transfer`'s.
+    ///
+    /// No arguments are carried. The executor passed to
+    /// [`AtomicBatch::execute_all`] decides how `function` is called.
     Invoke(Address, Symbol, bool),
 }
 
 /// Error returned by [`AtomicBatch::validate`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BatchValidationError {
+    /// The batch contains no operations.
     Empty,
+    /// The batch contains more than [`MAX_BATCH_SIZE`] operations.
     TooLarge,
 }
 
@@ -303,6 +467,36 @@ pub enum BatchValidationError {
 /// entry point (e.g. with `?`). Catching the error and returning `Ok`
 /// anyway would commit whatever ran before the failure, defeating the
 /// all-or-nothing contract this type exists to provide.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut batch = AtomicBatch::new(&env);
+/// batch.add_transfer(token.clone(), treasury.clone(), alice, 100);
+/// batch.add_transfer(token, treasury, bob, 50);
+/// batch.validate().map_err(|_| Error::InvalidBatch)?;
+/// batch.execute_all(|env, op| match op {
+///     BatchOp::Transfer(token, from, to, amount, _executed) => {
+///         token::Client::new(env, token).transfer(from, to, amount);
+///         Ok(())
+///     }
+///     BatchOp::Invoke(..) => Err(Error::Unsupported),
+/// })?; // propagate, or the batch is not atomic
+/// ```
+///
+/// # Failure reporting
+///
+/// On the first failing operation, `execute_all` emits
+/// `("batch", "failed") -> (executed_count, total, timestamp)` and returns
+/// the executor's error. If the error is propagated, the host reverts storage
+/// writes but keeps no events from the failed invocation, so this event is
+/// mainly visible in simulation and diagnostics.
+///
+/// # Composing with [`ReentrancyGuard`]
+///
+/// Executors usually make external calls. Hold a [`ReentrancyGuard`] around
+/// `execute_all` so a malicious token or target contract cannot re-enter the
+/// batching entry point mid-batch.
 pub struct AtomicBatch<'a> {
     env: &'a Env,
     ops: Vec<BatchOp>,
@@ -310,6 +504,7 @@ pub struct AtomicBatch<'a> {
 }
 
 impl<'a> AtomicBatch<'a> {
+    /// Create an empty batch bound to `env`.
     pub fn new(env: &'a Env) -> Self {
         Self {
             env,
@@ -318,6 +513,8 @@ impl<'a> AtomicBatch<'a> {
         }
     }
 
+    /// Queue a [`BatchOp::Transfer`] of `amount` of `token` from `from` to
+    /// `to`, and return its zero-based index in the batch.
     pub fn add_transfer(
         &mut self,
         token: Address,
@@ -330,6 +527,8 @@ impl<'a> AtomicBatch<'a> {
         idx
     }
 
+    /// Queue a [`BatchOp::Invoke`] of `function` on `contract`, and return
+    /// its zero-based index in the batch.
     pub fn add_invoke(&mut self, contract: Address, function: Symbol) -> u32 {
         let idx = self.ops.len();
         self.ops.push_back(BatchOp::Invoke(contract, function, false));
@@ -385,15 +584,21 @@ impl<'a> AtomicBatch<'a> {
         );
     }
 
+    /// Number of queued operations.
     pub fn len(&self) -> u32 {
         self.ops.len()
     }
 
+    /// Whether no operations have been queued.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 }
 
+/// Ledger timestamp and sequence captured at a point in execution.
+///
+/// [`verify`](Self::verify) checks that neither value has gone backwards
+/// since capture. It does **not** snapshot or compare contract storage.
 pub struct StateSnapshot<'a> {
     env: &'a Env,
     timestamp: u64,
@@ -401,6 +606,7 @@ pub struct StateSnapshot<'a> {
 }
 
 impl<'a> StateSnapshot<'a> {
+    /// Record the current ledger timestamp and sequence.
     pub fn capture(env: &'a Env) -> Self {
         Self {
             env,
@@ -409,6 +615,8 @@ impl<'a> StateSnapshot<'a> {
         }
     }
 
+    /// Returns `false` if the ledger timestamp or sequence in `env` is lower
+    /// than at capture.
     pub fn verify(&self, env: &Env) -> bool {
         let new_ts = env.ledger().timestamp();
         if new_ts < self.timestamp {
@@ -421,6 +629,7 @@ impl<'a> StateSnapshot<'a> {
         true
     }
 
+    /// Panics if [`verify`](Self::verify) returns `false`.
     pub fn assert_valid(&self) {
         if !self.verify(self.env) {
             panic!("state validation failed - mid-execution state change detected");
@@ -428,6 +637,9 @@ impl<'a> StateSnapshot<'a> {
     }
 }
 
+/// Returns `true` if `caller` appears in `authorized_contracts`.
+///
+/// This is a plain membership check. It does not call `require_auth`.
 pub fn validate_caller_is_authorized(
     _env: &Env,
     caller: &Address,
@@ -441,6 +653,8 @@ pub fn validate_caller_is_authorized(
     false
 }
 
+/// Returns `true` if `min_amount <= amount <= max_per_tx` (both bounds
+/// inclusive).
 pub fn validate_amount_limits(
     amount: i128,
     min_amount: i128,

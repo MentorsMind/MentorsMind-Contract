@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
     token, Address, Env, Symbol, Vec,
 };
+use shared::ttl_utils::{PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -225,6 +226,10 @@ pub enum DataKey {
     ReferrerAgg(Address),
     /// Provider-level share aggregates
     InsuranceAgg(Address),
+    /// Source index for filtering: LedgerSource → count of records with that source
+    SourceCount(LedgerSource),
+    /// Source index mapping: (LedgerSource, index_in_source) → record_id
+    SourceIndex(LedgerSource, u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -252,14 +257,31 @@ impl ReconciliationEngine {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().persistent().set(&DataKey::Admin,            &admin);
+        env.storage().persistent().extend_ttl(&DataKey::Admin, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::EscrowContract,   &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::EscrowContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::TreasuryContract, &treasury);
+        env.storage().persistent().extend_ttl(&DataKey::TreasuryContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::ReferralContract, &referral);
+        env.storage().persistent().extend_ttl(&DataKey::ReferralContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::InsuranceContract,&insurance);
+        env.storage().persistent().extend_ttl(&DataKey::InsuranceContract, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::RecordCount,      &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::RecordCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::MismatchCount,    &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::MismatchCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::ReportCount,      &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::ReportCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::HistoricalCount,  &0u64);
+        env.storage().persistent().extend_ttl(&DataKey::HistoricalCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(())
     }
 
@@ -299,8 +321,21 @@ impl ReconciliationEngine {
             id, source, token: token.clone(), amount, aux_bps, gross_base,
             account: account.clone(), reference, timestamp: ts,
         };
-        env.storage().persistent().set(&DataKey::Record(id), &rec);
+        
+        // Write record and extend TTL to ensure audit trail persists
+        let record_key = DataKey::Record(id);
+        env.storage().persistent().set(&record_key, &rec);
+        env.storage().persistent().extend_ttl(&record_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        
         env.storage().persistent().set(&DataKey::RecordCount, &id);
+        env.storage().persistent().extend_ttl(&DataKey::RecordCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // Update source index for pagination
+        let source_count_key = DataKey::SourceCount(source);
+        let source_count: u32 = env.storage().persistent().get(&source_count_key).unwrap_or(0);
+        let new_source_count = source_count.checked_add(1).ok_or(Error::Overflow)?;
+        env.storage().persistent().set(&source_count_key, &new_source_count);
+        env.storage().persistent().set(&DataKey::SourceIndex(source, source_count), &id);
 
         // Running totals
         let key = DataKey::RunningTotals(source);
@@ -315,6 +350,7 @@ impl ReconciliationEngine {
             outs = outs.checked_sub(amount).ok_or(Error::Overflow)?; // -(-x) = +x
         }
         env.storage().persistent().set(&key, &(ins, outs));
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         // Source-specific accumulators
         match source {
@@ -324,12 +360,14 @@ impl ReconciliationEngine {
                     env.storage().persistent().get(&k).unwrap_or((0, 0));
                 let new_credited = credited.checked_add(amount.max(0)).ok_or(Error::Overflow)?;
                 env.storage().persistent().set(&k, &(pending, new_credited));
+                env.storage().persistent().extend_ttl(&k, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
             }
             LedgerSource::InsuranceYield | LedgerSource::InsuranceClaim => {
                 let k = DataKey::InsuranceAgg(account.clone());
                 let shares: i128 = env.storage().persistent().get(&k).unwrap_or(0);
                 let new = shares.checked_add(amount).ok_or(Error::Overflow)?;
                 env.storage().persistent().set(&k, &new);
+                env.storage().persistent().extend_ttl(&k, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
             }
             _ => {}
         }
@@ -350,6 +388,51 @@ impl ReconciliationEngine {
 
     pub fn get_record_count(env: Env) -> u64 {
         env.storage().persistent().get(&DataKey::RecordCount).unwrap_or(0)
+    }
+
+    /// -------------------------------------------------------------------
+    /// Pagination endpoints for audit tooling
+    /// -------------------------------------------------------------------
+
+    /// Returns a paginated view of all ledger records.
+    pub fn get_records_page(env: Env, offset: u32, limit: u32) -> Vec<LedgerRecord> {
+        let count = Self::get_record_count(&env);
+        let count_u32 = if count > u32::MAX as u64 { u32::MAX } else { count as u32 };
+        let (start, end) = Pagination::bounds(count_u32, offset, limit);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let record_id = (i as u64) + 1; // Records are 1-indexed
+            if let Some(rec) = env.storage().persistent().get::<DataKey, LedgerRecord>(&DataKey::Record(record_id)) {
+                results.push_back(rec);
+            }
+        }
+        results
+    }
+
+    /// Returns a paginated view of ledger records filtered by source.
+    pub fn get_records_by_source(
+        env: Env,
+        source: LedgerSource,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<LedgerRecord> {
+        let source_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SourceCount(source))
+            .unwrap_or(0);
+        let (start, end) = Pagination::bounds(source_count, offset, limit);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            if let Some(record_id) = env.storage().persistent().get::<DataKey, u64>(&DataKey::SourceIndex(source, i)) {
+                if let Some(rec) = env.storage().persistent().get::<DataKey, LedgerRecord>(&DataKey::Record(record_id)) {
+                    results.push_back(rec);
+                }
+            }
+        }
+        results
     }
 
     /// -------------------------------------------------------------------
@@ -1598,5 +1681,177 @@ mod tests {
         assert_eq!(calc_insurance_yield(100_000), 10);
         assert_eq!(calc_insurance_yield(0), 0);
         assert_eq!(calc_insurance_yield(99), 0); // truncated
+    }
+
+    // ======================================================================
+    // TTL PERSISTENCE TESTS
+    // ======================================================================
+
+    #[test]
+    fn test_reconciliation_records_persist_with_ttl() {
+        let f = Fixture::setup();
+        let account = Address::generate(&f.env);
+        
+        // Append a record
+        let record_id = f.client().append_record(
+            &f.admin,
+            &LedgerSource::EscrowFee,
+            &f.token,
+            &1000,
+            &500u32,
+            &10000,
+            &account,
+            &Symbol::new(&f.env, "test_record")
+        ).unwrap();
+        
+        // Verify record exists
+        let record = f.client().get_record(&record_id).unwrap();
+        assert_eq!(record.id, record_id);
+        assert_eq!(record.amount, 1000);
+        
+        // Simulate time passage beyond default TTL (advance ledger by ~15 days)
+        f.env.ledger().with_mut(|li| {
+            li.sequence_number += 15 * 17_280; // 15 days in ledgers
+        });
+        
+        // Record should still exist after default TTL window
+        // because we extended TTL with PERSISTENT_BUMP_AMOUNT (30 days)
+        let record_after_time = f.client().get_record(&record_id).unwrap();
+        assert_eq!(record_after_time.id, record_id);
+        assert_eq!(record_after_time.amount, 1000);
+    }
+
+    #[test]
+    fn test_config_keys_have_ttl_extension() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let referral = Address::generate(&env);
+        let insurance = Address::generate(&env);
+        
+        let recon_id = env.register_contract(None, ReconciliationEngine);
+        let client = ReconciliationEngineClient::new(&env, &recon_id);
+        
+        client.initialize(&admin, &escrow, &treasury, &referral, &insurance).unwrap();
+        
+        // Verify initial record count is set
+        assert_eq!(client.get_record_count(), 0);
+        
+        // Advance time significantly (20 days)
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 20 * 17_280; // 20 days in ledgers
+        });
+        
+        // Config keys should still be accessible
+        // because they were extended with TTL during initialization
+        assert_eq!(client.get_record_count(), 0);
+    }
+}
+
+    // ======================================================================
+    // Pagination tests
+    // ======================================================================
+
+    #[test]
+    fn test_get_records_page_returns_paginated_results() {
+        let f = Fixture::setup();
+        
+        // Create 10 records
+        for i in 0..10 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::EscrowFee,
+                &f.token,
+                &(100 + i),
+                &500u32,
+                &1000,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "test"),
+            ).unwrap();
+        }
+
+        // Get first page
+        let page1 = f.client().get_records_page(0, 5);
+        assert_eq!(page1.len(), 5);
+        
+        // Get second page
+        let page2 = f.client().get_records_page(5, 5);
+        assert_eq!(page2.len(), 5);
+        
+        // Get page beyond range
+        let page3 = f.client().get_records_page(10, 5);
+        assert_eq!(page3.len(), 0);
+    }
+
+    #[test]
+    fn test_get_records_by_source_filters_correctly() {
+        let f = Fixture::setup();
+        
+        // Create records with different sources
+        for _i in 0..3 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::EscrowFee,
+                &f.token,
+                &100,
+                &500u32,
+                &1000,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "escrow"),
+            ).unwrap();
+        }
+        
+        for _i in 0..5 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::ReferralReward,
+                &f.token,
+                &50,
+                &0u32,
+                &0,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "referral"),
+            ).unwrap();
+        }
+
+        // Get EscrowFee records
+        let escrow_records = f.client().get_records_by_source(LedgerSource::EscrowFee, 0, 10);
+        assert_eq!(escrow_records.len(), 3);
+        
+        // Get ReferralReward records
+        let referral_records = f.client().get_records_by_source(LedgerSource::ReferralReward, 0, 10);
+        assert_eq!(referral_records.len(), 5);
+        
+        // Get paginated ReferralReward records
+        let page1 = f.client().get_records_by_source(LedgerSource::ReferralReward, 0, 3);
+        assert_eq!(page1.len(), 3);
+        let page2 = f.client().get_records_by_source(LedgerSource::ReferralReward, 3, 3);
+        assert_eq!(page2.len(), 2);
+    }
+
+    #[test]
+    fn test_pagination_respects_max_page_size() {
+        let f = Fixture::setup();
+        
+        // Create more than MAX_PAGE_SIZE records
+        for _i in 0..60 {
+            f.client().append_record(
+                &f.admin,
+                &LedgerSource::EscrowFee,
+                &f.token,
+                &100,
+                &500u32,
+                &1000,
+                &Address::generate(&f.env),
+                &Symbol::new(&f.env, "test"),
+            ).unwrap();
+        }
+
+        // Request more than MAX_PAGE_SIZE, should be clamped
+        let page = f.client().get_records_page(0, 100);
+        assert_eq!(page.len(), 50); // MAX_PAGE_SIZE is 50
     }
 }

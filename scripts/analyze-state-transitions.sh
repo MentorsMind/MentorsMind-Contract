@@ -18,9 +18,10 @@ mkdir -p "$OUTPUT_DIR"
 cd "$PROJECT_ROOT"
 cargo run -p state-transition-analyzer --bin analyze-transitions --release 2>&1
 
-# Check exit status
-if [ $? -ne 0 ]; then
-    echo "❌ Analyzer failed!"
+# Check exit status - the analyzer will exit with code 1 if coverage is below 80%
+ANALYZER_EXIT=$?
+if [ $ANALYZER_EXIT -ne 0 ]; then
+    echo "❌ Analyzer failed or coverage below 80% threshold!"
     exit 1
 fi
 

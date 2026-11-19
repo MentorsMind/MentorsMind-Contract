@@ -83,47 +83,47 @@
   {
     "contract": "governance",
     "entry_point": "create_proposal",
-    "cpu_instructions": 935000,
-    "mem_bytes": 15200,
+    "cpu_instructions": 337083,
+    "mem_bytes": 151048,
     "storage_reads": 5,
     "storage_writes": 6,
-    "wasm_bytes": 125440
+    "wasm_bytes": 227856
   },
   {
     "contract": "governance",
     "entry_point": "vote",
-    "cpu_instructions": 750000,
-    "mem_bytes": 14000,
+    "cpu_instructions": 462377,
+    "mem_bytes": 203986,
     "storage_reads": 5,
     "storage_writes": 3,
-    "wasm_bytes": 125440
+    "wasm_bytes": 227856
   },
   {
     "contract": "governance",
     "entry_point": "execute_proposal",
-    "cpu_instructions": 980000,
-    "mem_bytes": 16500,
+    "cpu_instructions": 507158,
+    "mem_bytes": 216725,
     "storage_reads": 7,
     "storage_writes": 5,
-    "wasm_bytes": 125440
+    "wasm_bytes": 227856
   },
   {
     "contract": "governance",
     "entry_point": "register_arbitrator",
-    "cpu_instructions": 620000,
-    "mem_bytes": 11500,
+    "cpu_instructions": 270126,
+    "mem_bytes": 128299,
     "storage_reads": 2,
     "storage_writes": 4,
-    "wasm_bytes": 125440
+    "wasm_bytes": 227856
   },
   {
     "contract": "governance",
     "entry_point": "cancel_proposal",
-    "cpu_instructions": 580000,
-    "mem_bytes": 10800,
+    "cpu_instructions": 413412,
+    "mem_bytes": 172847,
     "storage_reads": 3,
     "storage_writes": 2,
-    "wasm_bytes": 125440
+    "wasm_bytes": 227856
   },
   {
     "contract": "timelock",

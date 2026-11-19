@@ -17,6 +17,9 @@ pub enum DataKey {
     Leaderboard,
 }
 
+/// Maximum number of entries retained in the leaderboard (#1358).
+const MAX_LEADERBOARD_ENTRIES: u32 = 100;
+
 #[contract]
 pub struct ReferralLeaderboardContract;
 
@@ -48,32 +51,61 @@ impl ReferralLeaderboardContract {
             .get(&DataKey::Leaderboard)
             .unwrap_or(Vec::new(&env));
 
-        // Remove existing entry for referrer if present
-        leaderboard = leaderboard
-            .iter()
-            .filter(|(addr, _)| addr != &referrer)
-            .map(|(addr, count)| (addr, count))
-            .collect::<Vec<_>>(&env);
+        // Remove existing entry for referrer if present (manual filter/map)
+        let mut deduplicated = Vec::new(&env);
+        for i in 0..leaderboard.len() {
+            let entry = leaderboard.get(i).unwrap();
+            if entry.0 != referrer {
+                deduplicated.push_back(entry);
+            }
+        }
+        leaderboard = deduplicated;
 
         // Add or update with new count
         leaderboard.push_back((referrer.clone(), referral_count));
 
-        // Sort by count descending, take top 50
-        leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
-        if leaderboard.len() > 50 {
-            leaderboard = leaderboard.slice(0..50);
+        // Manual insertion sort by count descending (selection sort)
+        for i in 0..leaderboard.len() {
+            let mut max_idx = i;
+            for j in (i + 1)..leaderboard.len() {
+                let current_max = leaderboard.get(max_idx).unwrap();
+                let current_j = leaderboard.get(j).unwrap();
+                if current_j.1 > current_max.1 {
+                    max_idx = j;
+                }
+            }
+            if max_idx != i {
+                let temp = leaderboard.get(max_idx).unwrap();
+                leaderboard.set(max_idx, leaderboard.get(i).unwrap());
+                leaderboard.set(i, temp);
+            }
         }
+
+        // Cap at MAX_LEADERBOARD_ENTRIES elements (manual slice equivalent).
+        // Since the board is sorted descending, truncation evicts the
+        // lowest-ranked entries.
+        let mut capped = Vec::new(&env);
+        for i in 0..leaderboard.len() {
+            if i >= MAX_LEADERBOARD_ENTRIES {
+                break;
+            }
+            capped.push_back(leaderboard.get(i).unwrap());
+        }
+        leaderboard = capped;
 
         env.storage()
             .persistent()
             .set(&DataKey::Leaderboard, &leaderboard);
 
-        // Emit event with top 3
-        let top_three = leaderboard
-            .iter()
-            .take(3)
-            .map(|(addr, _)| addr.clone())
-            .collect::<Vec<_>>(&env);
+        // Emit event with top 3 (manual take equivalent)
+        let mut top_three = Vec::new(&env);
+        for i in 0..leaderboard.len() {
+            if i >= 3 {
+                break;
+            }
+            let (addr, _) = leaderboard.get(i).unwrap();
+            top_three.push_back(addr);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "Leaderboard"), Symbol::new(&env, "Updated")),
@@ -176,30 +208,54 @@ mod test {
         let f = TestFixture::setup();
         f.env.mock_auths(&[f.referral_contract.clone()]);
 
-        // Add 50 entries
+        // Add 100 entries
         let mut referrers = Vec::new(&f.env);
-        for i in 0..50 {
+        for i in 0..100 {
             let addr = Address::generate(&f.env);
             referrers.push_back(addr.clone());
-            f.client().record_referral(&addr, &(50 - i));
+            f.client().record_referral(&addr, &(100 - i));
         }
 
-        // The board should be sorted descending: counts 50,49,...,1
+        // The board should be sorted descending: counts 100,99,...,1
         let board = f.client().get_leaderboard();
-        assert_eq!(board.len(), 50);
-        for i in 0..50 {
-            assert_eq!(board.get(i as u32).unwrap().1, 50 - i);
+        assert_eq!(board.len(), 100);
+        for i in 0..100 {
+            assert_eq!(board.get(i as u32).unwrap().1, 100 - i);
         }
 
-        // Add a new one with count 51, should displace the last (count 1)
+        // Add a new one with count 101, should displace the last (count 1)
         let new_referrer = Address::generate(&f.env);
-        f.client().record_referral(&new_referrer, &51);
+        f.client().record_referral(&new_referrer, &101);
 
         let board2 = f.client().get_leaderboard();
-        assert_eq!(board2.len(), 50);
-        assert_eq!(board2.get(0).unwrap(), (new_referrer.clone(), 51));
+        assert_eq!(board2.len(), 100);
+        assert_eq!(board2.get(0).unwrap(), (new_referrer.clone(), 101));
         // The last should now be count 2 (since 1 was displaced)
-        assert_eq!(board2.get(49).unwrap().1, 2);
+        assert_eq!(board2.get(99).unwrap().1, 2);
+    }
+
+    #[test]
+    fn test_leaderboard_capped_at_100() {
+        let f = TestFixture::setup();
+        f.env.mock_auths(&[f.referral_contract.clone()]);
+
+        for i in 0..150 {
+            let addr = Address::generate(&f.env);
+            f.client().record_referral(&addr, &(i + 1));
+            let board = f.client().get_leaderboard();
+            assert!(
+                board.len() <= MAX_LEADERBOARD_ENTRIES,
+                "leaderboard exceeded cap at insert {}: len {}",
+                i,
+                board.len()
+            );
+        }
+
+        let board = f.client().get_leaderboard();
+        assert_eq!(board.len(), MAX_LEADERBOARD_ENTRIES);
+        // Highest counts are retained: 150 down to 51.
+        assert_eq!(board.get(0).unwrap().1, 150);
+        assert_eq!(board.get(99).unwrap().1, 51);
     }
 
     #[test]

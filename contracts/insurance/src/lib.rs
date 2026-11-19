@@ -1,8 +1,13 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, token, Address, Env, Symbol,
+use shared::storage_compatibility::{
+    CompatibilityValidator, StorageField, StorageFieldType, StorageLayoutSchema,
 };
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol,
+};
+use shared::{validate_amount_limits, MAX_FINANCIAL_AMOUNT};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -12,13 +17,14 @@ use soroban_sdk::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized      = 1,
-    NotInitialized          = 2,
-    NotAdmin                = 3,
-    InsufficientShares      = 4,
-    WithdrawLocked          = 5,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    NotAdmin = 3,
+    InsufficientShares = 4,
+    WithdrawLocked = 5,
     InsufficientPoolBalance = 6,
     ZeroAmount              = 7,
+    AmountExceedsLimit      = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,43 +70,88 @@ pub struct InsuranceContract;
 #[contractimpl]
 impl InsuranceContract {
     /// Initialize the insurance pool.
-    pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        upgrade_registry: Address,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
+        admin.require_auth();
+
+        let schema = Self::storage_layout_schema(&env);
+        match env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &upgrade_registry,
+            &Symbol::new(&env, "register_storage_schema"),
+            (
+                symbol_short!("insurance"),
+                schema,
+                soroban_sdk::vec![&env, admin.clone()],
+            )
+                .into_val(&env),
+        ) {
+            Ok(Ok(())) => {}
+            _ => return Err(Error::StorageSchemaRegistrationFailed),
+        }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::PoolBalance, &0i128);
-        env.storage().instance().set(&DataKey::TotalClaimsPaid, &0i128);
-        env.storage().instance().set(&DataKey::TotalActiveEscrow, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalClaimsPaid, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalActiveEscrow, &0i128);
         Ok(())
     }
 
     /// Deposit USDC into the insurance pool.
     pub fn deposit(env: Env, provider: Address, amount: i128) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
-        if amount <= 0 {
-            return Err(Error::ZeroAmount);
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
+            return if amount <= 0 {
+                Err(Error::ZeroAmount)
+            } else {
+                Err(Error::AmountExceedsLimit)
+            };
         }
         provider.require_auth();
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(&provider, &env.current_contract_address(), &amount);
+        token::Client::new(&env, &token).transfer(
+            &provider,
+            &env.current_contract_address(),
+            &amount,
+        );
 
         let shares: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::ProviderShares(provider.clone()))
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProviderShares(provider.clone()), &(shares + amount));
+        env.storage().persistent().set(
+            &DataKey::ProviderShares(provider.clone()),
+            &(shares + amount),
+        );
 
-        let pool: i128 = env.storage().instance().get(&DataKey::PoolBalance).unwrap_or(0);
-        env.storage().instance().set(&DataKey::PoolBalance, &(pool + amount));
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolBalance)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolBalance, &(pool + amount));
 
         env.events().publish(
-            (symbol_short!("insurance"), Symbol::new(&env, "deposited"), provider.clone()),
+            (
+                symbol_short!("insurance"),
+                Symbol::new(&env, "deposited"),
+                provider.clone(),
+            ),
             (amount, env.ledger().timestamp()),
         );
 
@@ -134,21 +185,36 @@ impl InsuranceContract {
             return Err(Error::InsufficientShares);
         }
 
-        let pool: i128 = env.storage().instance().get(&DataKey::PoolBalance).unwrap_or(0);
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolBalance)
+            .unwrap_or(0);
         if pool < amount {
             return Err(Error::InsufficientPoolBalance);
         }
 
+        env.storage().persistent().set(
+            &DataKey::ProviderShares(provider.clone()),
+            &(shares - amount),
+        );
         env.storage()
-            .persistent()
-            .set(&DataKey::ProviderShares(provider.clone()), &(shares - amount));
-        env.storage().instance().set(&DataKey::PoolBalance, &(pool - amount));
+            .instance()
+            .set(&DataKey::PoolBalance, &(pool - amount));
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &provider, &amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &provider,
+            &amount,
+        );
 
         env.events().publish(
-            (symbol_short!("insurance"), Symbol::new(&env, "withdrawn"), provider.clone()),
+            (
+                symbol_short!("insurance"),
+                Symbol::new(&env, "withdrawn"),
+                provider.clone(),
+            ),
             (amount, env.ledger().timestamp()),
         );
 
@@ -159,30 +225,52 @@ impl InsuranceContract {
     /// Admin only.
     pub fn claim(env: Env, escrow_id: Symbol, learner: Address, amount: i128) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
-        if amount <= 0 {
-            return Err(Error::ZeroAmount);
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
+            return if amount <= 0 {
+                Err(Error::ZeroAmount)
+            } else {
+                Err(Error::AmountExceedsLimit)
+            };
         }
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
-        let pool: i128 = env.storage().instance().get(&DataKey::PoolBalance).unwrap_or(0);
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolBalance)
+            .unwrap_or(0);
         if pool < amount {
             return Err(Error::InsufficientPoolBalance);
         }
 
-        env.storage().instance().set(&DataKey::PoolBalance, &(pool - amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolBalance, &(pool - amount));
 
-        let paid: i128 = env.storage().instance().get(&DataKey::TotalClaimsPaid).unwrap_or(0);
+        let paid: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalClaimsPaid)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::TotalClaimsPaid, &(paid + amount));
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &learner, &amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &learner,
+            &amount,
+        );
 
         env.events().publish(
-            (symbol_short!("insurance"), Symbol::new(&env, "claim_paid"), escrow_id),
+            (
+                symbol_short!("insurance"),
+                Symbol::new(&env, "claim_paid"),
+                escrow_id,
+            ),
             (learner, amount, env.ledger().timestamp()),
         );
 
@@ -208,12 +296,19 @@ impl InsuranceContract {
             .persistent()
             .get(&DataKey::ProviderShares(provider.clone()))
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProviderShares(provider.clone()), &(shares + yield_amount));
+        env.storage().persistent().set(
+            &DataKey::ProviderShares(provider.clone()),
+            &(shares + yield_amount),
+        );
 
-        let pool: i128 = env.storage().instance().get(&DataKey::PoolBalance).unwrap_or(0);
-        env.storage().instance().set(&DataKey::PoolBalance, &(pool + yield_amount));
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolBalance)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolBalance, &(pool + yield_amount));
 
         Ok(())
     }
@@ -223,7 +318,9 @@ impl InsuranceContract {
         Self::assert_initialized(&env)?;
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        env.storage().instance().set(&DataKey::TotalActiveEscrow, &value);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalActiveEscrow, &value);
         Ok(())
     }
 
@@ -249,8 +346,16 @@ impl InsuranceContract {
     /// Returns pool_balance / total_active_escrow_value in basis points.
     /// Returns 0 if no active escrow value is set.
     pub fn get_coverage_ratio(env: Env) -> u32 {
-        let pool: i128 = env.storage().instance().get(&DataKey::PoolBalance).unwrap_or(0);
-        let active: i128 = env.storage().instance().get(&DataKey::TotalActiveEscrow).unwrap_or(0);
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolBalance)
+            .unwrap_or(0);
+        let active: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalActiveEscrow)
+            .unwrap_or(0);
         if active == 0 {
             return 0;
         }
@@ -259,11 +364,17 @@ impl InsuranceContract {
     }
 
     pub fn get_pool_balance(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::PoolBalance).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::PoolBalance)
+            .unwrap_or(0)
     }
 
     pub fn get_total_claims_paid(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalClaimsPaid).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalClaimsPaid)
+            .unwrap_or(0)
     }
 
     pub fn get_provider_shares(env: Env, provider: Address) -> i128 {
@@ -300,6 +411,67 @@ impl InsuranceContract {
         }
         Ok(())
     }
+
+    fn storage_layout_schema(env: &Env) -> StorageLayoutSchema {
+        let fields = soroban_sdk::vec![
+            env,
+            StorageField {
+                name: Symbol::new(env, "NamespaceRoot"),
+                field_type: StorageFieldType::Custom,
+                slot_index: 0,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "Admin"),
+                field_type: StorageFieldType::Address,
+                slot_index: 1,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "Token"),
+                field_type: StorageFieldType::Address,
+                slot_index: 2,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "PoolBalance"),
+                field_type: StorageFieldType::I128,
+                slot_index: 3,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "TotalClaimsPaid"),
+                field_type: StorageFieldType::I128,
+                slot_index: 4,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "TotalActiveEscrow"),
+                field_type: StorageFieldType::I128,
+                slot_index: 5,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "ProviderShares"),
+                field_type: StorageFieldType::Map,
+                slot_index: 6,
+                deprecated: false,
+            },
+            StorageField {
+                name: Symbol::new(env, "WithdrawUnlock"),
+                field_type: StorageFieldType::Map,
+                slot_index: 7,
+                deprecated: false,
+            },
+        ];
+        let schema_hash = CompatibilityValidator::compute_schema_hash(env, &fields);
+
+        StorageLayoutSchema {
+            version: 1,
+            schema_hash,
+            fields,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +483,10 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use mentorminds_upgrade_registry::{
+        Error as RegistryError, UpgradeRegistryContract, UpgradeRegistryContractClient,
+    };
+    use shared::storage_compatibility::StorageField;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{Env, Symbol};
 
@@ -371,11 +547,12 @@ mod tests {
     use mock_token::MockToken;
 
     struct Fixture {
-        env:      Env,
+        env: Env,
         contract: Address,
-        token:    Address,
-        admin:    Address,
+        token: Address,
+        admin: Address,
         provider: Address,
+        registry: Address,
     }
 
     impl Fixture {
@@ -388,13 +565,25 @@ mod tests {
             let provider = Address::generate(&env);
             let token = env.register_contract(None, MockToken);
             let contract = env.register_contract(None, InsuranceContract);
+            let registry = env.register_contract(None, UpgradeRegistryContract);
+            let registry_client = UpgradeRegistryContractClient::new(&env, &registry);
+            registry_client.initialize(&admin, &0);
+            let signers = soroban_sdk::vec![&env, admin.clone()];
+            registry_client.set_upgrade_signers(&signers, &1, &signers);
 
             // Mint tokens to provider
             mock_token::MockTokenClient::new(&env, &token).mint(&provider, &1_000_000);
 
-            InsuranceContractClient::new(&env, &contract).initialize(&admin, &token);
+            InsuranceContractClient::new(&env, &contract).initialize(&admin, &token, &registry);
 
-            Fixture { env, contract, token, admin, provider }
+            Fixture {
+                env,
+                contract,
+                token,
+                admin,
+                provider,
+                registry,
+            }
         }
 
         fn client(&self) -> InsuranceContractClient {
@@ -491,6 +680,42 @@ mod tests {
         assert_eq!(
             f.client().try_deposit(&f.provider, &0),
             Err(Ok(Error::ZeroAmount))
+        );
+    }
+
+    #[test]
+    fn test_amount_exceeds_limit() {
+        let f = Fixture::setup();
+        // Try to deposit more than MAX_FINANCIAL_AMOUNT
+        let exceeds = 1_000_000_000_000_001i128; // MAX_FINANCIAL_AMOUNT + 1
+        assert_eq!(
+            f.client().try_deposit(&f.provider, &exceeds),
+            Err(Ok(Error::AmountExceedsLimit))
+        );
+    }
+
+    #[test]
+    fn test_claim_zero_amount_rejected() {
+        let f = Fixture::setup();
+        let learner = Address::generate(&f.env);
+        let escrow_id = Symbol::new(&f.env, "session1");
+        assert_eq!(
+            f.client().try_claim(&escrow_id, &learner, &0),
+            Err(Ok(Error::ZeroAmount))
+        );
+    }
+
+    #[test]
+    fn test_claim_amount_exceeds_limit() {
+        let f = Fixture::setup();
+        f.client().deposit(&f.provider, &500_000);
+        
+        let learner = Address::generate(&f.env);
+        let escrow_id = Symbol::new(&f.env, "session2");
+        let exceeds = 1_000_000_000_000_001i128; // MAX_FINANCIAL_AMOUNT + 1
+        assert_eq!(
+            f.client().try_claim(&escrow_id, &learner, &exceeds),
+            Err(Ok(Error::AmountExceedsLimit))
         );
     }
 }

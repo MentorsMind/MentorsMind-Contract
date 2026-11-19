@@ -314,6 +314,33 @@ mod tests {
     }
 
     #[test]
+    fn emergency_multisig_rejects_six_signers() {
+        let env = Env::default();
+        let seven = seven_signers(&env);
+        let mut six = Vec::new(&env);
+        for i in 0..6 {
+            six.push_back(seven.get(i).unwrap());
+        }
+        assert_eq!(six.len(), EMERGENCY_MSIG_SIGNERS - 1);
+        assert!(!MultisigValidation::is_valid_emergency_config(&six, EMERGENCY_MSIG_THRESHOLD));
+    }
+
+    #[test]
+    fn emergency_multisig_rejects_threshold_below_four() {
+        let env = Env::default();
+        let signers = seven_signers(&env);
+        assert!(!MultisigValidation::is_valid_emergency_config(&signers, EMERGENCY_MSIG_THRESHOLD - 1));
+    }
+
+    #[test]
+    fn emergency_multisig_accepts_exact_four_of_seven() {
+        let env = Env::default();
+        let signers = seven_signers(&env);
+        assert_eq!(signers.len(), EMERGENCY_MSIG_SIGNERS);
+        assert!(MultisigValidation::is_valid_emergency_config(&signers, EMERGENCY_MSIG_THRESHOLD));
+    }
+
+    #[test]
     fn validate_signatures_requires_exact_four_unique_registered() {
         let env = Env::default();
         let registered = seven_signers(&env);

@@ -29,6 +29,11 @@ use shared::mev_protection::{
     record_mev_monitoring, MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
     MEV_ARBITRAGE_RISK_THRESHOLD,
 };
+use shared::pricing_protection::{
+    compute_pricing_intervention as compute_market_protection_intervention,
+    validate_market_rate, PriceCoordinationFlag, MarketRateValidation, DemandAuthenticity,
+    PricingInterventionRecord as MarketProtectionRecord,
+};
 
 // ---------------------------------------------------------------------------
 // Storage key constants
@@ -77,6 +82,21 @@ const ORACLE_REORG_SAFE_DEPTH: u32 = 12;
 // ---------------------------------------------------------------------------
 
 /// A single price observation submitted by a feeder.
+///
+/// Represents an atomic price submission from a single feeder at a specific point in time.
+/// The oracle stores up to `MAX_POINTS` (10) recent observations per asset, maintaining
+/// a rolling window of price history.
+///
+/// # Fields
+/// * `price` - The price value in the token's smallest unit (e.g., 100_000_000 for 1.00 USD).
+///   Must be strictly positive.
+/// * `timestamp` - Unix timestamp (seconds) when the price was observed/submitted.
+///   Used to filter stale readings (older than `MAX_STALENESS_SECS` = 1 hour).
+/// * `feeder` - Address of the price feed operator who submitted this reading.
+///   Validated against the registered feeder list.
+/// * `submitted_at_ledger` - Stellar ledger sequence at submission time.
+///   Used for reorg-safe depth checks to prevent serving prices from recent ledgers
+///   that may be subject to reordering.
 #[contracttype]
 #[derive(Clone)]
 pub struct PricePoint {
@@ -97,6 +117,33 @@ pub struct OracleSource {
 }
 
 /// Snapshot of oracle health exposed to callers (e.g. treasury).
+///
+/// Reports the current state of the oracle's data feeds for a specific asset.
+/// Useful for consumers to determine if they can safely rely on price feeds or if they
+/// should apply fallback logic due to staleness or insufficient feeder participation.
+///
+/// # Fields
+/// * `active_feeders` - Number of distinct feeders with a non-stale reading in the current
+///   observation window. A feeder is considered "active" if their most recent submission
+///   is within the last `MAX_STALENESS_SECS` (3600 seconds = 1 hour).
+///   Must be >= `MIN_FEEDERS` (3) to compute valid prices.
+/// * `last_update` - Unix timestamp (seconds) of the most recently accepted reading
+///   across all feeders for this asset. Allows consumers to calculate age/freshness.
+/// * `is_stale` - Boolean flag: `true` if the most recent reading is older than
+///   `MAX_STALENESS_SECS`, indicating the oracle has not received fresh data.
+///
+/// # Example
+/// ```ignore
+/// // Check oracle health before processing a payment route:
+/// let health = oracle.get_oracle_health(&Symbol::new(&env, "USD"));
+/// if health.is_stale {
+///     // Reject the route; oracle data is too old
+///     panic!("oracle data stale; payment rejected");
+/// }
+/// if health.active_feeders < 3 {
+///     // Apply extra validation; not enough independent feeders
+/// }
+/// ```
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleHealth {
@@ -273,6 +320,46 @@ impl OracleContract {
     // Price submission (#866: reorg protection + feeder accountability)
     // -----------------------------------------------------------------------
 
+    /// Submit a price observation for an asset (feeder only).
+    ///
+    /// Accepts a new price reading from an authorized feeder and stores it in the rolling window.
+    /// The submission is subject to:
+    /// * **Authorization**: Caller must be registered as a feeder or hold the ORACLE_FEEDER role.
+    /// * **Validation**: Price must be strictly positive.
+    /// * **Circuit breaker**: Price must not deviate more than the configured threshold
+    ///   (default 50% = `DEFAULT_CB_THRESHOLD_BPS`) from the current TWAP.
+    /// * **Chain isolation**: Submissions are rejected if the oracle chain is isolated
+    ///   (e.g., due to cross-chain sync failures).
+    /// * **Reorg safety**: Submissions from ledgers within `ORACLE_REORG_SAFE_DEPTH` (12)
+    ///   of the current sequence are stored but flagged for later filtering.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `feeder` - Address of the feeder submitting the reading. Must authenticate.
+    /// * `asset` - Symbol identifying the asset (e.g., `Symbol::new(&env, "USD")` or `"XLM"`).
+    /// * `price` - The price value in the smallest unit of the asset's denomination.
+    ///   Must be > 0.
+    /// * `timestamp` - Unix timestamp (seconds) when the price was observed.
+    ///   Used to filter stale readings and compute TWAP.
+    ///
+    /// # Panics
+    /// * If feeder is not authorized.
+    /// * If `price <= 0`.
+    /// * If price deviates more than the circuit-breaker threshold from TWAP.
+    /// * If oracle chain is isolated.
+    /// * If MEV arbitrage is detected.
+    ///
+    /// # Events
+    /// Emits `OraclePriceUpdateEvent` on success, carrying the asset, price, and timestamp.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let feeder = Address::generate(&env);
+    /// let asset = Symbol::new(&env, "USDC");
+    /// let price = 1_0000000; // 1.00 USD in USDC smallest unit
+    /// let now = env.ledger().timestamp();
+    /// oracle.submit_price(&feeder, &asset, &price, &now);
+    /// ```
     pub fn submit_price(env: Env, feeder: Address, asset: Symbol, price: i128, timestamp: u64) {
         feeder.require_auth();
         if !Self::is_feeder(&env, &feeder)
@@ -317,6 +404,37 @@ impl OracleContract {
             .get::<_, TwapState>(&twap_key)
         {
             if twap_state.twap > 0 {
+                let market_val = validate_market_rate(price, twap_state.twap, cb_threshold as u32);
+                let coordination = PriceCoordinationFlag {
+                    suspicious: false,
+                    risk_score: 0,
+                    matching_price_count: 0,
+                    clustered_timing_count: 0,
+                };
+                let demand = DemandAuthenticity {
+                    genuine: true,
+                    distinct_requester_bps: 10_000,
+                    artificial_risk_score: 0,
+                    burst_count: 0,
+                };
+                let floor = twap_state.twap.saturating_div(2);
+                let ceiling = twap_state.twap.saturating_mul(2);
+                let intervention = compute_market_protection_intervention(
+                    &env,
+                    coordination,
+                    market_val,
+                    demand,
+                    twap_state.twap,
+                    floor,
+                    ceiling,
+                );
+
+                if intervention.intervene {
+                    let prot_key = (symbol_short!("MKT_PROT"), asset.clone());
+                    env.storage().persistent().set(&prot_key, &intervention);
+                    panic!("MarketProtectionTriggered");
+                }
+
                 let diff = if price > twap_state.twap {
                     price - twap_state.twap
                 } else {
@@ -335,6 +453,7 @@ impl OracleContract {
                 }
             }
         }
+
 
         // Store the reading in per-asset vec (one entry per submission; capped at MAX_POINTS).
         let key = (symbol_short!("PRICES"), asset.clone());
@@ -369,6 +488,12 @@ impl OracleContract {
 
         let _ = cb_trips_this_submission;
     }
+
+    pub fn get_market_protection_record(env: Env, asset: Symbol) -> Option<MarketProtectionRecord> {
+        let prot_key = (symbol_short!("MKT_PROT"), asset);
+        env.storage().persistent().get(&prot_key)
+    }
+
 
     // -----------------------------------------------------------------------
     // Price query (#614: heartbeat filter + outlier rejection + min_feeders)
@@ -448,8 +573,38 @@ impl OracleContract {
         (Self::median(inliers), last_updated)
     }
 
-    /// Return the current TWAP and monitor callers whose reads show a
-    /// suspicious spot-price deviation.
+    /// Return the current Time-Weighted Average Price (TWAP) for an asset.
+    ///
+    /// Computes a rolling-window TWAP using the most recent price points and their
+    /// inter-submission intervals. The TWAP is updated whenever a new price is submitted
+    /// and reflects the average price over the last `TWAP_WINDOW` (5) price submissions.
+    ///
+    /// Before returning the TWAP, this function monitors the caller for MEV (Maximal
+    /// Extractable Value) arbitrage risk by comparing the spot price to the TWAP and
+    /// recording any suspicious patterns. Callers with high MEV risk are logged for
+    /// protocol monitoring.
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `asset` - Symbol identifying the asset (e.g., `Symbol::new(&env, "USD")`).
+    ///
+    /// # Returns
+    /// The TWAP as an `i128` value in the asset's smallest unit.
+    ///
+    /// # Panics
+    /// * If no TWAP is available (fewer than 2 price submissions have been stored).
+    /// * If all price points are stale or fail reorg-safety checks.
+    /// * If fewer than `MIN_FEEDERS` (3) have non-stale readings.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let asset = Symbol::new(&env, "USDC");
+    /// // Feeders have submitted prices over the last minute.
+    /// let twap = oracle.get_twap(&asset);
+    /// // twap is now the time-weighted average of recent submissions.
+    /// // For example, if prices were 1.00 USD, 1.00 USD, 1.02 USD (in that order),
+    /// // and TWAP_WINDOW=5, the result reflects the weighted average of those readings.
+    /// ```
     pub fn get_twap(env: Env, asset: Symbol) -> i128 {
         let twap_key = (symbol_short!("TWAP"), asset.clone());
         let twap_state: TwapState = env
@@ -619,6 +774,43 @@ impl OracleContract {
         now.saturating_sub(last_updated) > MAX_STALENESS_SECS
     }
 
+    /// Get the health status of the oracle feed for an asset.
+    ///
+    /// Returns a snapshot of the current oracle state, including the number of active feeders,
+    /// the timestamp of the most recent accepted reading, and whether the data is stale.
+    /// This is a non-mutating view function suitable for off-chain monitoring and for
+    /// on-chain verification before consuming price data.
+    ///
+    /// An asset's feed is considered **healthy** when:
+    /// * At least `MIN_FEEDERS` (3) distinct feeders have submitted non-stale readings.
+    /// * The most recent reading is within the last `MAX_STALENESS_SECS` (3600 seconds).
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `asset` - Symbol identifying the asset (e.g., `Symbol::new(&env, "USD")`).
+    ///
+    /// # Returns
+    /// An `OracleHealth` struct containing:
+    /// * `active_feeders` - Count of distinct feeders with fresh data.
+    /// * `last_update` - Timestamp of the most recent accepted reading.
+    /// * `is_stale` - Boolean flag indicating whether the most recent reading exceeds `MAX_STALENESS_SECS`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let asset = Symbol::new(&env, "USDC");
+    /// let health = oracle.get_oracle_health(&asset);
+    /// 
+    /// if health.is_stale {
+    ///     // Oracle has no recent data; consider rejecting the operation
+    ///     return Err("oracle stale");
+    /// }
+    /// if health.active_feeders < 3 {
+    ///     // Fewer than expected feeders are participating; apply additional scrutiny
+    /// }
+    /// 
+    /// // Safe to consume price data
+    /// let twap = oracle.get_twap(&asset);
+    /// ```
     pub fn get_oracle_health(env: Env, asset: Symbol) -> OracleHealth {
         let now = env.ledger().timestamp();
         let key = (symbol_short!("PRICES"), asset);
@@ -774,6 +966,15 @@ impl OracleContract {
         {
             panic!("unauthorized feeder");
         }
+
+        // Reject replay of a proof hash that has already been accepted.
+        // Without this, a single oracle-attested calendar-busy hash could be
+        // reused verbatim to "prove" availability for unrelated slots.
+        let used_key = (symbol_short!("CAL_USED"), proof_hash.clone());
+        if env.storage().persistent().has(&used_key) {
+            panic!("duplicate calendar proof");
+        }
+        env.storage().persistent().set(&used_key, &true);
 
         let key = (symbol_short!("CAL_PRF"), mentor, slot_start);
         env.storage()
@@ -1309,6 +1510,46 @@ mod tests {
     }
 
     #[test]
+    fn test_calendar_proof_rejects_stale_timestamp() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+        let mentor = Address::generate(&env);
+        let slot_start = 5_000u64;
+        let proof_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &proof_hash);
+
+        // Move the ledger clock past MAX_CONFLICT_PROOF_AGE_SECS (24h) after
+        // the proof was issued; it is still hash-correct but must now be
+        // rejected as stale.
+        env.ledger()
+            .set_timestamp(1_000 + shared::MAX_CONFLICT_PROOF_AGE_SECS + 1);
+
+        let result = client.verify_calendar_availability(&mentor, &slot_start, &proof_hash);
+        assert!(!result.within_freshness_window);
+        assert!(!result.valid);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate calendar proof")]
+    fn test_calendar_proof_rejects_duplicate_hash() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+        let mentor_a = Address::generate(&env);
+        let mentor_b = Address::generate(&env);
+        let proof_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor_a, &5_000u64, &proof_hash);
+        // Re-using the exact same proof hash for a different mentor/slot is a
+        // replay attempt and must be rejected.
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor_b, &6_000u64, &proof_hash);
+    }
+
+    #[test]
     fn test_calendar_proof_missing_returns_invalid() {
         let (env, _admin, contract_id) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
@@ -1318,4 +1559,105 @@ mod tests {
         let result = client.verify_calendar_availability(&mentor, &5_000u64, &expected);
         assert!(!result.valid);
     }
+
+    #[test]
+    #[should_panic(expected = "MarketProtectionTriggered")]
+    fn test_market_protection_intervention_blocks_price_submission() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 3);
+        let asset = Symbol::new(&env, "USDC");
+
+        // Submit initial prices to establish a TWAP benchmark around 100
+        submit(&env, &client, &feeders.get(0).unwrap(), asset.clone(), 100, 100);
+        submit(&env, &client, &feeders.get(1).unwrap(), asset.clone(), 100, 100);
+        submit(&env, &client, &feeders.get(2).unwrap(), asset.clone(), 100, 100);
+
+        // Submit an excessively distorted price (e.g., 200, which is +100% deviation > 50% max deviation threshold)
+        // This must trigger MarketProtectionTriggered intervention
+        client.submit_price(&feeders.get(0).unwrap(), &asset, &200, &200);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_conflict_proof tests (#1239)
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a deterministic 32-byte hash from a seed byte.
+    fn make_hash(env: &Env, seed: u8) -> BytesN<32> {
+        let mut arr = [0u8; 32];
+        arr[0] = seed;
+        BytesN::from_array(env, &arr)
+    }
+
+    #[test]
+    fn test_conflict_proof_valid_accepted() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+
+        let mentor     = Address::generate(&env);
+        let slot_start = 1_000u64;
+        let hash       = make_hash(&env, 0xAB);
+
+        // Set timestamp so issued_at is within freshness window
+        env.ledger().set_timestamp(1_000);
+
+        // Advance past reorg-safe depth
+        env.ledger().with_mut(|l| l.sequence_number = ORACLE_REORG_SAFE_DEPTH + 1);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &hash);
+
+        // Verify within freshness window (same timestamp → age = 0)
+        let proof = client.verify_calendar_availability(&mentor, &slot_start, &hash);
+        assert!(proof.valid, "matching hash within freshness window must be valid");
+        assert!(proof.within_freshness_window, "must report within_freshness_window = true");
+    }
+
+    #[test]
+    fn test_conflict_proof_stale_timestamp_rejected() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+
+        let mentor     = Address::generate(&env);
+        let slot_start = 2_000u64;
+        let hash       = make_hash(&env, 0xCD);
+
+        // Submit the proof when ledger time == 0
+        env.ledger().set_timestamp(0);
+        env.ledger().with_mut(|l| l.sequence_number = ORACLE_REORG_SAFE_DEPTH + 1);
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &hash);
+
+        // Advance ledger past MAX_CONFLICT_PROOF_AGE_SECS (24 h = 86400 s)
+        let stale_ts = shared::MAX_CONFLICT_PROOF_AGE_SECS + 1;
+        env.ledger().set_timestamp(stale_ts);
+
+        let proof = client.verify_calendar_availability(&mentor, &slot_start, &hash);
+        assert!(!proof.valid, "proof outside freshness window must not be valid");
+        assert!(!proof.within_freshness_window, "must report within_freshness_window = false");
+    }
+
+    #[test]
+    fn test_conflict_proof_wrong_hash_rejected() {
+        let (env, admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+
+        let mentor     = Address::generate(&env);
+        let slot_start = 3_000u64;
+        let stored_hash   = make_hash(&env, 0x01);
+        let different_hash = make_hash(&env, 0x02);
+
+        env.ledger().set_timestamp(1_000);
+        env.ledger().with_mut(|l| l.sequence_number = ORACLE_REORG_SAFE_DEPTH + 1);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &stored_hash);
+
+        // Verify with a different expected hash — should be rejected even though fresh
+        let proof = client.verify_calendar_availability(&mentor, &slot_start, &different_hash);
+        assert!(!proof.valid, "proof with mismatched hash must not be valid");
+        // The proof is still within the freshness window even if the hash differs
+        assert!(proof.within_freshness_window, "freshness window check is independent of hash match");
+    }
 }
+
