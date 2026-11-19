@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
 use shared::pagination::Pagination;
 use shared::safe_math::SafeMath;
 
@@ -18,7 +18,7 @@ const MAX_GRANT_PCT_BPS: u16 = 2000;
 // ── Errors ────────────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
+pub enum GrantError {
     /// Allocation attempted after the program's expiry timestamp.
     ProgramExpired = 1,
     /// Allocation would push cumulative commitments past MAX_GRANT_PCT_BPS of treasury.
@@ -74,6 +74,13 @@ pub enum DataKey {
     GrantCount,
     /// Total committed to all grants
     TotalCommitted,
+}
+
+// ── Cross-contract interfaces ──────────────────────────────────────────────────
+/// Client for the treasury contract's live-balance entry point.
+#[contractclient(name = "TreasuryClient")]
+pub trait TreasuryInterface {
+    fn get_balance(env: Env, token: Address) -> i128;
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -224,7 +231,7 @@ impl Grants {
 
         // Enforce program expiry before disbursing any grant.
         if env.ledger().timestamp() >= program.expiry {
-            panic!("{:?}", Error::ProgramExpired);
+            panic!("{:?}", GrantError::ProgramExpired);
         }
 
         // Enforce the treasury cap against the live treasury balance.
@@ -248,10 +255,7 @@ impl Grants {
         // Check that total allocated doesn't exceed budget.
         // Use checked arithmetic so the check-then-write cannot overflow and
         // validate the new total against the budget before persisting it.
-        let new_allocated = program
-            .allocated
-            .safe_add(&env, amount)
-            .expect("Allocation overflow");
+        let new_allocated = program.allocated.safe_add(&env, amount);
         if new_allocated > program.budget {
             panic!("GrantBudgetExceeded");
         }
@@ -339,7 +343,7 @@ impl Grants {
     /// Get a bounded page of approved grants in creation order.
     pub fn get_grants_page(env: Env, offset: u32, limit: u32) -> Vec<Grant> {
         let count = Self::get_grant_count(env.clone());
-        let (start, end) = Pagination::new(offset, limit).bounds(count);
+        let (start, end) = Pagination::bounds(count, offset, limit);
         let mut result = Vec::new(&env);
         for index in start..end {
             if let Some(grant) = env
@@ -365,7 +369,7 @@ impl Grants {
             .instance()
             .get(&DataKey::RecipientGrants(recipient))
             .unwrap_or_else(|| Vec::new(&env));
-        let (start, end) = Pagination::new(offset, limit).bounds(indexes.len() as u32);
+        let (start, end) = Pagination::bounds(indexes.len() as u32, offset, limit);
         let mut result = Vec::new(&env);
         for position in start..end {
             let grant_id = indexes.get(position).unwrap();
@@ -381,7 +385,7 @@ impl Grants {
     }
 
     /// Get total committed to all grants in basis points (as percentage of treasury).
-    pub fn get_total_committed_bps(env: Env, token: Address) -> u16 {
+    pub fn get_total_committed_bps(env: Env, token: Address) -> u32 {
         let treasury: Address = env
             .storage()
             .instance()
@@ -401,7 +405,7 @@ impl Grants {
             return 0;
         }
 
-        ((total_committed * 10000) / treasury_balance) as u16
+        ((total_committed * 10000) / treasury_balance) as u32
     }
 
     /// Increment funded sessions counter for a program.
@@ -455,7 +459,7 @@ impl Grants {
         let max_allowed = (treasury_balance * (MAX_GRANT_PCT_BPS as i128)) / 10_000;
 
         if total_committed + new_budget > max_allowed {
-            panic!("{:?}", Error::ExceedsTreasuryCap);
+            panic!("{:?}", GrantError::ExceedsTreasuryCap);
         }
     }
 
@@ -467,7 +471,7 @@ impl Grants {
             .get(&TREASURY)
             .expect("Not initialized");
 
-        let client = treasury_interface::Client::new(env, &treasury);
+        let client = TreasuryClient::new(env, &treasury);
         client.get_balance(token)
     }
 }
