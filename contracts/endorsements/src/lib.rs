@@ -1,6 +1,7 @@
 #![no_std]
 
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::Pagination;
 use soroban_sdk::{
     contract, contractevent, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
@@ -165,7 +166,7 @@ impl EndorsementsContract {
             endorsee,
             skill,
             endorser,
-        }.publish(env);
+        }.publish(&env);
 
         // Report health metric for endorsement creation
         if let Some(dashboard) = env
@@ -260,6 +261,36 @@ impl EndorsementsContract {
             .persistent()
             .get(&DataKey::Endorsers(endorsee, skill))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Paginated view over the endorser list for a given endorsee/skill pair.
+    ///
+    /// The full `Endorsers` vector is read once and then sliced with
+    /// `Pagination::bounds`, which clamps `limit` to `MAX_PAGE_SIZE`, so a
+    /// single call never returns more than a bounded number of entries. An
+    /// out-of-range `offset` yields an empty page rather than panicking.
+    pub fn get_endorsers_page(
+        env: Env,
+        endorsee: Address,
+        skill: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        let endorsers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Endorsers(endorsee, skill))
+            .unwrap_or(Vec::new(&env));
+
+        let (start, end) = Pagination::bounds(endorsers.len(), offset, limit);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            if let Some(endorser) = endorsers.get(i) {
+                page.push_back(endorser);
+            }
+        }
+
+        page
     }
 
     pub fn get_endorsed_skills(env: Env, endorsee: Address) -> Vec<(Symbol, u32)> {
@@ -407,6 +438,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use shared::MAX_PAGE_SIZE;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{contract, contractimpl, symbol_short};
 
@@ -599,5 +631,63 @@ mod tests {
         let skill = symbol_short!("DB");
 
         f.endorsements().endorse(&f.outsider, &f.endorsee, &skill);
+    }
+
+    #[test]
+    fn test_get_endorsers_page() {
+        let f = Fixture::setup();
+        let skill = symbol_short!("RUST");
+
+        // One full page plus one extra endorser, each with a completed session.
+        let total: u32 = MAX_PAGE_SIZE + 1;
+        for i in 0..total {
+            let endorser = Address::generate(&f.env);
+            f.sessions().add_session(&SessionRecord {
+                session_id: Symbol::new(&f.env, &std::format!("s{}", i)),
+                mentor: f.endorsee.clone(),
+                learner: endorser.clone(),
+                scheduled_at: 0,
+                duration_mins: 60,
+                amount: 100,
+                token: Address::generate(&f.env),
+                status: SessionStatus::Completed,
+                registered_at: 0,
+            });
+            f.endorsements().endorse(&endorser, &f.endorsee, &skill);
+        }
+
+        let all = f.endorsements().get_endorsers(&f.endorsee, &skill);
+        assert_eq!(all.len(), total);
+
+        // `limit` is clamped to MAX_PAGE_SIZE instead of trusting the caller.
+        let first = f
+            .endorsements()
+            .get_endorsers_page(&f.endorsee, &skill, &0, &u32::MAX);
+        assert_eq!(first.len(), MAX_PAGE_SIZE);
+        assert_eq!(first.get(0).unwrap(), all.get(0).unwrap());
+        assert_eq!(
+            first.get(MAX_PAGE_SIZE - 1).unwrap(),
+            all.get(MAX_PAGE_SIZE - 1).unwrap()
+        );
+
+        // The next page holds the single remaining endorser.
+        let rest = f.endorsements().get_endorsers_page(
+            &f.endorsee,
+            &skill,
+            &MAX_PAGE_SIZE,
+            &MAX_PAGE_SIZE,
+        );
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest.get(0).unwrap(), all.get(MAX_PAGE_SIZE).unwrap());
+
+        // Offsets at or past the end yield an empty page instead of panicking.
+        assert!(f
+            .endorsements()
+            .get_endorsers_page(&f.endorsee, &skill, &total, &MAX_PAGE_SIZE)
+            .is_empty());
+        assert!(f
+            .endorsements()
+            .get_endorsers_page(&f.endorsee, &skill, &(total + 10), &MAX_PAGE_SIZE)
+            .is_empty());
     }
 }
