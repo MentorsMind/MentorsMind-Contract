@@ -132,6 +132,10 @@ pub enum ConsensusError {
     InsufficientSigners = 8,
     /// Proposer not selected for this round
     InvalidProposer = 9,
+    /// Caller is not the consensus admin
+    NotAdmin = 10,
+    /// Cleanup cutoff is later than the current epoch
+    InvalidCleanupEpoch = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -448,4 +452,236 @@ pub fn handle_round_timeout(state: &mut ConsensusState) -> bool {
 /// Reset timeout counter after successful consensus.
 pub fn reset_timeouts(state: &mut ConsensusState) {
     state.consecutive_timeouts = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Finalized-state cleanup (#1479)
+// ---------------------------------------------------------------------------
+// Finalized rounds are kept only for a retention window. Once an epoch is
+// older than the cutoff, its finalized rounds are dropped so consensus state
+// cannot grow without bound. Rounds that are not finalized (still in flight,
+// or failed and awaiting a view change) are never dropped.
+
+/// Number of retained rounds above which cleanup is due automatically.
+pub const MAX_RETAINED_ROUNDS: u32 = 256;
+
+fn drop_finalized_before(
+    env: &Env,
+    rounds: &Vec<ConsensusRound>,
+    before_epoch: u64,
+) -> (Vec<ConsensusRound>, u32) {
+    let mut kept = Vec::new(env);
+    let mut removed: u32 = 0;
+    for round in rounds.iter() {
+        if round.phase == ConsensusPhase::Finalized && round.epoch < before_epoch {
+            removed += 1;
+        } else {
+            kept.push_back(round);
+        }
+    }
+    (kept, removed)
+}
+
+/// Whether the number of retained rounds calls for cleanup.
+pub fn needs_cleanup(retained_rounds: u32) -> bool {
+    retained_rounds > MAX_RETAINED_ROUNDS
+}
+
+/// Admin cleanup: drop finalized rounds from epochs before `before_epoch`.
+///
+/// Returns the rounds to keep and how many were removed. `before_epoch` may not
+/// be later than `current_epoch`, so the live epoch can never be wiped. The
+/// call is idempotent: running it again removes nothing more.
+pub fn cleanup_finalized_rounds(
+    env: &Env,
+    admin: &soroban_sdk::Address,
+    caller: &soroban_sdk::Address,
+    rounds: &Vec<ConsensusRound>,
+    current_epoch: u64,
+    before_epoch: u64,
+) -> Result<(Vec<ConsensusRound>, u32), ConsensusError> {
+    caller.require_auth();
+    if caller != admin {
+        return Err(ConsensusError::NotAdmin);
+    }
+    if before_epoch > current_epoch {
+        return Err(ConsensusError::InvalidCleanupEpoch);
+    }
+    Ok(drop_finalized_before(env, rounds, before_epoch))
+}
+
+/// Automatic cleanup: once more than `MAX_RETAINED_ROUNDS` are held, drop
+/// finalized rounds from every epoch before `current_epoch`. Below the
+/// threshold nothing is touched. Needs no admin because it only reclaims
+/// finalized rounds of past epochs.
+pub fn auto_cleanup_finalized_rounds(
+    env: &Env,
+    rounds: &Vec<ConsensusRound>,
+    current_epoch: u64,
+) -> (Vec<ConsensusRound>, u32) {
+    if !needs_cleanup(rounds.len()) {
+        return (rounds.clone(), 0);
+    }
+    drop_finalized_before(env, rounds, current_epoch)
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Address};
+
+    fn round(env: &Env, n: u64, epoch: u64, phase: ConsensusPhase) -> ConsensusRound {
+        let mut r = start_round(
+            env,
+            n,
+            BytesN::from_array(env, &[n as u8; 32]),
+            Address::generate(env),
+            epoch,
+            3,
+        );
+        r.phase = phase;
+        r
+    }
+
+    fn rounds(env: &Env) -> Vec<ConsensusRound> {
+        let mut v = Vec::new(env);
+        v.push_back(round(env, 1, 1, ConsensusPhase::Finalized));
+        v.push_back(round(env, 2, 1, ConsensusPhase::Failed));
+        v.push_back(round(env, 3, 2, ConsensusPhase::Finalized));
+        v.push_back(round(env, 4, 3, ConsensusPhase::Finalized));
+        v.push_back(round(env, 5, 3, ConsensusPhase::Commit));
+        v
+    }
+
+    fn numbers(v: &Vec<ConsensusRound>) -> soroban_sdk::Vec<u64> {
+        let mut out = soroban_sdk::Vec::new(v.env());
+        for r in v.iter() {
+            out.push_back(r.round);
+        }
+        out
+    }
+
+    #[test]
+    fn removes_only_finalized_rounds_before_the_cutoff() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let (kept, removed) =
+            cleanup_finalized_rounds(&env, &admin, &admin, &rounds(&env), 3, 3).unwrap();
+
+        // rounds 1 and 3 are finalized in epochs < 3; the failed round 2,
+        // the finalized round 4 (epoch 3) and the in-flight round 5 stay.
+        assert_eq!(removed, 2);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(numbers(&kept), soroban_sdk::vec![&env, 2u64, 4, 5]);
+    }
+
+    #[test]
+    fn never_removes_unfinalized_rounds_even_from_old_epochs() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let mut v = Vec::new(&env);
+        v.push_back(round(&env, 1, 1, ConsensusPhase::Failed));
+        v.push_back(round(&env, 2, 1, ConsensusPhase::Prepare));
+
+        let (kept, removed) = cleanup_finalized_rounds(&env, &admin, &admin, &v, 5, 5).unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let (once, _) = cleanup_finalized_rounds(&env, &admin, &admin, &rounds(&env), 3, 3).unwrap();
+        let (twice, removed) = cleanup_finalized_rounds(&env, &admin, &admin, &once, 3, 3).unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn leaves_the_input_untouched() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let input = rounds(&env);
+
+        cleanup_finalized_rounds(&env, &admin, &admin, &input, 3, 3).unwrap();
+
+        assert_eq!(input.len(), 5);
+    }
+
+    #[test]
+    fn rejects_a_caller_who_is_not_the_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        let result = cleanup_finalized_rounds(&env, &admin, &other, &rounds(&env), 3, 3);
+
+        assert_eq!(result, Err(ConsensusError::NotAdmin));
+    }
+
+    #[test]
+    fn refuses_a_cutoff_after_the_current_epoch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let result = cleanup_finalized_rounds(&env, &admin, &admin, &rounds(&env), 3, 4);
+
+        assert_eq!(result, Err(ConsensusError::InvalidCleanupEpoch));
+    }
+
+    #[test]
+    fn a_cutoff_of_zero_removes_nothing() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let (kept, removed) =
+            cleanup_finalized_rounds(&env, &admin, &admin, &rounds(&env), 3, 0).unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(kept.len(), 5);
+    }
+
+    #[test]
+    fn cleanup_is_due_only_above_the_threshold() {
+        assert!(!needs_cleanup(MAX_RETAINED_ROUNDS));
+        assert!(needs_cleanup(MAX_RETAINED_ROUNDS + 1));
+    }
+
+    #[test]
+    fn auto_cleanup_does_nothing_below_the_threshold() {
+        let env = Env::default();
+
+        let (kept, removed) = auto_cleanup_finalized_rounds(&env, &rounds(&env), 3);
+
+        assert_eq!(removed, 0);
+        assert_eq!(kept.len(), 5);
+    }
+
+    #[test]
+    fn auto_cleanup_drops_finalized_rounds_of_past_epochs_above_the_threshold() {
+        let env = Env::default();
+        let mut v = Vec::new(&env);
+        for n in 0..(MAX_RETAINED_ROUNDS as u64 + 1) {
+            v.push_back(round(&env, n, 1, ConsensusPhase::Finalized));
+        }
+        v.push_back(round(&env, 1000, 2, ConsensusPhase::Finalized));
+
+        let (kept, removed) = auto_cleanup_finalized_rounds(&env, &v, 2);
+
+        assert_eq!(removed, MAX_RETAINED_ROUNDS + 1);
+        assert_eq!(kept.len(), 1);
+        assert!(!needs_cleanup(kept.len()));
+    }
 }

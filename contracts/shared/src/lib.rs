@@ -639,6 +639,7 @@ pub use bft_consensus::{
     ConsensusRound, ConsensusPhase, QuorumCertificate, ViewChange,
     ViewChangeReason, ConsensusState, ConsensusError,
     ROUND_TIMEOUT_SECS, MAX_TIMEOUTS_BEFORE_EJECT,
+    cleanup_finalized_rounds, auto_cleanup_finalized_rounds, needs_cleanup, MAX_RETAINED_ROUNDS,
 };
 
 // Content protection exports
