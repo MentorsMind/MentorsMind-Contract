@@ -75,6 +75,7 @@ pub mod transaction_guard;
 pub mod validator_accountability;
 pub mod cross_chain_sync;
 pub mod vrf;
+pub mod zk_audit;
 pub mod bft_consensus;
 pub mod payment_integrity;
 pub mod threat_intelligence;
@@ -627,6 +628,8 @@ pub use vrf::{
     VrfOutput, ValidatorSelection, EpochInfo, ChainCheckpoint,
     MIN_VALIDATORS, DEFAULT_EPOCH_DURATION_SECS,
 };
+
+pub use zk_audit::{commit_audit_entry, verify_audit_commitment, AuditCommitment};
 
 pub use bft_consensus::{
     start_round, cast_prepare, cast_commit, finalize_round, fail_round,
