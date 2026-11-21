@@ -1,24 +1,26 @@
 version: '3.8'
 
+# All environment-specific / sensitive configuration comes from .env.
+# Missing variables abort startup so misconfiguration is immediately obvious.
 services:
   stellar:
-    image: stellar/quickstart:latest
-    container_name: mentorminds-stellar
+    image: ${STELLAR_IMAGE:?STELLAR_IMAGE must be set in .env}
+    container_name: ${STELLAR_CONTAINER_NAME:?STELLAR_CONTAINER_NAME must be set in .env}
     ports:
-      - "8000:8000"   # Horizon API
-      - "8001:8001"   # Stellar RPC
-      - "8002:8002"   # Friendbot (for funding accounts)
-      - "8003:8003"   # Soroban RPC
+      - "${HORIZON_PORT:?HORIZON_PORT must be set in .env}:8000"   # Horizon API
+      - "${RPC_PORT:?RPC_PORT must be set in .env}:8001"   # Stellar RPC
+      - "${FRIENDBOT_PORT:?FRIENDBOT_PORT must be set in .env}:8002"   # Friendbot (for funding accounts)
+      - "${SOROBAN_RPC_PORT:?SOROBAN_RPC_PORT must be set in .env}:8003"   # Soroban RPC
     environment:
-      - STELLAR_NETWORK=standalone
-      - CATCHUP_COMPLETE=true
-      - ENABLE_SOROBAN_RPC=true
-      - ENABLE_SOROBAN_HTTP=true
-      - ENABLE_FRIENDBOT=true
-      - FRIENDBOT_URL=http://localhost:8002
-      - HORIZON_URL=http://localhost:8000
-      - RPC_URL=http://localhost:8001
-      - SOROBAN_RPC_URL=http://localhost:8003
+      - STELLAR_NETWORK=${STELLAR_NETWORK:?STELLAR_NETWORK must be set in .env}
+      - CATCHUP_COMPLETE=${CATCHUP_COMPLETE:?CATCHUP_COMPLETE must be set in .env}
+      - ENABLE_SOROBAN_RPC=${ENABLE_SOROBAN_RPC:?ENABLE_SOROBAN_RPC must be set in .env}
+      - ENABLE_SOROBAN_HTTP=${ENABLE_SOROBAN_HTTP:?ENABLE_SOROBAN_HTTP must be set in .env}
+      - ENABLE_FRIENDBOT=${ENABLE_FRIENDBOT:?ENABLE_FRIENDBOT must be set in .env}
+      - FRIENDBOT_URL=${FRIENDBOT_URL:?FRIENDBOT_URL must be set in .env}
+      - HORIZON_URL=${HORIZON_URL:?HORIZON_URL must be set in .env}
+      - RPC_URL=${RPC_URL:?RPC_URL must be set in .env}
+      - SOROBAN_RPC_URL=${SOROBAN_RPC_URL:?SOROBAN_RPC_URL must be set in .env}
     volumes:
       - stellar_data:/opt/stellar
     healthcheck:

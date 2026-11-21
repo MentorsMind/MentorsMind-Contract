@@ -116,7 +116,7 @@ jobs:
           echo "GITHUB_SHA=${{ github.sha }}" >> "$GITHUB_ENV"
           echo "GITHUB_REF_NAME=${{ github.ref_name }}" >> "$GITHUB_ENV"
 
-      # Run the benchmark binary; exits 1 on >10% regression.
+      # Run the benchmark binary; exits 1 on >5% regression.
       - name: Run benchmarks
         id: bench
         run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
@@ -221,7 +221,7 @@ jobs:
 
               ${table}
 
-              > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+              > Baselines gated at **±5%**. WASM alert at **> 64 KB**.
               > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})${optimizationStatus}
 
               **📊 Coverage:** ${results.length} functions across ${[...new Set(results.map(r => r.contract))].length} contracts`;
