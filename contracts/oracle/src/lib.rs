@@ -7,6 +7,7 @@ use shared::{
     isolate_chain,
     is_chain_isolated,
     lift_chain_isolation,
+    record_governance_proposal_passed,
     record_inconsistency,
     // Validator accountability (#869)
     apply_slash,
@@ -859,10 +860,19 @@ impl OracleContract {
         );
     }
 
-    /// Admin: lift oracle chain isolation after the cooling-off period.
-    pub fn lift_oracle_isolation(env: Env, admin: Address) -> bool {
+    /// Lift oracle chain isolation after the cooling-off period and a
+    /// governance proposal approving re-admission has passed.
+    ///
+    /// Admin authorization alone is not sufficient: `proposal_id` must match
+    /// a proposal recorded as passed by governance.
+    pub fn lift_oracle_isolation(env: Env, admin: Address, proposal_id: u32) -> bool {
         Self::require_admin_or_role(&env, &admin, Symbol::new(&env, "ORACLE_ADMIN"));
-        lift_chain_isolation(&env, 0u32)
+        lift_chain_isolation(&env, 0u32, proposal_id)
+    }
+
+    /// Record that a governance vote passed (called by the governance contract).
+    pub fn record_gov_approval(env: Env, proposal_id: u32) {
+        record_governance_proposal_passed(&env, proposal_id);
     }
 
     /// Query whether the oracle chain is currently isolated.
@@ -1344,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oracle_isolation_lift_after_cooldown() {
+    fn test_oracle_isolation_lift_requires_governance_approval() {
         let (env, admin, contract_id) = setup();
         env.ledger().set_timestamp(1_000);
         let client = OracleContractClient::new(&env, &contract_id);
@@ -1352,15 +1362,18 @@ mod tests {
         client.isolate_oracle_chain(&admin, &Symbol::new(&env, "test"));
         assert!(client.is_oracle_isolated());
 
-        // Not yet eligible.
-        let lifted = client.lift_oracle_isolation(&admin);
-        assert!(!lifted);
+        // Not yet eligible, and no governance proposal has passed.
+        assert!(!client.lift_oracle_isolation(&admin, &1));
 
-        // Advance past isolation duration.
+        // Advance past isolation duration. Admin alone still cannot lift.
         env.ledger()
             .set_timestamp(1_000 + FEEDER_ISOLATION_DURATION_SECS + 1);
-        let lifted = client.lift_oracle_isolation(&admin);
-        assert!(lifted);
+        assert!(!client.lift_oracle_isolation(&admin, &1));
+        assert!(client.is_oracle_isolated());
+
+        // A passed governance proposal is required to re-admit the chain.
+        client.record_gov_approval(&1);
+        assert!(client.lift_oracle_isolation(&admin, &1));
         assert!(!client.is_oracle_isolated());
     }
 
