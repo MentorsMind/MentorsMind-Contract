@@ -59,6 +59,10 @@ path = "fuzz_targets/fuzz_stateful_harness.rs"
 name = "fuzz_staking_rewards"
 path = "fuzz_targets/fuzz_staking_rewards.rs"
 
+[[test]]
+name = "fuzz_milestone_escrow"
+path = "fuzz_targets/fuzz_milestone_escrow.rs"
+
 [profile.release]
 opt-level = 3
 debug = 1
