@@ -1,6 +1,17 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
+
+/// Errors returned by interface registration (#1431).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// A registration reused a version while changing the interface hash.
+    VersionNotBumped = 1,
+    /// The supplied version is zero.
+    InvalidVersion = 2,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12,6 +23,8 @@ pub enum DataKey {
     InterfaceIds,
     InterfaceDescriptor(Symbol),
     Quarantined(Address),
+    /// Minimum acceptable version per interface id (#1431).
+    MinVersion(Symbol),
 }
 
 #[contracttype]
@@ -27,7 +40,12 @@ pub struct InterfaceEntry {
 pub struct InterfaceData {
     pub contract: Address,
     pub version: u32,
+    /// Hash of the interface definition registered at `version` (#1431).
+    pub interface_hash: BytesN<32>,
 }
+
+/// Canonical name for the stored interface record (#1431).
+pub type InterfaceRecord = InterfaceData;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,7 +74,35 @@ impl InterfaceRegistryContract {
             .set(&DataKey::InterfaceIds, &Vec::<Symbol>::new(&env));
     }
 
-    pub fn register_interface(env: Env, contract: Address, interface_id: Symbol, version: u32) {
+    /// Register an interface without an explicit hash (legacy entry point).
+    ///
+    /// Uses a zero hash; callers that track interface definitions should use
+    /// `register_interface_with_hash` so a version bump can be enforced.
+    pub fn register_interface(
+        env: Env,
+        contract: Address,
+        interface_id: Symbol,
+        version: u32,
+    ) -> Result<(), Error> {
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        Self::register_interface_with_hash(env, contract, interface_id, version, zero_hash)
+    }
+
+    /// Register a contract interface with its definition hash (#1431).
+    ///
+    /// Re-registering the same version with a different hash is rejected: the
+    /// version must be bumped whenever the interface changes.
+    pub fn register_interface_with_hash(
+        env: Env,
+        contract: Address,
+        interface_id: Symbol,
+        version: u32,
+        interface_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        if version == 0 {
+            return Err(Error::InvalidVersion);
+        }
+
         let admin: Address = env
             .storage()
             .persistent()
@@ -65,6 +111,19 @@ impl InterfaceRegistryContract {
         admin.require_auth();
 
         let key = DataKey::Interface(interface_id.clone());
+
+        // Reject a changed interface that did not bump its version.
+        if let Some(existing) = env.storage().persistent().get::<_, InterfaceData>(&key) {
+            if existing.version == version && existing.interface_hash != interface_hash {
+                return Err(Error::VersionNotBumped);
+            }
+        }
+
+        let min_version = Self::get_min_version(env.clone(), interface_id.clone());
+        if version < min_version {
+            return Err(Error::InvalidVersion);
+        }
+
         let mut is_new = false;
 
         let mut ids: Vec<Symbol> = env
@@ -84,6 +143,7 @@ impl InterfaceRegistryContract {
             &InterfaceData {
                 contract: contract.clone(),
                 version,
+                interface_hash,
             },
         );
 
@@ -109,6 +169,19 @@ impl InterfaceRegistryContract {
                 (contract, version),
             );
         }
+
+        Ok(())
+    }
+
+    /// Recorded hash of the interface definition (#1431).
+    pub fn get_interface_hash(env: Env, interface_id: Symbol) -> BytesN<32> {
+        let key = DataKey::Interface(interface_id);
+        let data: InterfaceData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Interface not found");
+        data.interface_hash
     }
 
     pub fn get_contract(env: Env, interface_id: Symbol) -> Address {
@@ -157,13 +230,13 @@ impl InterfaceRegistryContract {
         result
     }
 
-    pub fn register_yield_contract(env: Env, contract: Address, version: u32) {
+    pub fn register_yield_contract(env: Env, contract: Address, version: u32) -> Result<(), Error> {
         Self::register_interface(
             env.clone(),
             contract,
             Symbol::new(&env, Self::YIELD_INTERFACE),
             version,
-        );
+        )
     }
 
     pub fn get_yield_contract(env: Env) -> Address {
@@ -180,9 +253,13 @@ impl InterfaceRegistryContract {
         if Self::is_quarantined(env.clone(), address.clone()) {
             return false;
         }
-        let key = DataKey::Interface(expected_interface);
+        let key = DataKey::Interface(expected_interface.clone());
         match env.storage().persistent().get::<_, InterfaceData>(&key) {
-            Some(data) => data.contract == address,
+            Some(data) => {
+                // Consumers must not accept a registration below the
+                // governance-defined minimum version (#1431).
+                data.contract == address && data.version >= Self::get_min_version(env, expected_interface)
+            }
             None => false,
         }
     }
@@ -243,13 +320,48 @@ impl InterfaceRegistryContract {
 
     /// Register `contract` as a resolution oracle under the canonical
     /// `oracle_v1` interface id. Admin-only (delegates to `register_interface`).
-    pub fn register_oracle(env: Env, contract: Address, version: u32) {
+    pub fn register_oracle(env: Env, contract: Address, version: u32) -> Result<(), Error> {
         Self::register_interface(
             env.clone(),
             contract,
             Symbol::new(&env, Self::ORACLE_INTERFACE),
             version,
-        );
+        )
+    }
+
+    // ── Minimum acceptable version (#1431) ──────────────────────────────────
+
+    /// Set the minimum acceptable version for an interface. Admin-only.
+    pub fn set_min_version(
+        env: Env,
+        admin: Address,
+        interface_id: Symbol,
+        min_version: u32,
+    ) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        if min_version == 0 {
+            return Err(Error::InvalidVersion);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinVersion(interface_id), &min_version);
+        Ok(())
+    }
+
+    /// Minimum version consumers should accept for `interface_id` (default 1).
+    pub fn get_min_version(env: Env, interface_id: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinVersion(interface_id))
+            .unwrap_or(1)
     }
 
     /// Whether `address` is a registered (and non-quarantined) resolution
@@ -432,5 +544,85 @@ mod tests {
             registry.require_interface(&other, &interface);
         }));
         assert!(result.is_err());
+    }
+
+    // ── #1431: interface version compatibility ──────────────────────────────
+
+    #[test]
+    fn test_version_bump_is_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, contract) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        let hash_v1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash_v2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        registry.register_interface_with_hash(&contract, &interface, &1, &hash_v1);
+        assert_eq!(registry.get_version(&interface), 1);
+        assert_eq!(registry.get_interface_hash(&interface), hash_v1);
+
+        // A changed interface with a bumped version is accepted.
+        registry.register_interface_with_hash(&contract, &interface, &2, &hash_v2);
+        assert_eq!(registry.get_version(&interface), 2);
+        assert_eq!(registry.get_interface_hash(&interface), hash_v2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1)")]
+    fn test_changed_interface_without_version_bump_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, contract) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        let hash_v1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash_changed = BytesN::from_array(&env, &[9u8; 32]);
+
+        registry.register_interface_with_hash(&contract, &interface, &1, &hash_v1);
+        registry.register_interface_with_hash(&contract, &interface, &1, &hash_changed);
+    }
+
+    #[test]
+    fn test_same_version_same_hash_is_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, contract) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        let hash = BytesN::from_array(&env, &[3u8; 32]);
+
+        registry.register_interface_with_hash(&contract, &interface, &1, &hash);
+        registry.register_interface_with_hash(&contract, &interface, &1, &hash);
+        assert_eq!(registry.get_version(&interface), 1);
+    }
+
+    #[test]
+    fn test_minimum_acceptable_version_is_queryable_and_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, contract) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        let hash = BytesN::from_array(&env, &[4u8; 32]);
+
+        registry.register_interface_with_hash(&contract, &interface, &1, &hash);
+        assert_eq!(registry.get_min_version(&interface), 1);
+        assert!(registry.verify(&contract, &interface));
+
+        registry.set_min_version(&_admin, &interface, &2);
+        assert_eq!(registry.get_min_version(&interface), 2);
+        // A stale (below-minimum) registration no longer verifies.
+        assert!(!registry.verify(&contract, &interface));
+
+        registry.register_interface_with_hash(&contract, &interface, &2, &hash);
+        assert!(registry.verify(&contract, &interface));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_zero_version_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, contract) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        let hash = BytesN::from_array(&env, &[5u8; 32]);
+        registry.register_interface_with_hash(&contract, &interface, &0, &hash);
     }
 }
