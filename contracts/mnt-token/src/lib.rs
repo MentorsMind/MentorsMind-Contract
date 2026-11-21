@@ -6,6 +6,7 @@ use soroban_sdk::{
     Env, String, Symbol, IntoVal, MuxedAddress,
 };
 use soroban_token_sdk::metadata::TokenMetadata;
+use shared::safe_math::SafeMath;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -532,9 +533,14 @@ impl TokenInterface for MNTToken {
         }
 
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
-        if allowance < amount {
-            panic!("Insufficient allowance");
+        // Guard the decrement explicitly: SafeMath::safe_sub panics with a
+        // generic underflow error, while this entry point must report the
+        // token-specific InsufficientAllowance error.
+        match allowance.checked_sub(amount) {
+            Some(value) if value >= 0 => (),
+            _ => panic_with_error!(&env, Error::InsufficientAllowance),
         }
+        let remaining_allowance = SafeMath::safe_sub(allowance, &env, amount);
 
         let from_balance = Self::balance(env.clone(), from.clone());
         if from_balance < amount {
@@ -545,7 +551,7 @@ impl TokenInterface for MNTToken {
 
         env.storage().persistent().set(
             &DataKey::Allowance(from.clone(), spender.clone()),
-            &(allowance - amount),
+            &remaining_allowance,
         );
         env.storage()
             .persistent()
@@ -1105,5 +1111,29 @@ mod test {
             *topics,
             (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Unpaused")).into_val(&env)
         );
+    }
+
+    #[test]
+    fn test_transfer_from_allowance_underflow_guard() {
+        let (env, _admin, _guardian, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.mint(&owner, &1_000);
+        client.approve(&owner, &spender, &500, &100);
+
+        match client
+            .try_transfer_from(&spender, &owner, &recipient, &501)
+            .err()
+            .unwrap()
+        {
+            Ok(e) => assert_eq!(e.get_code(), Error::InsufficientAllowance as u32),
+            Err(e) => panic!("unexpected invoke error: {e:?}"),
+        }
+
+        // Nothing moved: the guard aborts before any storage write.
+        assert_eq!(client.allowance(&owner, &spender), 500);
+        assert_eq!(client.balance(&owner), 1_000);
+        assert_eq!(client.balance(&recipient), 0);
     }
 }
