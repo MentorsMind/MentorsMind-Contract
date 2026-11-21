@@ -1,3 +1,7 @@
+# Standalone workspace so this crate can be tested independently of the
+# contract workspace (see the comment above about intentional exclusion).
+[workspace]
+
 [package]
 name = "mentormind-fuzz"
 version = "0.1.0"

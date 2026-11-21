@@ -323,13 +323,146 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
+// -------- Seed corpus ----------------------------------------------------
+// The seed corpus lives in `fuzz/corpus/fuzz_stateful_harness/`. Each file is
+// a newline-delimited trace of the operations below, derived from the valid
+// multisig/timelock transactions in this harness's happy-path test and the
+// timelock schedule/execute tests. Seeds are loaded as an additional strategy
+// so fuzzing starts from representative transactions instead of empty input.
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/fuzz_stateful_harness");
+
+fn parse_seed_line(line: &str) -> Result<Op, String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let num = |i: usize| -> Result<u64, String> {
+        parts.get(i).ok_or_else(|| format!("missing argument in: {line}"))?
+            .parse::<u64>().map_err(|e| format!("bad number in '{line}': {e}"))
+    };
+    match parts.first().copied() {
+        Some("init_ms") => {
+            let n = num(1)? as usize;
+            Ok(Op::InitMS { signers: (0..n as u64).collect(), threshold: num(2)? as u32 })
+        }
+        Some("init_tl") => Ok(Op::InitTL { admin: num(1)? }),
+        Some("ms_propose") => Ok(Op::MsPropose {
+            proposer: num(1)?, action: num(2)? as u32, arg: num(3)?,
+        }),
+        Some("ms_sign") => Ok(Op::MsSign { signer: num(1)?, pid: num(2)? as u32 }),
+        Some("ms_execute") => Ok(Op::MsExecute { pid: num(1)? as u32 }),
+        Some("ms_cancel") => Ok(Op::MsCancel { caller: num(1)?, pid: num(2)? as u32 }),
+        Some("tl_schedule") => Ok(Op::TlSchedule {
+            caller: num(1)?, delay: num(2)?, salt: num(3)? as u8,
+        }),
+        Some("tl_execute") => Ok(Op::TlExecute { op_slot: num(1)? as u32 }),
+        Some("tl_cancel") => Ok(Op::TlCancel { caller: num(1)?, op_slot: num(2)? as u32 }),
+        Some("advance") => Ok(Op::AdvanceClock { secs: num(1)? }),
+        other => Err(format!("unknown seed operation: {other:?}")),
+    }
+}
+
+fn load_seed_corpus() -> Vec<Vec<Op>> {
+    let mut seeds = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(CORPUS_DIR)
+        .expect("seed corpus directory must exist")
+        .map(|e| e.expect("read corpus entry").path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("read seed file");
+        let trace: Vec<Op> = text.lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .map(|l| parse_seed_line(l).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+            .collect();
+        assert!(!trace.is_empty(), "{}: empty seed", path.display());
+        seeds.push(trace);
+    }
+    assert!(seeds.len() >= 10, "at least 10 seed inputs required");
+    seeds
+}
+
+/// Apply one operation to the combined system (shared by random and seed traces).
+fn apply_op(sys: &mut System, tl_op_ids: &mut Vec<OpId>, op: &Op) {
+    match op {
+        Op::InitMS { signers, threshold } => {
+            let s: Vec<Addr> = signers.iter().map(|&x| Addr(x)).collect();
+            let _ = sys.ms.init(&s, *threshold);
+        }
+        Op::InitTL { admin } => {
+            let _ = sys.tl.init(Addr(*admin));
+        }
+        Op::MsPropose { proposer, action, arg } => {
+            let p = Addr(*proposer);
+            let act = match action % 5 {
+                0 => MsAction::Nop,
+                1 => MsAction::AddSigner(Addr(*arg)),
+                2 => MsAction::RemoveSigner(Addr(*arg)),
+                3 => MsAction::SetThreshold((*arg as u32) % 50),
+                4 => {
+                    let delay = TL_MIN_DELAY + (*arg % (TL_MAX_DELAY - TL_MIN_DELAY + 1));
+                    let mut salt = [0u8; 32];
+                    for b in salt.iter_mut() { *b = *arg as u8; }
+                    MsAction::ScheduleTimelock { delay, salt }
+                }
+                _ => unreachable!(),
+            };
+            let r = sys.ms.propose(p, sys.clock, act.clone());
+            if let (Ok(pid), MsAction::ScheduleTimelock { delay, salt }) = (r, &act) {
+                sys.pending_tl.insert(pid, (*delay, *salt));
+            }
+        }
+        Op::MsSign { signer, pid } => {
+            let _ = sys.ms.sign(Addr(*signer), *pid, sys.clock);
+        }
+        Op::MsExecute { pid } => {
+            let r = sys.ms.execute(*pid, sys.clock);
+            if let Ok(MsAction::ScheduleTimelock { delay, salt }) = r {
+                let caller = Addr(0);
+                if let Ok((op_id, _)) = sys.tl.schedule(caller, delay, salt, sys.clock) {
+                    tl_op_ids.push(op_id);
+                }
+            }
+        }
+        Op::MsCancel { caller, pid } => {
+            let _ = sys.ms.cancel(Addr(*caller), *pid, sys.clock);
+        }
+        Op::TlSchedule { caller, delay, salt } => {
+            let caller = Addr(*caller);
+            let salt_arr = [*salt; 32];
+            if let Ok((op_id, _)) = sys.tl.schedule(caller, *delay, salt_arr, sys.clock) {
+                tl_op_ids.push(op_id);
+            }
+        }
+        Op::TlExecute { op_slot } => {
+            if !tl_op_ids.is_empty() {
+                let idx = (*op_slot as usize) % tl_op_ids.len();
+                let id = tl_op_ids[idx];
+                let _ = sys.tl.execute(id, sys.clock);
+            }
+        }
+        Op::TlCancel { caller, op_slot } => {
+            if !tl_op_ids.is_empty() {
+                let idx = (*op_slot as usize) % tl_op_ids.len();
+                let id = tl_op_ids[idx];
+                let _ = sys.tl.cancel(Addr(*caller), id);
+            }
+        }
+        Op::AdvanceClock { secs } => {
+            sys.clock = sys.clock.saturating_add(*secs);
+        }
+    }
+}
+
 // -------- The main stateful property test --------------------------------
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     #[test]
     fn fuzz_integrated_stateful_harness(
-        ops in prop::collection::vec(op_strategy(), 0..=200),
+        // Start from recorded valid transactions as well as random sequences.
+        ops in prop_oneof![
+            prop::collection::vec(op_strategy(), 0..=200),
+            proptest::sample::select(load_seed_corpus()),
+        ],
     ) {
         let mut sys = System::new();
         // Track timelock op_ids by insertion order for op_slot indexing
@@ -340,77 +473,7 @@ proptest! {
         sys.assert_global_invariants(0);
 
         for (step, op) in ops.iter().enumerate() {
-            match op {
-                Op::InitMS { signers, threshold } => {
-                    let s: Vec<Addr> = signers.iter().map(|&x| Addr(x)).collect();
-                    let _ = sys.ms.init(&s, *threshold);
-                    // INV-1: init never panics; and if success, invariant holds.
-                }
-                Op::InitTL { admin } => {
-                    let _ = sys.tl.init(Addr(*admin));
-                }
-                Op::MsPropose { proposer, action, arg } => {
-                    let p = Addr(*proposer);
-                    // Derive an action from (action, arg)
-                    let act = match action % 5 {
-                        0 => MsAction::Nop,
-                        1 => MsAction::AddSigner(Addr(*arg)),
-                        2 => MsAction::RemoveSigner(Addr(*arg)),
-                        3 => MsAction::SetThreshold((*arg as u32) % 50),
-                        4 => {
-                            let delay = TL_MIN_DELAY + (*arg % (TL_MAX_DELAY - TL_MIN_DELAY + 1));
-                            let mut salt = [0u8; 32];
-                            for b in salt.iter_mut() { *b = *arg as u8; }
-                            MsAction::ScheduleTimelock { delay, salt }
-                        }
-                        _ => unreachable!(),
-                    };
-                    let r = sys.ms.propose(p, sys.clock, act.clone());
-                    if let (Ok(pid), MsAction::ScheduleTimelock { delay, salt }) = (r, &act) {
-                        sys.pending_tl.insert(pid, (*delay, *salt));
-                    }
-                }
-                Op::MsSign { signer, pid } => {
-                    let _ = sys.ms.sign(Addr(*signer), *pid, sys.clock);
-                }
-                Op::MsExecute { pid } => {
-                    let r = sys.ms.execute(*pid, sys.clock);
-                    if let Ok(MsAction::ScheduleTimelock { delay, salt }) = r {
-                        // Schedule on timelock via governance-approved caller
-                        let caller = Addr(0); // represents governance contract itself
-                        if let Ok((op_id, _)) = sys.tl.schedule(caller, delay, salt, sys.clock) {
-                            tl_op_ids.push(op_id);
-                        }
-                    }
-                }
-                Op::MsCancel { caller, pid } => {
-                    let _ = sys.ms.cancel(Addr(*caller), *pid, sys.clock);
-                }
-                Op::TlSchedule { caller, delay, salt } => {
-                    let caller = Addr(*caller);
-                    let salt_arr = [*salt; 32];
-                    if let Ok((op_id, _)) = sys.tl.schedule(caller, *delay, salt_arr, sys.clock) {
-                        tl_op_ids.push(op_id);
-                    }
-                }
-                Op::TlExecute { op_slot } => {
-                    if !tl_op_ids.is_empty() {
-                        let idx = (*op_slot as usize) % tl_op_ids.len();
-                        let id = tl_op_ids[idx];
-                        let _ = sys.tl.execute(id, sys.clock);
-                    }
-                }
-                Op::TlCancel { caller, op_slot } => {
-                    if !tl_op_ids.is_empty() {
-                        let idx = (*op_slot as usize) % tl_op_ids.len();
-                        let id = tl_op_ids[idx];
-                        let _ = sys.tl.cancel(Addr(*caller), id);
-                    }
-                }
-                Op::AdvanceClock { secs } => {
-                    sys.clock = sys.clock.saturating_add(*secs);
-                }
-            }
+            apply_op(&mut sys, &mut tl_op_ids, op);
             // ---- Global invariant assertion EVERY step ----
             // INV-1: we never panicked to get here (proptest itself would fail on panic)
             // INV-2,3,4: via assert_global_invariants
@@ -496,5 +559,19 @@ proptest! {
             }
         }
         sys.assert_global_invariants(999);
+    }
+}
+
+/// Replay every corpus seed as a concrete transaction trace and verify that
+/// each one is a valid, invariant-preserving starting point for the fuzzer.
+#[test]
+fn seed_corpus_transactions_are_valid() {
+    for trace in load_seed_corpus() {
+        let mut sys = System::new();
+        let mut tl_op_ids: Vec<OpId> = Vec::new();
+        for (step, op) in trace.iter().enumerate() {
+            apply_op(&mut sys, &mut tl_op_ids, op);
+            sys.assert_global_invariants(step + 1);
+        }
     }
 }
