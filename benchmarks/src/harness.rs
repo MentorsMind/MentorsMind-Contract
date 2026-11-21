@@ -110,7 +110,7 @@ pub fn wasm_size(crate_name: &str) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Fraction increase above which a metric is a regression (10 %).
-const REGRESSION_THRESHOLD: f64 = 0.10;
+const REGRESSION_THRESHOLD: f64 = 0.05;
 /// WASM size alert threshold: 64 KB.
 const WASM_ALERT_BYTES: u64 = 64 * 1024;
 
@@ -174,7 +174,7 @@ pub fn check_regressions(results: &[BenchResult], baseline_path: &Path) -> Vec<R
                 result.contract, result.entry_point, result.wasm_bytes
             );
         }
-        // Also apply 10 % regression gate to WASM size if we have a baseline
+        // Also apply 5 % regression gate to WASM size if we have a baseline
         if b.wasm_bytes > 0 {
             check_metric(
                 result,

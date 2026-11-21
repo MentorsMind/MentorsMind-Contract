@@ -4,11 +4,12 @@
 extern crate std;
 
 use crate::harness::{measure, wasm_size, BenchResult};
-use mentorminds_escrow::{EscrowContract, EscrowContractClient};
+use mentorminds_escrow::{DataKey, EscrowContract, EscrowContractClient, MilestoneSpec};
+use shared::emergency::EmergencyAction;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
-    Address, Env, Symbol, Vec as SorobanVec,
+    Address, BytesN, Env, Symbol, Vec as SorobanVec,
 };
 
 const CONTRACT: &str = "escrow";
@@ -66,6 +67,23 @@ impl Fixture {
             &self.token,
             &(self.env.ledger().timestamp() + 3600),
             &1u32,
+        )
+    }
+
+    /// Create a milestone escrow split evenly across `count` milestones.
+    fn create_milestones(&self, count: u32) -> u64 {
+        let mut milestones = SorobanVec::new(&self.env);
+        for i in 0..count {
+            milestones.push_back(MilestoneSpec {
+                description_hash: BytesN::<32>::from_array(&self.env, &[i as u8; 32]),
+                amount: 1_000i128,
+            });
+        }
+        self.client().create_milestone_escrow(
+            &self.mentor,
+            &self.learner,
+            &milestones,
+            &self.token,
         )
     }
 }
@@ -175,6 +193,99 @@ pub fn run() -> Vec<BenchResult> {
             storage_writes: 0,
             wasm_bytes: wasm,
         });
+    }
+
+    // --- milestone escrow gas estimation (1 / 5 / 10 milestones) ---
+    for count in [1u32, 5, 10] {
+        // create_milestone_escrow
+        {
+            let f = Fixture::new();
+            let snap = measure(&f.env, || {
+                f.create_milestones(count);
+            });
+            results.push(BenchResult {
+                contract: CONTRACT.into(),
+                entry_point: format!("create_milestone_escrow_{count}"),
+                cpu_instructions: snap.cpu_instructions,
+                mem_bytes: snap.mem_bytes,
+                storage_reads: 0,
+                storage_writes: 0,
+                wasm_bytes: wasm,
+            });
+        }
+
+        // complete_milestone (first milestone of an n-milestone escrow)
+        {
+            let f = Fixture::new();
+            let escrow_id = f.create_milestones(count);
+            let snap = measure(&f.env, || {
+                f.client().complete_milestone(&escrow_id, &0u32);
+            });
+            results.push(BenchResult {
+                contract: CONTRACT.into(),
+                entry_point: format!("complete_milestone_{count}"),
+                cpu_instructions: snap.cpu_instructions,
+                mem_bytes: snap.mem_bytes,
+                storage_reads: 0,
+                storage_writes: 0,
+                wasm_bytes: wasm,
+            });
+        }
+
+        // emergency release (multisig path) for an n-milestone escrow.
+        // Seed a pre-approved action so the measurement isolates the release.
+        {
+            let f = Fixture::new();
+            let escrow_id = f.create_milestones(count);
+            let reason = BytesN::<32>::from_array(&f.env, &[0xABu8; 32]);
+            let emergency_admin = Address::generate(&f.env);
+            let mut signers = SorobanVec::new(&f.env);
+            for i in 0..7 {
+                signers.push_back(Address::generate(&f.env));
+            }
+            let mut approved = SorobanVec::new(&f.env);
+            for signer in signers.iter().take(4) {
+                approved.push_back(signer);
+            }
+            let now = f.env.ledger().timestamp();
+            f.env.as_contract(&f.contract_id, || {
+                let storage = f.env.storage().persistent();
+                storage.set(&DataKey::EmergencySigners, &signers);
+                storage.set(
+                    &DataKey::EmergencyProposal(0),
+                    &EmergencyAction {
+                        id: 0,
+                        action_type: Symbol::new(&f.env, "emergency_release"),
+                        escrow_id,
+                        amount: 1_000,
+                        proposer: signers.get(0).unwrap(),
+                        reason_hash: reason.clone(),
+                        params_hash: BytesN::<32>::from_array(&f.env, &[0x11u8; 32]),
+                        proposed_at: now,
+                        execute_after: now,
+                        approval_count: 4,
+                        signers: approved,
+                        executed: false,
+                        failed: false,
+                    },
+                );
+            });
+            f.client()
+                .grant_emergency_admin(&f.admin, &emergency_admin);
+            let snap = measure(&f.env, || {
+                f.client()
+                    .emergency_release(&emergency_admin, &escrow_id, &reason, &0u32);
+            });
+            results.push(BenchResult {
+                contract: CONTRACT.into(),
+                entry_point: format!("emergency_release_{count}"),
+                cpu_instructions: snap.cpu_instructions,
+                mem_bytes: snap.mem_bytes,
+                storage_reads: 0,
+                storage_writes: 0,
+                wasm_bytes: wasm,
+            });
+        }
     }
 
     print_suite(&results);
