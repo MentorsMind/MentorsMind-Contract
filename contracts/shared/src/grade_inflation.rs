@@ -11,8 +11,11 @@ pub const MIN_SESSIONS_FOR_ANALYSIS: u32 = 10;
 pub const OUTLIER_ZSCORE_THRESHOLD: i128 = 250; // 2.5 * 100 (scaled)
 /// Inflation detection window (sessions to analyze)
 pub const INFLATION_WINDOW: u32 = 20;
-/// Maximum allowed grade inflation rate (basis points per session)
+/// Maximum allowed grade inflation rate (basis points per session) at the
+/// baseline session volume.
 pub const MAX_INFLATION_RATE_BPS: u32 = 50; // 0.5% per session
+/// Session volume at which the fixed baseline threshold applies.
+pub const VOLUME_BASELINE_SESSIONS: u32 = INFLATION_WINDOW;
 /// Mentor score adjustment factor for detected inflation
 pub const INFLATION_PENALTY_BPS_PER_DETECTION: u32 = 200; // 2% per detection
 
@@ -183,6 +186,33 @@ pub fn calculate_grade_distribution(
     }
 }
 
+/// Volume-adjusted inflation threshold (basis points per session).
+///
+/// Formula: `threshold(n) = MAX_INFLATION_RATE_BPS * sqrt(n / BASELINE)`,
+/// where `n` is the mentor's total session count and `BASELINE` is
+/// `VOLUME_BASELINE_SESSIONS`. The square root keeps sensitivity normalized:
+/// low-volume mentors use a *lower* threshold (catching inflation sooner),
+/// while high-volume mentors use a *higher* threshold, avoiding the false
+/// positives that a fixed absolute rate produces across many sessions.
+///
+/// Calculated with integer arithmetic to avoid floating point in Soroban:
+/// `sqrt(n * MAX_INFLATION_RATE_BPS^2 / BASELINE)`.
+pub fn volume_adjusted_inflation_threshold(session_count: u32) -> u32 {
+    if session_count == 0 {
+        return 0;
+    }
+    let scaled = (session_count as u64)
+        .saturating_mul(MAX_INFLATION_RATE_BPS as u64)
+        .saturating_mul(MAX_INFLATION_RATE_BPS as u64)
+        / VOLUME_BASELINE_SESSIONS as u64;
+    integer_sqrt(scaled) as u32
+}
+
+/// Whether an observed inflation rate exceeds the volume-adjusted threshold.
+pub fn exceeds_volume_adjusted_threshold(inflation_rate_bps: u32, session_count: u32) -> bool {
+    inflation_rate_bps > volume_adjusted_inflation_threshold(session_count)
+}
+
 /// Detect grade inflation using statistical analysis
 pub fn detect_grade_inflation(
     env: &Env,
@@ -267,8 +297,11 @@ pub fn detect_grade_inflation(
         }
     }
     
-    // Determine if inflation detected
-    let inflation_detected = inflation_rate_bps > MAX_INFLATION_RATE_BPS && recent_count >= MIN_SESSIONS_FOR_ANALYSIS;
+    // Determine if inflation detected. The threshold is scaled by
+    // sqrt(total session volume) (documented above) instead of using a fixed
+    // absolute rate, so sensitivity is comparable across mentor volumes.
+    let inflation_detected = exceeds_volume_adjusted_threshold(inflation_rate_bps, count)
+        && recent_count >= MIN_SESSIONS_FOR_ANALYSIS;
     
     // Confidence based on sample size and consistency
     let confidence_level = if recent_count >= 20 { 9000 }
@@ -455,6 +488,50 @@ mod tests {
         assert!(result.inflation_detected);
         assert!(result.inflation_rate_bps > MAX_INFLATION_RATE_BPS);
         assert!(result.recommended_adjustment_bps > 0);
+    }
+
+    #[test]
+    fn test_volume_adjusted_threshold_scales_with_session_volume() {
+        // Low-volume mentors are more sensitive; high-volume mentors less.
+        let low = volume_adjusted_inflation_threshold(5);
+        let baseline = volume_adjusted_inflation_threshold(VOLUME_BASELINE_SESSIONS);
+        let high = volume_adjusted_inflation_threshold(500);
+
+        assert_eq!(low, 25);      // 50 * sqrt(5/20)
+        assert_eq!(baseline, 50); // 50 * sqrt(20/20)
+        assert_eq!(high, 250);    // 50 * sqrt(500/20)
+        assert!(low < baseline && baseline < high);
+
+        // Same observed rate is suspicious at 5 sessions but not at 500.
+        assert!(exceeds_volume_adjusted_threshold(30, 5));
+        assert!(!exceeds_volume_adjusted_threshold(30, 500));
+    }
+
+    #[test]
+    fn test_detect_grade_inflation_volume_sensitivity() {
+        let env = Env::default();
+        let mentor = Address::generate(&env);
+
+        // High volume with a mild upward drift: the fixed 50 bps threshold
+        // would flag it, but the sqrt(500/20) scaled threshold does not.
+        let mut grades = Vec::new(&env);
+        let mut sessions = Vec::new(&env);
+        let mut times = Vec::new(&env);
+        for i in 0..500u32 {
+            grades.push_back(7000 + i); // +100 bps per session
+            sessions.push_back(Symbol::new(&env, "sess"));
+            times.push_back(i as u64 * 86400);
+        }
+        let result = detect_grade_inflation(&env, &mentor, &grades, &sessions, &times);
+        assert!(!result.inflation_detected);
+
+        // A strong trend at the same volume is still detected.
+        for i in 0..500u32 {
+            grades.set(i, 7000 + i * 5); // +500 bps per session
+        }
+        let strong = detect_grade_inflation(&env, &mentor, &grades, &sessions, &times);
+        assert!(strong.inflation_detected);
+        assert!(strong.inflation_rate_bps > volume_adjusted_inflation_threshold(500));
     }
 
     #[test]

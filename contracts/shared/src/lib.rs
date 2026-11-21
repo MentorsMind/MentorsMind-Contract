@@ -792,9 +792,11 @@ pub use assessment_authenticity::{
 };
 pub use grade_inflation::{
     apply_inflation_adjustment, calculate_grade_distribution, detect_grade_inflation,
-    record_grade_correction, GradeCorrectionRecord, GradeDistributionStats,
-    InflationDetectionResult, MentorScoringAdjustment, INFLATION_PENALTY_BPS_PER_DETECTION,
-    INFLATION_WINDOW, MAX_INFLATION_RATE_BPS, MIN_SESSIONS_FOR_ANALYSIS, OUTLIER_ZSCORE_THRESHOLD,
+    record_grade_correction, exceeds_volume_adjusted_threshold, volume_adjusted_inflation_threshold,
+    GradeCorrectionRecord, GradeDistributionStats, InflationDetectionResult,
+    MentorScoringAdjustment, INFLATION_PENALTY_BPS_PER_DETECTION, INFLATION_WINDOW,
+    MAX_INFLATION_RATE_BPS, MIN_SESSIONS_FOR_ANALYSIS, OUTLIER_ZSCORE_THRESHOLD,
+    VOLUME_BASELINE_SESSIONS,
 };
 pub use assessment_security::{
     AssessmentMetrics, AssessmentRecord, AssessmentSecurity, AssessmentSecurityError,
