@@ -37,3 +37,7 @@ jobs:
 
       - name: Run cargo check
         run: cargo +stable check --workspace --target wasm32v1-none
+
+      # Invariant regressions must block every PR.
+      - name: Invariant contract tests (mentorminds-invariants)
+        run: cargo +stable test -p mentorminds-invariants
