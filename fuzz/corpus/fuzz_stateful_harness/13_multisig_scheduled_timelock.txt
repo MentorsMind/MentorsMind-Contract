@@ -1,0 +1,8 @@
+# Integrated flow: approved multisig proposal schedules timelock op
+init_ms 3 2
+init_tl 0
+ms_propose 0 4 0
+ms_sign 1 1
+ms_execute 1
+advance 172860
+tl_execute 0
