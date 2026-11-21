@@ -6,6 +6,7 @@ use shared::events::{
 };
 use shared::health_reporter::{report_metric, MetricCategory};
 use shared::pause_guard::{require_not_paused_local, pause, unpause, set_pause_guardian};
+use shared::reentrancy_guard::ReentrancyGuard;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Val, Vec,
@@ -341,6 +342,7 @@ impl BountyContract {
         submission_hash: BytesN<32>,
         submission_uri_hash: BytesN<32>,
     ) {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOUNTY"));
         learner.require_auth();
 
         // Validate evidence hashes are not zero
@@ -431,6 +433,7 @@ impl BountyContract {
         learner: Address,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOUNTY"));
         let lock_key = DataKey::BountyLock(bounty_id);
         if env.storage().persistent().get(&lock_key).unwrap_or(false) {
             panic!("Bounty is locked");
@@ -560,6 +563,7 @@ impl BountyContract {
         milestone_index: u32,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOUNTY"));
         let lock_key = DataKey::BountyLock(bounty_id);
         if env.storage().persistent().get(&lock_key).unwrap_or(false) {
             panic!("Bounty is locked");
@@ -1115,7 +1119,7 @@ mod test {
 
         let learner2 = Address::generate(&f.env);
         f.client().claim_bounty(&f.learner, &id);
-        f.client().claim_bounty(&learner2, &id);
+        f.client().claim_bounty(&learner2, &id, &BytesN::from_array(&f.env, &[7u8;32]), &BytesN::from_array(&f.env, &[6u8;32]));
 
         // Verify first learner
         f.client().verify_completion(&f.mentor, &id, &f.learner);
@@ -1436,7 +1440,7 @@ mod test {
         );
 
         f.client().claim_bounty(&f.learner, &id);
-        f.client().claim_bounty(&learner2, &id);
+        f.client().claim_bounty(&learner2, &id, &BytesN::from_array(&f.env, &[7u8;32]), &BytesN::from_array(&f.env, &[6u8;32]));
 
         // Learner1 completes milestone 0 (40% = 40_000)
         f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
@@ -1666,4 +1670,115 @@ mod test {
         // Verify reward was transferred
         assert_eq!(f.token().balance(&f.learner), 100_000);
         assert_eq!(f.token().balance(&f.bounty_id), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrant call detected")]
+    fn test_reentrant_claim_is_rejected() {
+        mod reentrant_token {
+            use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+
+            #[contracttype]
+            pub enum TokenKey {
+                Balance(Address),
+                BountyContract,
+                BountyId,
+                Learner,
+                Submission,
+                Uri,
+            }
+
+            #[contract]
+            pub struct ReentrantToken;
+
+            #[contractimpl]
+            impl ReentrantToken {
+                pub fn configure(
+                    env: Env,
+                    bounty_contract: Address,
+                    bounty_id: u32,
+                    learner: Address,
+                    submission: BytesN<32>,
+                    uri: BytesN<32>,
+                ) {
+                    env.storage().persistent().set(&TokenKey::BountyContract, &bounty_contract);
+                    env.storage().persistent().set(&TokenKey::BountyId, &bounty_id);
+                    env.storage().persistent().set(&TokenKey::Learner, &learner);
+                    env.storage().persistent().set(&TokenKey::Submission, &submission);
+                    env.storage().persistent().set(&TokenKey::Uri, &uri);
+                }
+
+                pub fn mint(env: Env, to: Address, amount: i128) {
+                    let bal: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&TokenKey::Balance(to.clone()))
+                        .unwrap_or(0);
+                    env.storage().persistent().set(&TokenKey::Balance(to), &(bal + amount));
+                }
+
+                pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+                    let from_bal: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&TokenKey::Balance(from.clone()))
+                        .unwrap_or(0);
+                    if from_bal < amount {
+                        panic!("Insufficient balance");
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&TokenKey::Balance(from.clone()), &(from_bal - amount));
+                    let to_bal: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&TokenKey::Balance(to.clone()))
+                        .unwrap_or(0);
+                    env.storage()
+                        .persistent()
+                        .set(&TokenKey::Balance(to.clone()), &(to_bal + amount));
+
+                    let bounty_contract: Address = env
+                        .storage()
+                        .persistent()
+                        .get(&TokenKey::BountyContract)
+                        .unwrap();
+                    let bounty_id: u32 = env.storage().persistent().get(&TokenKey::BountyId).unwrap();
+                    let learner: Address = env.storage().persistent().get(&TokenKey::Learner).unwrap();
+                    let submission: BytesN<32> = env.storage().persistent().get(&TokenKey::Submission).unwrap();
+                    let uri: BytesN<32> = env.storage().persistent().get(&TokenKey::Uri).unwrap();
+
+                    let bounty_client = crate::BountyContractClient::new(&env, &bounty_contract);
+                    bounty_client.claim_bounty(&learner, &bounty_id, &submission, &uri);
+                }
+            }
+        }
+
+        let f = TestFixture::setup();
+        let reentrant_token_id = f.env.register_contract(None, reentrant_token::ReentrantToken);
+        let reentrant_token = reentrant_token::ReentrantTokenClient::new(&f.env, &reentrant_token_id);
+        reentrant_token.mint(&f.poster, &100_000);
+
+        let mut ms = Vec::new(&f.env);
+        ms.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 10000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Soroban"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &reentrant_token_id,
+            &f.deadline(),
+            &ms,
+        );
+
+        let submission = BytesN::from_array(&f.env, &[9u8; 32]);
+        let uri = BytesN::from_array(&f.env, &[8u8; 32]);
+        reentrant_token.configure(&f.bounty_id, &id, &f.learner, &submission, &uri);
+        f.client().claim_bounty(&f.learner, &id, &submission, &uri);
     }
