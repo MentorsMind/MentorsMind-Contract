@@ -240,7 +240,7 @@ pub fn run() -> Vec<BenchResult> {
             let reason = BytesN::<32>::from_array(&f.env, &[0xABu8; 32]);
             let emergency_admin = Address::generate(&f.env);
             let mut signers = SorobanVec::new(&f.env);
-            for i in 0..7 {
+            for _ in 0..7 {
                 signers.push_back(Address::generate(&f.env));
             }
             let mut approved = SorobanVec::new(&f.env);
