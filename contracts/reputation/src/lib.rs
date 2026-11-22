@@ -41,9 +41,18 @@ use shared::{
 };
 use shared::*;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Vec, Map,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, BytesN, Env, IntoVal, Symbol, Vec, Map,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    InvalidRating = 1,
+    SelfReview = 2,
+    LearnerMismatch = 3,
+}
 
 // ── Storage keys ────────────────────────────────────────────────────────────
 const ESCROW: Symbol = symbol_short!("ESCROW");
@@ -77,6 +86,13 @@ pub struct LearnerReviewRecord {
     pub participation_rating: u32,
     pub comment_hash: BytesN<32>,
     pub submitted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecializationOutcomeRecord {
+    pub outcome_score: u32,
+    pub recorded_at: u64,
 }
 
 #[contracttype]
@@ -156,6 +172,8 @@ pub enum DataKey {
     GradeInflationDetection(Address),
     InformationAccuracyTrack(Address),
     MarketManipulationAlert(Symbol),
+    SpecializationOutcomeHistory(Address, Symbol),
+    SpecializationHistoryWriteIndex(Address, Symbol),
     MentorBurnoutAssessment(Address),
     MentorGradeHistory(Address),
     MentorGradeTimestamps(Address),
@@ -250,12 +268,16 @@ impl ReputationContract {
         rating: u32,
         comment_hash: BytesN<32>,
     ) {
+        if env.invoker() == mentor {
+            panic_with_error!(&env, Error::SelfReview);
+        }
+
         // Auth: caller must be learner
         learner.require_auth();
 
         // Validate rating 1–5
         if rating < 1 || rating > 5 {
-            panic!("InvalidRating");
+            panic_with_error!(&env, Error::InvalidRating);
         }
 
         // Prevent duplicate review
@@ -279,6 +301,9 @@ impl ReputationContract {
 
         if escrow.status != shared::EscrowStatus::Released {
             panic!("SessionNotReleased");
+        }
+        if escrow.learner != learner {
+            panic_with_error!(&env, Error::LearnerMismatch);
         }
 
         let proof = if env.storage().instance().has(&DataKey::SessionRegistry) {
@@ -2100,6 +2125,90 @@ impl ReputationContract {
         }
     }
 
+    /// Record an outcome score in the bounded history for a specialization.
+    /// When full, the oldest timestamp is replaced and the ring write index
+    /// advances from the evicted slot.
+    pub fn record_specialization_outcome(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+        outcome_score: u32,
+    ) {
+        let history_key =
+            DataKey::SpecializationOutcomeHistory(mentor.clone(), specialization.clone());
+        let index_key =
+            DataKey::SpecializationHistoryWriteIndex(mentor, specialization);
+        let mut history: Vec<SpecializationOutcomeRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        let mut write_index: u32 = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or(0);
+
+        let record = SpecializationOutcomeRecord {
+            outcome_score,
+            recorded_at: env.ledger().timestamp(),
+        };
+
+        if history.len() < MAX_SPECIALIZATION_HISTORY {
+            history.push_back(record);
+            write_index = (write_index + 1) % MAX_SPECIALIZATION_HISTORY;
+        } else {
+            // Scan from the write index so equal timestamps are evicted in
+            // insertion order, while a strictly older timestamp always wins.
+            let mut oldest_index = write_index;
+            for offset in 0..MAX_SPECIALIZATION_HISTORY {
+                let index = (write_index + offset) % MAX_SPECIALIZATION_HISTORY;
+                let current = history.get(index).expect("Invalid specialization history");
+                let oldest = history
+                    .get(oldest_index)
+                    .expect("Invalid specialization history");
+                if current.recorded_at < oldest.recorded_at {
+                    oldest_index = index;
+                }
+            }
+            history.set(oldest_index, record);
+            write_index = (oldest_index + 1) % MAX_SPECIALIZATION_HISTORY;
+        }
+
+        env.storage().persistent().set(&history_key, &history);
+        env.storage().persistent().set(&index_key, &write_index);
+    }
+
+    /// Return a specialization's retained outcome history from oldest to newest.
+    pub fn get_specialization_outcome_history(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+    ) -> Vec<SpecializationOutcomeRecord> {
+        let history: Vec<SpecializationOutcomeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpecializationOutcomeHistory(mentor, specialization))
+            .unwrap_or(Vec::new(&env));
+        let mut remaining = history;
+        let mut ordered = Vec::new(&env);
+
+        while !remaining.is_empty() {
+            let mut oldest_index = 0;
+            for index in 1..remaining.len() {
+                if remaining.get(index).unwrap().recorded_at
+                    < remaining.get(oldest_index).unwrap().recorded_at
+                {
+                    oldest_index = index;
+                }
+            }
+            ordered.push_back(remaining.get(oldest_index).unwrap());
+            remaining.remove(oldest_index);
+        }
+
+        ordered
+    }
+
     pub fn track_curriculum_effectiveness(env: Env, mentor: Address, metric: u32) {
         env.events().publish((symbol_short!("curric"), Symbol::new(&env, "tracked")), (mentor, metric));
     }
@@ -2147,22 +2256,51 @@ mod tests {
     };
 
     // Mock escrow contract for testing
+    #[contracttype]
+    #[derive(Clone)]
+    enum MockEscrowKey {
+        Released(Symbol),
+        Parties(Symbol),
+    }
+
     #[contract]
     pub struct MockEscrow;
 
     #[contractimpl]
     impl MockEscrow {
         pub fn set_status(env: Env, session_id: Symbol, released: bool) {
-            env.storage().persistent().set(&session_id, &released);
+            env.storage()
+                .persistent()
+                .set(&MockEscrowKey::Released(session_id), &released);
+        }
+
+        pub fn set_session_parties(
+            env: Env,
+            session_id: Symbol,
+            mentor: Address,
+            learner: Address,
+        ) {
+            env.storage()
+                .persistent()
+                .set(&MockEscrowKey::Parties(session_id), &(mentor, learner));
         }
 
         pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowRecord {
-            let released: bool = env.storage().persistent().get(&session_id).unwrap_or(false);
+            let released: bool = env
+                .storage()
+                .persistent()
+                .get(&MockEscrowKey::Released(session_id.clone()))
+                .unwrap_or(false);
             let dummy = Address::generate(&env);
+            let (mentor, learner): (Address, Address) = env
+                .storage()
+                .persistent()
+                .get(&MockEscrowKey::Parties(session_id.clone()))
+                .unwrap_or((dummy.clone(), dummy.clone()));
             EscrowRecord {
                 id: 1,
-                mentor: dummy.clone(),
-                learner: dummy.clone(),
+                mentor,
+                learner,
                 amount: 100,
                 session_id: session_id.clone(),
                 status: if released {
@@ -2185,6 +2323,31 @@ mod tests {
                 total_sessions: 1,
                 sessions_completed: 1,
             }
+        }
+    }
+
+    #[contract]
+    pub struct MockReviewCaller;
+
+    #[contractimpl]
+    impl MockReviewCaller {
+        pub fn rejects_self_review(
+            env: Env,
+            reputation: Address,
+            session_id: Symbol,
+            mentor: Address,
+            learner: Address,
+            rating: u32,
+            comment_hash: BytesN<32>,
+        ) -> bool {
+            matches!(
+                env.try_invoke_contract::<(), Error>(
+                    &reputation,
+                    &Symbol::new(&env, "submit_review"),
+                    (session_id, mentor, learner, rating, comment_hash).into_val(&env),
+                ),
+                Err(Ok(Error::SelfReview))
+            )
         }
     }
 
@@ -2219,6 +2382,7 @@ mod tests {
         // Mark session as released in mock escrow
         let mock = MockEscrowClient::new(&env, &escrow_id);
         mock.set_status(&session_id, &true);
+        mock.set_session_parties(&session_id, &mentor, &learner);
 
         client.submit_review(&session_id, &mentor, &learner, &5, &comment_hash);
 
@@ -2230,6 +2394,43 @@ mod tests {
         assert_eq!(review.rating, 5);
         assert_eq!(review.mentor, mentor);
         assert_eq!(review.learner, learner);
+    }
+
+    #[test]
+    fn test_mentor_cannot_submit_self_review() {
+        let (env, client, escrow_id, _mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_self_review");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let caller_id = env.register_contract(None, MockReviewCaller);
+        let caller = MockReviewCallerClient::new(&env, &caller_id);
+        mock.set_status(&session_id, &true);
+        mock.set_session_parties(&session_id, &caller_id, &learner);
+
+        assert!(caller.rejects_self_review(
+            &client.address,
+            &session_id,
+            &caller_id,
+            &learner,
+            &5,
+            &comment_hash,
+        ));
+    }
+
+    #[test]
+    fn test_review_learner_must_match_session_learner() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_learner_mismatch");
+        let other_learner = Address::generate(&env);
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+        mock.set_session_parties(&session_id, &mentor, &other_learner);
+
+        assert_eq!(
+            client.try_submit_review(&session_id, &mentor, &learner, &5, &comment_hash),
+            Err(Ok(Error::LearnerMismatch))
+        );
     }
 
     #[test]
@@ -2245,6 +2446,7 @@ mod tests {
                 _ => Symbol::new(&env, "s3"),
             };
             mock.set_status(&sid, &true);
+            mock.set_session_parties(&sid, &mentor, &learner);
             client.submit_review(&sid, &mentor, &learner, &(i * 2).min(5), &comment_hash);
         }
 
@@ -2255,14 +2457,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "InvalidRating")]
-    fn test_invalid_rating() {
+    fn test_review_rating_boundaries_are_accepted() {
         let (env, client, escrow_id, mentor, learner) = setup();
-        let session_id = Symbol::new(&env, "s_bad");
         let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
         let mock = MockEscrowClient::new(&env, &escrow_id);
-        mock.set_status(&session_id, &true);
-        client.submit_review(&session_id, &mentor, &learner, &6, &comment_hash);
+        let min_session_id = Symbol::new(&env, "s_min");
+        let max_session_id = Symbol::new(&env, "s_max");
+        mock.set_status(&min_session_id, &true);
+        mock.set_status(&max_session_id, &true);
+        mock.set_session_parties(&min_session_id, &mentor, &learner);
+        mock.set_session_parties(&max_session_id, &mentor, &learner);
+
+        client.submit_review(&min_session_id, &mentor, &learner, &1, &comment_hash);
+        client.submit_review(&max_session_id, &mentor, &learner, &5, &comment_hash);
+
+        assert_eq!(client.get_review(&min_session_id).rating, 1);
+        assert_eq!(client.get_review(&max_session_id).rating, 5);
+        assert_eq!(client.get_mentor_rating(&mentor), (300, 2));
+    }
+
+    #[test]
+    fn test_invalid_review_ratings_return_error() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let zero_session_id = Symbol::new(&env, "s_zero");
+        let six_session_id = Symbol::new(&env, "s_six");
+        mock.set_status(&zero_session_id, &true);
+        mock.set_status(&six_session_id, &true);
+
+        assert_eq!(
+            client.try_submit_review(&zero_session_id, &mentor, &learner, &0, &comment_hash),
+            Err(Ok(Error::InvalidRating))
+        );
+        assert_eq!(
+            client.try_submit_review(&six_session_id, &mentor, &learner, &6, &comment_hash),
+            Err(Ok(Error::InvalidRating))
+        );
     }
 
     #[test]
@@ -2283,6 +2514,7 @@ mod tests {
         let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
         let mock = MockEscrowClient::new(&env, &escrow_id);
         mock.set_status(&session_id, &true);
+        mock.set_session_parties(&session_id, &mentor, &learner);
         client.submit_review(&session_id, &mentor, &learner, &3, &comment_hash);
         client.submit_review(&session_id, &mentor, &learner, &4, &comment_hash);
     }
@@ -2372,6 +2604,7 @@ mod tests {
         let comment_hash = BytesN::from_array(&env, &[1u8; 32]);
         let mock = MockEscrowClient::new(&env, &escrow_id);
         mock.set_status(&session_id, &true);
+        mock.set_session_parties(&session_id, &mentor, &learner);
 
         // Learner reviews mentor
         client.submit_review(&session_id, &mentor, &learner, &4, &comment_hash);
@@ -2409,6 +2642,7 @@ mod tests {
                 _ => Symbol::new(&env, "cs4"),
             };
             mock.set_status(&sid, &true);
+            mock.set_session_parties(&sid, &mentor, &learner);
             client.submit_review(&sid, &mentor, &learner, &5, &comment_hash);
             env.ledger().with_mut(|li| li.timestamp += 60);
         }
@@ -2435,6 +2669,7 @@ mod tests {
             };
             let reviewer = Address::generate(&env);
             mock.set_status(&sid, &true);
+            mock.set_session_parties(&sid, &mentor, &reviewer);
             client.submit_review(&sid, &mentor, &reviewer, &5, &comment_hash);
             env.ledger().with_mut(|li| li.timestamp += 7_200);
         }
@@ -2457,6 +2692,7 @@ mod tests {
                 _ => Symbol::new(&env, "rs4"),
             };
             mock.set_status(&sid, &true);
+            mock.set_session_parties(&sid, &mentor, &learner);
             client.submit_review(&sid, &mentor, &learner, &5, &comment_hash);
             env.ledger().with_mut(|li| li.timestamp += 60);
         }
@@ -2477,6 +2713,27 @@ mod tests {
     // -----------------------------------------------------------------------
     // Expertise monitoring & specialization performance (#891)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_specialization_history_evicts_oldest_entries_in_order() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust");
+        let start = env.ledger().timestamp();
+
+        for score in 0u32..25 {
+            env.ledger().with_mut(|ledger| ledger.timestamp = start + score as u64);
+            client.record_specialization_outcome(&mentor, &specialization, &score);
+        }
+
+        let history = client.get_specialization_outcome_history(&mentor, &specialization);
+        assert_eq!(history.len(), MAX_SPECIALIZATION_HISTORY);
+        for index in 0..MAX_SPECIALIZATION_HISTORY {
+            let record = history.get(index).unwrap();
+            let expected_score = index + 5;
+            assert_eq!(record.outcome_score, expected_score);
+            assert_eq!(record.recorded_at, start + expected_score as u64);
+        }
+    }
 
     #[test]
     #[test]
