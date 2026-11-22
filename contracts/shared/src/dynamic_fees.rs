@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{contracterror, contracttype, Env};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -8,6 +8,8 @@ pub const BASE_FEE_BPS: u32 = 200; // 2%
 pub const MAX_FEE_BPS: u32 = 1000; // 10%
 pub const MIN_FEE_BPS: u32 = 100; // 1%
 pub const HIGH_LOAD_THRESHOLD: u32 = 1000; // System load threshold
+/// Minimum seconds between two fee adjustments (#1459).
+pub const MIN_FEE_ADJUSTMENT_INTERVAL_SECS: u64 = 5 * 60;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,6 +27,21 @@ pub struct DynamicFeeResult {
 pub struct FeeEvasionResult {
     pub is_evading: bool,
     pub evasion_score: u32,
+}
+
+/// Error returned when a fee adjustment is attempted too soon (#1459).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum DynamicFeeError {
+    AdjustmentTooFrequent = 1,
+}
+
+/// Storage key that enforces the minimum adjustment interval (#1459).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeeDataKey {
+    LastFeeAdjustedAt,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +83,33 @@ pub fn calculate_dynamic_fee(
         fee_bps: fee,
         is_emergency,
     }
+}
+
+/// Rate-limited fee adjustment (#1459).
+///
+/// Guards `calculate_dynamic_fee` with `LastFeeAdjustedAt` so rapid oracle-driven
+/// load changes cannot oscillate fees. The first adjustment always succeeds;
+/// later ones require `MIN_FEE_ADJUSTMENT_INTERVAL_SECS` to elapse.
+pub fn adjust_fee(
+    env: &Env,
+    system_load: u32,
+    reputation_score: u32,
+) -> Result<DynamicFeeResult, DynamicFeeError> {
+    let key = FeeDataKey::LastFeeAdjustedAt;
+    let now = env.ledger().timestamp();
+    if let Some(last) = env.storage().instance().get::<_, u64>(&key) {
+        if now.saturating_sub(last) < MIN_FEE_ADJUSTMENT_INTERVAL_SECS {
+            return Err(DynamicFeeError::AdjustmentTooFrequent);
+        }
+    }
+    let result = calculate_dynamic_fee(env, system_load, reputation_score);
+    env.storage().instance().set(&key, &now);
+    Ok(result)
+}
+
+/// Timestamp of the last accepted adjustment, for operators/tests.
+pub fn last_fee_adjusted_at(env: &Env) -> Option<u64> {
+    env.storage().instance().get(&FeeDataKey::LastFeeAdjustedAt)
 }
 
 pub fn detect_fee_gaming(
@@ -138,5 +182,27 @@ mod tests {
         let result_emergency = calculate_dynamic_fee(&env, HIGH_LOAD_THRESHOLD * 2 + 1, 50);
         assert_eq!(result_emergency.fee_bps, MAX_FEE_BPS);
         assert_eq!(result_emergency.is_emergency, true);
+    }
+    #[test]
+    fn test_adjust_fee_is_rate_limited() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+        // First adjustment succeeds and records the timestamp.
+        assert_eq!(adjust_fee(&env, 0, 0).unwrap().fee_bps, BASE_FEE_BPS);
+        assert_eq!(last_fee_adjusted_at(&env), Some(1_000));
+
+        // Rapid follow-up (e.g. oracle oscillation) is blocked.
+        assert_eq!(
+            adjust_fee(&env, HIGH_LOAD_THRESHOLD * 2 + 1, 0),
+            Err(DynamicFeeError::AdjustmentTooFrequent)
+        );
+        assert_eq!(last_fee_adjusted_at(&env), Some(1_000));
+
+        // After the interval, a new adjustment is accepted.
+        env.ledger().with_mut(|li| li.timestamp = 1_000 + MIN_FEE_ADJUSTMENT_INTERVAL_SECS);
+        let result = adjust_fee(&env, HIGH_LOAD_THRESHOLD * 2 + 1, 0).unwrap();
+        assert_eq!(result.fee_bps, MAX_FEE_BPS);
+        assert_eq!(last_fee_adjusted_at(&env), Some(1_000 + MIN_FEE_ADJUSTMENT_INTERVAL_SECS));
     }
 }
