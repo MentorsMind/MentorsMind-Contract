@@ -1512,7 +1512,7 @@ fn require_upgrade_approvals_cached(
 /// legitimate-looking hash to unrelated or malicious WASM bytecode.
 pub fn verify_wasm_hash(env: &Env, wasm: &Bytes, claimed_hash: &BytesN<32>) -> Result<(), Error> {
     let actual = env.crypto().sha256(wasm);
-    if actual != *claimed_hash {
+    if actual != claimed_hash.clone() {
         return Err(Error::WasmHashMismatch);
     }
     Ok(())
