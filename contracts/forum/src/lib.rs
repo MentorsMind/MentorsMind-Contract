@@ -16,6 +16,15 @@ const MODERATION_THRESHOLD: Symbol = symbol_short!("MOD_THR");
 const DEFAULT_REPUTATION_THRESHOLD: i128 = 10;
 const DEFAULT_MIN_POST_STAKE: i128 = 1_000_000; // 0.001 MNT
 const DEFAULT_MODERATION_THRESHOLD: u32 = 3;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const MAX_POSTS_PER_DAY: u32 = 10;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostRateLimit {
+    pub day: u64,
+    pub count: u32,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +128,7 @@ pub enum DataKey {
     Reply(u32),
     Category(u32),
     UserReputation(Address),
+    PostCountThisPeriod(Address),
     Vote(u32, Address),      // For posts
     ReplyVote(u32, Address), // For replies
     Moderation(u32, Address),
@@ -193,6 +203,20 @@ impl ForumContract {
     ) -> u32 {
         author.require_auth();
 
+        let day = env.ledger().timestamp() / SECONDS_PER_DAY;
+        let rate_key = DataKey::PostCountThisPeriod(author.clone());
+        let posts_this_day = match env
+            .storage()
+            .persistent()
+            .get::<_, PostRateLimit>(&rate_key)
+        {
+            Some(limit) if limit.day == day => limit.count,
+            _ => 0,
+        };
+        if posts_this_day >= MAX_POSTS_PER_DAY {
+            panic!("post rate limit exceeded");
+        }
+
         let min_stake: i128 = env
             .storage()
             .persistent()
@@ -243,7 +267,7 @@ impl ForumContract {
             id: count,
             author: author.clone(),
             title,
-            content_hash,
+            content_hash: content_hash.clone(),
             post_type,
             category_id,
             status: PostStatus::Active,
@@ -257,6 +281,13 @@ impl ForumContract {
         };
 
         env.storage().persistent().set(&POST_COUNT, &count);
+        env.storage().persistent().set(
+            &rate_key,
+            &PostRateLimit {
+                day,
+                count: posts_this_day + 1,
+            },
+        );
         env.storage().persistent().set(&DataKey::Post(count), &post);
         env.storage()
             .persistent()
@@ -282,10 +313,19 @@ impl ForumContract {
 
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("POST_CR"), count),
-            (author, post_type_clone, category_id, stake_amount),
+            (author, post_type_clone, category_id, stake_amount, content_hash),
         );
 
         count
+    }
+
+    /// Check a post's committed content hash against a supplied value.
+    pub fn verify_post_content(env: Env, post_id: u32, content_hash: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, Post>(&DataKey::Post(post_id))
+            .map(|post| post.content_hash == content_hash)
+            .unwrap_or(false)
     }
 
     pub fn create_reply(
@@ -1053,5 +1093,100 @@ mod tests {
 
         let responder_rep = forum.get_user_reputation(&responder);
         assert_eq!(responder_rep.reputation, 50); // Best answer bonus
+    }
+
+    #[test]
+    fn test_post_rate_limit_and_daily_reset() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author = Address::generate(&env);
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
+        token.mint(&author, &100_000_000i128);
+
+        let title = Bytes::from_slice(&env, b"Post");
+        let hash = BytesN::from_array(&env, &[3u8; 32]);
+        for _ in 0..MAX_POSTS_PER_DAY {
+            forum.create_post(
+                &author,
+                &title,
+                &hash,
+                &PostType::Question,
+                &1,
+                &1_000_000i128,
+            );
+        }
+        assert!(forum
+            .try_create_post(
+                &author,
+                &title,
+                &hash,
+                &PostType::Question,
+                &1,
+                &1_000_000i128
+            )
+            .is_err());
+
+        env.ledger().set_timestamp(SECONDS_PER_DAY);
+        let post_id = forum.create_post(
+            &author,
+            &title,
+            &hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+        assert_eq!(post_id, MAX_POSTS_PER_DAY + 1);
+    }
+
+    #[test]
+    fn test_verify_post_content() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author = Address::generate(&env);
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
+        token.mint(&author, &10_000_000i128);
+
+        let hash = BytesN::from_array(&env, &[5u8; 32]);
+        let post_id = forum.create_post(
+            &author,
+            &Bytes::from_slice(&env, b"Post"),
+            &hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+
+        assert!(forum.verify_post_content(&post_id, &hash));
+        assert!(!forum.verify_post_content(
+            &post_id,
+            &BytesN::from_array(&env, &[6u8; 32])
+        ));
+        assert!(!forum.verify_post_content(&999, &hash));
     }
 }
