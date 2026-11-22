@@ -32,7 +32,7 @@ use shared::storage_compatibility::{
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address,
-    BytesN, Env, IntoVal, Symbol, Vec,
+    Bytes, BytesN, Env, IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +83,8 @@ pub enum Error {
     StorageLayoutNotFound = 22,
     /// Migration batch size is invalid (e.g. 0 or too large).
     InvalidMigrationBatch = 23,
+    /// Supplied WASM hash does not match the actual WASM bytes (#1434).
+    WasmHashMismatch = 24,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +326,30 @@ impl UpgradeRegistryContract {
         );
 
         Ok(())
+    }
+
+    /// Schedule an upgrade with the WASM hash verified against actual bytes (#1434).
+    ///
+    /// Additive companion to `schedule_upgrade`: existing callers are unchanged,
+    /// while callers that hold the WASM blob can prove the hash before proposing.
+    pub fn schedule_upgrade_verified(
+        env: Env,
+        wasm: Bytes,
+        new_wasm_hash: BytesN<32>,
+        contract_name: Symbol,
+        new_version: u32,
+        changelog_hash: BytesN<32>,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        verify_wasm_hash(&env, &wasm, &new_wasm_hash)?;
+        Self::schedule_upgrade(
+            env,
+            new_wasm_hash,
+            contract_name,
+            new_version,
+            changelog_hash,
+            approvers,
+        )
     }
 
     pub fn execute_pending_upgrade(env: Env, approvers: Vec<Address>) -> Result<(), Error> {
@@ -1480,6 +1506,18 @@ fn require_upgrade_approvals_cached(
     Ok(result)
 }
 
+/// Verify that a claimed WASM hash matches the actual WASM bytes (#1434).
+///
+/// Uses Soroban's SHA-256 facility so an attacker cannot attach a
+/// legitimate-looking hash to unrelated or malicious WASM bytecode.
+pub fn verify_wasm_hash(env: &Env, wasm: &Bytes, claimed_hash: &BytesN<32>) -> Result<(), Error> {
+    let actual = env.crypto().sha256(wasm);
+    if actual != *claimed_hash {
+        return Err(Error::WasmHashMismatch);
+    }
+    Ok(())
+}
+
 /// Validate that a WASM binary exports all required functions.
 ///
 /// This prevents upgrades to WASM that omits critical functions like
@@ -2273,5 +2311,34 @@ mod test {
         // Rollback to version 1
         client.rollback_storage_layout(&contract_name, &1, &signers);
         assert_eq!(client.get_active_storage_version(&contract_name).unwrap().current_version, 1);
+    }
+}
+
+#[cfg(test)]
+mod wasm_hash_verification_tests {
+    use super::*;
+
+    fn sample_wasm(env: &Env) -> Bytes {
+        // Minimal valid empty WASM module (magic + version).
+        Bytes::from_slice(env, b"\0asm\x01\0\0\0")
+    }
+
+    #[test]
+    fn rejects_hash_that_does_not_match_wasm() {
+        let env = Env::default();
+        let wasm = sample_wasm(&env);
+        let claimed = BytesN::from_array(&env, &[0x11u8; 32]);
+        assert_eq!(
+            verify_wasm_hash(&env, &wasm, &claimed),
+            Err(Error::WasmHashMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_hash_computed_from_wasm() {
+        let env = Env::default();
+        let wasm = sample_wasm(&env);
+        let actual = env.crypto().sha256(&wasm);
+        assert_eq!(verify_wasm_hash(&env, &wasm, &actual), Ok(()));
     }
 }
