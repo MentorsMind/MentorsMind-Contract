@@ -181,6 +181,7 @@ fn test_expired_kyc_returns_none_and_expiry_query() {
 
     env.ledger().set_timestamp(1001);
     assert_eq!(client.get_kyc_level(&user), KycLevel::None);
+    assert_eq!(client.get_kyc_level(&user), KycLevel::None);
 }
 
 #[test]
@@ -623,3 +624,65 @@ fn test_get_expiring_kyc_returns_near_expiry_records() {
     assert_eq!(no_expiring.len(), 0);
 }
 
+
+#[test]
+fn test_set_kyc_level_deduplicates_user_registry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    let provider_hash = BytesN::from_array(&env, &[0; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Basic, &1000, &provider_hash);
+    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &2000, &provider_hash);
+
+    env.as_contract(&contract_id, || {
+        let users: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserRegistry)
+            .unwrap();
+        let count: u32 = env.storage().persistent().get(&DataKey::UserCount).unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(count, 1);
+    });
+}
+
+#[test]
+fn test_batch_set_kyc_level_returns_per_entry_results() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user_ok = Address::generate(&env);
+    let user_bad = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    env.ledger().set_timestamp(100);
+    let provider_hash = BytesN::from_array(&env, &[1; 32]);
+    let mut entries = soroban_sdk::Vec::new(&env);
+    entries.push_back(KycBatchEntry {
+        user: user_ok.clone(),
+        level: KycLevel::Basic,
+        expiry: 200,
+        provider_hash: provider_hash.clone(),
+    });
+    entries.push_back(KycBatchEntry {
+        user: user_bad.clone(),
+        level: KycLevel::Enhanced,
+        expiry: 100,
+        provider_hash: provider_hash.clone(),
+    });
+
+    let results = client.batch_set_kyc_level(&admin, &entries);
+    assert_eq!(results.get(0), Some(true));
+    assert_eq!(results.get(1), Some(false));
+    assert_eq!(client.get_kyc_level(&user_ok), KycLevel::Basic);
+    assert_eq!(client.get_kyc_level(&user_bad), KycLevel::None);
+}
