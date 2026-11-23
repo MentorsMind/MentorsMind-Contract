@@ -85,6 +85,9 @@ pub enum DataKey {
     SubCounter,
     Plan(u32),
     Sub(u32),
+    /// Number of subscriptions in `Active` status per plan (#1394). Plan
+    /// price changes are rejected while this is non-zero.
+    ActiveSubscriberCount(u32),
     /// Stores the pre-authorized maximum pull amount (i128) for auto-renewal.
     /// Key: subscription_id → i128 allowance remaining.
     RenewalAllowance(u32),
@@ -403,6 +406,59 @@ impl SubscriptionContract {
         plan_id
     }
 
+    /// Change a plan's monthly price (mentor only).
+    ///
+    /// Active subscriptions reference the plan by ID and renew at its current
+    /// price, so a change would bill learners more than they agreed to. The
+    /// change is rejected while any subscription to the plan is `Active`
+    /// (#1394); the mentor can create a new plan for the new price instead.
+    pub fn update_plan_price(env: Env, mentor: Address, plan_id: u32, new_price: i128) {
+        mentor.require_auth();
+        if new_price <= 0 {
+            panic!("price must be positive");
+        }
+        let mut plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id))
+            .expect("plan not found");
+        if plan.mentor != mentor {
+            panic!("not plan owner");
+        }
+        if Self::get_active_subscriber_count(env.clone(), plan_id) > 0 {
+            panic!("plan has active subscribers");
+        }
+        let old_price = plan.price_per_month;
+        plan.price_per_month = new_price;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+        env.events().publish(
+            (symbol_short!("price_upd"), plan_id),
+            (mentor, old_price, new_price),
+        );
+    }
+
+    /// Number of `Active` subscriptions currently referencing a plan.
+    pub fn get_active_subscriber_count(env: Env, plan_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveSubscriberCount(plan_id))
+            .unwrap_or(0)
+    }
+
+    fn bump_active(env: &Env, plan_id: u32) {
+        let key = DataKey::ActiveSubscriberCount(plan_id);
+        let n: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &n.saturating_add(1));
+    }
+
+    fn drop_active(env: &Env, plan_id: u32) {
+        let key = DataKey::ActiveSubscriberCount(plan_id);
+        let n: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &n.saturating_sub(1));
+    }
+
     // -----------------------------------------------------------------------
     // Subscriptions
     // -----------------------------------------------------------------------
@@ -442,6 +498,7 @@ impl SubscriptionContract {
         env.storage()
             .persistent()
             .set(&DataKey::SubCounter, &(sub_id + 1));
+        Self::bump_active(&env, plan_id);
 
         env.events().publish(
             (symbol_short!("subscrbd"), plan_id),
@@ -481,6 +538,7 @@ impl SubscriptionContract {
             // Subscription has lapsed past the grace window — transition to Expired
             // and return gracefully.  The learner must create a new subscription.
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -527,6 +585,7 @@ impl SubscriptionContract {
 
         if allowance < required || available < required {
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -622,7 +681,11 @@ impl SubscriptionContract {
             panic!("already cancelled");
         }
 
+        let was_active = record.status == SubscriptionStatus::Active;
         record.status = SubscriptionStatus::Cancelled;
+        if was_active {
+            Self::drop_active(&env, record.plan_id);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Sub(subscription_id), &record);
@@ -648,6 +711,7 @@ impl SubscriptionContract {
         }
 
         record.status = SubscriptionStatus::Paused;
+        Self::drop_active(&env, record.plan_id);
         env.storage()
             .persistent()
             .set(&DataKey::Sub(subscription_id), &record);
@@ -685,6 +749,7 @@ impl SubscriptionContract {
             .expect("timestamp overflow");
         if now >= expiry_deadline {
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -733,6 +798,7 @@ impl SubscriptionContract {
 
         if now >= expiry_deadline {
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
