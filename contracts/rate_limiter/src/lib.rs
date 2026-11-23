@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractclient, contractimpl, contracttype, symbol_short, Address,
-    Env, Symbol,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
+    Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +44,7 @@ pub enum DataKey {
     CallCount(Address, Symbol),
     WindowStart(Address, Symbol),
     Whitelist(Address),
+    CallTimestamps(Address, Symbol),
 }
 
 // ---------------------------------------------------------------------------
@@ -105,44 +106,26 @@ impl RateLimiterContract {
         }
 
         let now = env.ledger().timestamp();
-        let window_start_key = DataKey::WindowStart(caller.clone(), action.clone());
+        let timestamps_key = DataKey::CallTimestamps(caller.clone(), action.clone());
         let call_count_key = DataKey::CallCount(caller.clone(), action.clone());
+        let window_start_key = DataKey::WindowStart(caller.clone(), action.clone());
 
-        // Get current window start time
-        let window_start: u64 = env
+        let timestamps: Vec<u64> = env
             .storage()
             .temporary()
-            .get(&window_start_key)
-            .unwrap_or(0);
+            .get(&timestamps_key)
+            .unwrap_or_else(|| Vec::new(&env));
 
-        let window_seconds_u64 = window_seconds as u64;
-
-        // Check if we need to reset the window
-        if now >= window_start.saturating_add(window_seconds_u64) {
-            // Reset the counter and window timestamp together so the TTL always
-            // reflects the active policy window rather than the previous one.
-            // New window - reset counter
-            env.storage().temporary().set(&window_start_key, &now);
-            env.storage().temporary().set(&call_count_key, &1u32);
-
-            // Extend TTL for the new window
-            env.storage()
-                .temporary()
-                .extend_ttl(&window_start_key, window_seconds, window_seconds);
-            env.storage()
-                .temporary()
-                .extend_ttl(&call_count_key, window_seconds, window_seconds);
-
-            return true;
+        let cutoff = now.saturating_sub(window_seconds as u64);
+        let mut valid_timestamps = Vec::new(&env);
+        for t in timestamps.iter() {
+            if t >= cutoff {
+                valid_timestamps.push_back(t);
+            }
         }
 
-        // Within current window - check and increment counter
-        let current_count: u32 = env.storage().temporary().get(&call_count_key).unwrap_or(0);
-
+        let current_count = valid_timestamps.len();
         if current_count >= max_calls {
-            // Emit a dedicated event so operators can tell policy enforcement
-            // apart from genuine execution failures in downstream logs.
-            // Rate limit exceeded - emit event
             env.events().publish(
                 (
                     symbol_short!("rate"),
@@ -154,17 +137,25 @@ impl RateLimiterContract {
             return false;
         }
 
-        // Increment counter
-        let new_count = current_count.checked_add(1).expect("call count overflow");
-        env.storage().temporary().set(&call_count_key, &new_count);
+        valid_timestamps.push_back(now);
+        let new_count = valid_timestamps.len();
 
-        // Extend TTL only for the remaining time in the window so the counter
-        // expires with the policy interval.
-        let remaining_u64 = window_start.saturating_add(window_seconds_u64).saturating_sub(now);
-        let remaining_seconds = remaining_u64.min(u32::MAX as u64) as u32;
+        env.storage().temporary().set(&timestamps_key, &valid_timestamps);
+        env.storage().temporary().set(&call_count_key, &new_count);
+        if let Some(first) = valid_timestamps.get(0) {
+            env.storage().temporary().set(&window_start_key, &first);
+        }
+
+        // Extend TTL for the active policy window
         env.storage()
             .temporary()
-            .extend_ttl(&call_count_key, remaining_seconds, remaining_seconds);
+            .extend_ttl(&timestamps_key, window_seconds, window_seconds);
+        env.storage()
+            .temporary()
+            .extend_ttl(&call_count_key, window_seconds, window_seconds);
+        env.storage()
+            .temporary()
+            .extend_ttl(&window_start_key, window_seconds, window_seconds);
 
         true
     }
@@ -378,5 +369,33 @@ mod test {
         assert!(typed.check_rate_limit(&caller, &action, &1, &60));
 
         typed.remove_from_whitelist(&caller);
+    }
+
+    #[test]
+    fn test_rolling_window_across_epoch_boundary() {
+        let (env, _admin, _contract_id, client) = setup();
+        env.ledger().set_timestamp(50);
+
+        let caller = Address::generate(&env);
+        let action = symbol_short!("transfer");
+
+        // First request at t=50 (limit 2 per 60s)
+        assert!(client.check_rate_limit(&caller, &action, &2, &60));
+
+        // Advance to t=70 (crosses fixed 60s epoch boundary)
+        // t=50 is still within rolling window [70 - 60 = 10, 70]
+        env.ledger().set_timestamp(70);
+        assert!(client.check_rate_limit(&caller, &action, &2, &60));
+
+        // Third request at t=80 is within [80 - 60 = 20, 80] which contains both t=50 and t=70
+        // Combined limit of 2 must hold across epoch boundary, so third call must fail
+        env.ledger().set_timestamp(80);
+        assert!(!client.check_rate_limit(&caller, &action, &2, &60));
+
+        // Advance past t=50: at t=111, cutoff is 111 - 60 = 51 > 50
+        // t=50 drops out of the rolling window, leaving only t=70 (count 1)
+        // So a new request succeeds
+        env.ledger().set_timestamp(111);
+        assert!(client.check_rate_limit(&caller, &action, &2, &60));
     }
 }

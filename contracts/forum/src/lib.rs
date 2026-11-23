@@ -60,6 +60,7 @@ pub struct Post {
     pub downvotes: i128,
     pub reply_count: u32,
     pub moderation_count: u32,
+    pub deleted: bool,
 }
 
 #[contracttype]
@@ -254,6 +255,7 @@ impl ForumContract {
             downvotes: 0,
             reply_count: 0,
             moderation_count: 0,
+            deleted: false,
         };
 
         env.storage().persistent().set(&POST_COUNT, &count);
@@ -298,7 +300,7 @@ impl ForumContract {
         author.require_auth();
 
         let post = Self::get_post(env.clone(), post_id);
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -371,7 +373,7 @@ impl ForumContract {
         voter.require_auth();
 
         let mut post = Self::get_post(env.clone(), post_id);
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -486,7 +488,7 @@ impl ForumContract {
             panic!("only post author can mark best answer");
         }
 
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -592,6 +594,7 @@ impl ForumContract {
                 ModerationAction::Delete => {
                     let was_active = post.status == PostStatus::Active;
                     post.status = PostStatus::Deleted;
+                    post.deleted = true;
                     if was_active {
                         let active_posts = env.storage().persistent().get(&DataKey::ActivePosts).unwrap_or(0u32);
                         env.storage().persistent().set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
@@ -620,6 +623,43 @@ impl ForumContract {
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("MOD_ACT"), target_id),
             (moderator, is_reply, action),
+        );
+    }
+
+    pub fn delete_post(env: Env, author: Address, post_id: u32) {
+        author.require_auth();
+
+        let mut post = Self::get_post(env.clone(), post_id);
+        if post.author != author {
+            panic!("only post author can delete post");
+        }
+        if post.deleted || post.status == PostStatus::Deleted {
+            panic!("post already deleted");
+        }
+
+        let was_active = post.status == PostStatus::Active;
+        post.status = PostStatus::Deleted;
+        post.deleted = true;
+        post.updated_at = env.ledger().timestamp();
+
+        if was_active {
+            let active_posts = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ActivePosts)
+                .unwrap_or(0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Post(post_id), &post);
+
+        env.events().publish(
+            (symbol_short!("FRM"), symbol_short!("POST_DEL"), post_id),
+            author,
         );
     }
 
@@ -722,7 +762,7 @@ impl ForumContract {
                 .persistent()
                 .get::<_, Post>(&DataKey::Post(current_id))
             {
-                if post.category_id == category_id && post.status == PostStatus::Active {
+                if post.category_id == category_id && post.status == PostStatus::Active && !post.deleted {
                     posts.push_back(current_id);
                     found += 1;
                 }
@@ -730,6 +770,16 @@ impl ForumContract {
         }
 
         posts
+    }
+
+    pub fn is_parent_deleted(env: Env, post_id: u32) -> bool {
+        let post = Self::get_post(env, post_id);
+        post.deleted || post.status == PostStatus::Deleted
+    }
+
+    pub fn is_reply_orphaned(env: Env, reply_id: u32) -> bool {
+        let reply = Self::get_reply(env.clone(), reply_id);
+        Self::is_parent_deleted(env, reply.post_id)
     }
 
     pub fn get_replies_by_post(env: Env, post_id: u32, limit: u32) -> Vec<u32> {
@@ -1053,5 +1103,72 @@ mod tests {
 
         let responder_rep = forum.get_user_reputation(&responder);
         assert_eq!(responder_rep.reputation, 50); // Best answer bonus
+    }
+
+    #[test]
+    fn test_post_soft_deletion_and_orphaned_replies() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author = Address::generate(&env);
+        let responder = Address::generate(&env);
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
+        token.mint(&author, &10_000_000i128);
+        token.mint(&responder, &10_000_000i128);
+
+        // Create post
+        let title = Bytes::from_slice(&env, b"Post to be deleted");
+        let content_hash = BytesN::from_array(&env, &[3u8; 32]);
+        let post_id = forum.create_post(
+            &author,
+            &title,
+            &content_hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+
+        // Create reply referencing this post
+        let reply_hash = BytesN::from_array(&env, &[4u8; 32]);
+        let reply_id = forum.create_reply(&responder, &post_id, &reply_hash, &1_000_000i128);
+
+        // Before deletion: post is active, not deleted, reply is not orphaned
+        let post_before = forum.get_post(&post_id);
+        assert_eq!(post_before.status, PostStatus::Active);
+        assert!(!post_before.deleted);
+        assert!(!forum.is_parent_deleted(&post_id));
+        assert!(!forum.is_reply_orphaned(&reply_id));
+
+        let active_posts_before = forum.get_posts_by_category(&1, &10);
+        assert!(active_posts_before.contains(post_id));
+
+        // Author soft-deletes the post
+        forum.delete_post(&author, &post_id);
+
+        // Post still exists in storage (metadata retained) with deleted flag
+        let post_after = forum.get_post(&post_id);
+        assert_eq!(post_after.status, PostStatus::Deleted);
+        assert!(post_after.deleted);
+
+        // Orphaned replies can be identified by querying parent's deleted flag
+        assert!(forum.is_parent_deleted(&post_id));
+        assert!(forum.is_reply_orphaned(&reply_id));
+
+        // Active post queries do NOT return deleted post
+        let active_posts_after = forum.get_posts_by_category(&1, &10);
+        assert!(!active_posts_after.contains(post_id));
     }
 }
