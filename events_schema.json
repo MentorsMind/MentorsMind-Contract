@@ -187,6 +187,7 @@
         "subscribed": { "description": "User subscribed" },
         "expired": { "description": "Subscription expired" },
         "renewed": { "description": "Subscription renewed" },
+        "renewpaid": { "description": "Subscription renewal payment with mentor, amount, and paid_at timestamp" },
         "cancelled": { "description": "Subscription cancelled" },
         "paused": { "description": "Subscription paused" }
       }

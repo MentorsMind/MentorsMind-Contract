@@ -601,6 +601,10 @@ impl SubscriptionContract {
             (symbol_short!("renewed"), subscription_id),
             (record.learner, record.plan_id),
         );
+        env.events().publish(
+            (symbol_short!("renewpaid"), subscription_id),
+            (record.mentor, required, now),
+        );
         Ok(())
     }
 
@@ -755,27 +759,71 @@ impl SubscriptionContract {
             .expect("plan not found")
     }
 
-    /// Get the total count of subscriptions.
+    /// Get the count of active subscriptions.
     pub fn get_subscription_count(env: Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SubCounter)
-            .unwrap_or(0)
-    }
-
-    /// Get a paginated page of subscriptions.
-    pub fn get_subscriptions_page(env: Env, offset: u32, limit: u32) -> Vec<SubscriptionRecord> {
-        let count = env.storage()
+        let count = env
+            .storage()
             .persistent()
             .get(&DataKey::SubCounter)
             .unwrap_or(0);
+        let mut active_count = 0;
 
-        let (start, end) = Pagination::bounds(count, offset, limit);
+        for id in 0..count {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubscriptionRecord>(&DataKey::Sub(id))
+            {
+                if record.status == SubscriptionStatus::Active {
+                    active_count += 1;
+                }
+            }
+        }
+
+        active_count
+    }
+
+    /// Get a paginated page of active subscriptions.
+    pub fn get_subscriptions_page(env: Env, offset: u32, limit: u32) -> Vec<SubscriptionRecord> {
+        let count = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubCounter)
+            .unwrap_or(0);
+        let mut active_count = 0;
+
+        for id in 0..count {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubscriptionRecord>(&DataKey::Sub(id))
+            {
+                if record.status == SubscriptionStatus::Active {
+                    active_count += 1;
+                }
+            }
+        }
+
+        let (start, end) = Pagination::bounds(active_count, offset, limit);
         let mut page = Vec::new(&env);
+        let mut active_index = 0;
 
-        for i in start..end {
-            if let Some(record) = env.storage().persistent().get(&DataKey::Sub(i)) {
-                page.push_back(record);
+        for id in 0..count {
+            if active_index >= end {
+                break;
+            }
+
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubscriptionRecord>(&DataKey::Sub(id))
+            {
+                if record.status == SubscriptionStatus::Active {
+                    if active_index >= start {
+                        page.push_back(record);
+                    }
+                    active_index += 1;
+                }
             }
         }
 
@@ -1868,6 +1916,60 @@ mod test {
         let page = client.get_subscriptions_page(&2u32, &2u32);
         assert_eq!(page.len(), 1);
         assert_eq!(page.get(0).unwrap().plan_id, plan_id);
+    }
+
+    #[test]
+    fn test_subscription_queries_only_include_active_records() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let active_id = client.subscribe(&learner, &plan_id);
+        let cancelled_id = client.subscribe(&learner, &plan_id);
+        let paused_id = client.subscribe(&learner, &plan_id);
+        let expired_id = client.subscribe(&learner, &plan_id);
+
+        client.cancel(&cancelled_id);
+        client.pause(&paused_id);
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + SUBSCRIPTION_EXPIRY_GRACE_SECS
+        });
+        client.check_expiry(&expired_id);
+        let later_active_id = client.subscribe(&learner, &plan_id);
+        client.use_session(&later_active_id);
+
+        assert_eq!(client.get_subscription_count(), 2);
+        let page = client.get_subscriptions_page(&0u32, &1u32);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().status, SubscriptionStatus::Active);
+        assert_eq!(page.get(0).unwrap().sessions_used, 0);
+        let page = client.get_subscriptions_page(&1u32, &1u32);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().status, SubscriptionStatus::Active);
+        assert_eq!(page.get(0).unwrap().sessions_used, 1);
+        assert!(client.get_subscriptions_page(&2u32, &1u32).is_empty());
+        assert_eq!(
+            client.get_subscription(&active_id).status,
+            SubscriptionStatus::Active
+        );
+        assert_eq!(
+            client.get_subscription(&cancelled_id).status,
+            SubscriptionStatus::Cancelled
+        );
+        assert_eq!(
+            client.get_subscription(&paused_id).status,
+            SubscriptionStatus::Paused
+        );
+        assert_eq!(
+            client.get_subscription(&expired_id).status,
+            SubscriptionStatus::Expired
+        );
+        assert_eq!(
+            client.get_subscription(&later_active_id).status,
+            SubscriptionStatus::Active
+        );
     }
 
     // -----------------------------------------------------------------------

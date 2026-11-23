@@ -41,9 +41,17 @@ pub enum DataKey {
     EscrowDisputeCount,
     EscrowTotalDurationSecs,
     RevenueBucket(Address, u32),
+    RevenueRecords(Address, u32),
     MentorRevenueCount,
     MentorRevenueAt(u32),
     MentorRevenue30d(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevenueRecord {
+    pub amount: i128,
+    pub paid_at: u64,
 }
 
 #[contracttype]
@@ -149,9 +157,9 @@ impl SubscriptionAnalytics {
         );
     }
 
-    /// Record a renewal into today's daily revenue bucket for `mentor`.
+    /// Record a renewal in the daily revenue bucket for `mentor`.
     /// Deletes the bucket from 32 days ago so storage stays bounded at 31 days.
-    pub fn record_renewal(env: Env, mentor: Address, amount: i128) {
+    pub fn record_renewal(env: Env, mentor: Address, amount: i128, paid_at: u64) {
         let sub_contract: Address = env
             .storage()
             .persistent()
@@ -161,16 +169,29 @@ impl SubscriptionAnalytics {
 
         Self::ensure_mentor_indexed(&env, &mentor);
 
-        let day = (env.ledger().timestamp() / BUCKET_SIZE_SECS) as u32;
+        let day = (paid_at / BUCKET_SIZE_SECS) as u32;
         let key = DataKey::RevenueBucket(mentor.clone(), day);
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(prev + amount));
+
+        let records_key = DataKey::RevenueRecords(mentor.clone(), day);
+        let mut records: soroban_sdk::Vec<RevenueRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        records.push_back(RevenueRecord { amount, paid_at });
+        env.storage().persistent().set(&records_key, &records);
 
         // Delete the bucket from 32 days ago (keep at most 31 daily buckets).
         if day >= 32 {
             let stale_key = DataKey::RevenueBucket(mentor.clone(), day - 32);
             if env.storage().persistent().has(&stale_key) {
                 env.storage().persistent().remove(&stale_key);
+            }
+            let stale_records_key = DataKey::RevenueRecords(mentor.clone(), day - 32);
+            if env.storage().persistent().has(&stale_records_key) {
+                env.storage().persistent().remove(&stale_records_key);
             }
         }
 
@@ -179,6 +200,39 @@ impl SubscriptionAnalytics {
         env.storage()
             .persistent()
             .set(&DataKey::MentorRevenue30d(mentor), &rolling);
+    }
+
+    /// Sum revenue paid in `[period_start, period_end)` from retained records.
+    pub fn get_mentor_revenue_for_period(
+        env: Env,
+        mentor: Address,
+        period_start: u64,
+        period_end: u64,
+    ) -> i128 {
+        if period_start >= period_end
+            || period_end - period_start > BUCKET_SIZE_SECS * _BUCKETS_RETAINED as u64
+        {
+            panic!("invalid revenue period");
+        }
+
+        let first_day = (period_start / BUCKET_SIZE_SECS) as u32;
+        let last_day = ((period_end - 1) / BUCKET_SIZE_SECS) as u32;
+        let mut total = 0i128;
+
+        for day in first_day..=last_day {
+            let records: soroban_sdk::Vec<RevenueRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RevenueRecords(mentor.clone(), day))
+                .unwrap_or(soroban_sdk::Vec::new(&env));
+            for record in records.iter() {
+                if record.paid_at >= period_start && record.paid_at < period_end {
+                    total = total.saturating_add(record.amount);
+                }
+            }
+        }
+
+        total
     }
 
     /// Sum of the mentor's most recent 30 daily buckets (today inclusive).
@@ -437,15 +491,46 @@ mod test {
         let client = setup(&env);
         let mentor = Address::generate(&env);
 
-        client.record_renewal(&mentor, &100i128); // today (day 100)
+        client.record_renewal(&mentor, &100i128, &(100 * BUCKET_SIZE_SECS));
         env.ledger().with_mut(|li| li.timestamp = 90 * BUCKET_SIZE_SECS);
-        client.record_renewal(&mentor, &50i128); // 10 days ago
+        client.record_renewal(&mentor, &50i128, &(90 * BUCKET_SIZE_SECS));
         env.ledger().with_mut(|li| li.timestamp = 69 * BUCKET_SIZE_SECS);
-        client.record_renewal(&mentor, &999i128); // 31 days before day 100
+        client.record_renewal(&mentor, &999i128, &(69 * BUCKET_SIZE_SECS));
 
         env.ledger().with_mut(|li| li.timestamp = 100 * BUCKET_SIZE_SECS);
         // 30d window: days 71..=100 → includes 100 and 90; excludes 69
         assert_eq!(client.get_mentor_revenue_30d(&mentor), 150i128);
+    }
+
+    #[test]
+    fn test_revenue_period_uses_payment_timestamp() {
+        let env = Env::default();
+        env.ledger()
+            .with_mut(|li| li.timestamp = 100 * BUCKET_SIZE_SECS);
+        let client = setup(&env);
+        let mentor = Address::generate(&env);
+        let day_90 = 90 * BUCKET_SIZE_SECS;
+        let day_100 = 100 * BUCKET_SIZE_SECS;
+
+        client.record_renewal(&mentor, &40i128, &day_90);
+        client.record_renewal(&mentor, &75i128, &day_100);
+
+        assert_eq!(
+            client.get_mentor_revenue_for_period(
+                &mentor,
+                &day_90,
+                &(day_90 + BUCKET_SIZE_SECS)
+            ),
+            40i128
+        );
+        assert_eq!(
+            client.get_mentor_revenue_for_period(&mentor, &day_100, &(day_100 + BUCKET_SIZE_SECS)),
+            75i128
+        );
+        assert_eq!(
+            client.get_mentor_revenue_for_period(&mentor, &day_91, &day_100),
+            0i128
+        );
     }
 
     #[test]
@@ -455,10 +540,10 @@ mod test {
         let mentor = Address::generate(&env);
 
         env.ledger().with_mut(|li| li.timestamp = 168 * BUCKET_SIZE_SECS);
-        client.record_renewal(&mentor, &10i128);
+        client.record_renewal(&mentor, &10i128, &(168 * BUCKET_SIZE_SECS));
 
         env.ledger().with_mut(|li| li.timestamp = 200 * BUCKET_SIZE_SECS);
-        client.record_renewal(&mentor, &5i128); // prunes day 200-32 = 168
+        client.record_renewal(&mentor, &5i128, &(200 * BUCKET_SIZE_SECS));
 
         // Day 168 is outside the 30d window anyway; revenue should be today's 5 only
         // from recent activity in window (day 200 only among recorded that remain).
@@ -473,7 +558,7 @@ mod test {
 
         for _ in 0..5 {
             let m = Address::generate(&env);
-            client.record_renewal(&m, &10i128);
+            client.record_renewal(&m, &10i128, &(50 * BUCKET_SIZE_SECS));
         }
 
         let page1 = client.get_protocol_revenue_30d(&0u32, &2u32);
@@ -500,7 +585,7 @@ mod test {
             env.ledger()
                 .with_mut(|li| li.timestamp = (80 - d as u64) * BUCKET_SIZE_SECS);
             let amt = (d as i128 + 1) * 3;
-            client.record_renewal(&mentor, &amt);
+            client.record_renewal(&mentor, &amt, &((80 - d as u64) * BUCKET_SIZE_SECS));
             expected += amt;
         }
         env.ledger().with_mut(|li| li.timestamp = 80 * BUCKET_SIZE_SECS);
