@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::params::{get_param, init_protocol_params, set_param as write_param, ParamKey};
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracterror, contracttype,
     symbol_short, Address, Env, Symbol, Vec,
@@ -53,6 +54,10 @@ pub enum Error {
     HoldActive         = 4,
     /// A manual anomaly trigger exceeded its rate limit (#1430).
     RateLimited        = 5,
+    /// `set_param` was given a key that is not an anomaly threshold (#1429).
+    UnknownParam       = 6,
+    /// A threshold was negative (#1429).
+    InvalidThreshold   = 7,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +202,26 @@ pub trait AnomalyDetectorTrait {
 // Contract
 // ---------------------------------------------------------------------------
 
+/// Protocol-param keys for the detection thresholds (#1429).
+fn key_escrow_warn() -> Symbol { soroban_sdk::symbol_short!("ANM_ESC") }
+fn key_dispute_hold() -> Symbol { soroban_sdk::symbol_short!("ANM_DSP") }
+fn key_volume_hold() -> Symbol { soroban_sdk::symbol_short!("ANM_VOL") }
+
+fn is_threshold_key(key: &Symbol) -> bool {
+    *key == key_escrow_warn() || *key == key_dispute_hold() || *key == key_volume_hold()
+}
+
+/// Thresholds as governance last set them, or the compile-time defaults (#1429).
+fn load_config(env: &Env) -> AnomalyConfig {
+    AnomalyConfig {
+        escrow_warn_per_hour: u32::try_from(get_param(env, &key_escrow_warn(), DEFAULT_ESCROW_WARN_PER_HOUR as i128))
+            .unwrap_or(u32::MAX),
+        dispute_hold_per_day: u32::try_from(get_param(env, &key_dispute_hold(), DEFAULT_DISPUTE_HOLD_PER_DAY as i128))
+            .unwrap_or(u32::MAX),
+        volume_hold_per_hour: get_param(env, &key_volume_hold(), DEFAULT_VOLUME_HOLD_PER_HOUR),
+    }
+}
+
 #[contract]
 pub struct AnomalyDetectorContract;
 
@@ -208,17 +233,12 @@ impl AnomalyDetectorContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        // Store default thresholds in instance storage
-        let config = AnomalyConfig {
-            escrow_warn_per_hour: DEFAULT_ESCROW_WARN_PER_HOUR,
-            dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
-            volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
-        };
-        env.storage().instance().set(&DataKey::Config, &config);
+        // Thresholds are protocol params; unset ones fall back to the defaults (#1429).
         Ok(())
     }
 
-    /// Admin updates thresholds atomically.
+    /// Admin updates thresholds atomically. Writes the same protocol params that
+    /// `set_param` writes, so governance and admin see one source of truth (#1429).
     pub fn set_thresholds(env: Env, admin: Address, config: AnomalyConfig) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -226,20 +246,40 @@ impl AnomalyDetectorContract {
         if admin != stored_admin {
             return Err(Error::NotAdmin);
         }
-        env.storage().instance().set(&DataKey::Config, &config);
+        if config.volume_hold_per_hour < 0 {
+            return Err(Error::InvalidThreshold);
+        }
+        env.storage().persistent().set(&ParamKey::Param(key_escrow_warn()), &(config.escrow_warn_per_hour as i128));
+        env.storage().persistent().set(&ParamKey::Param(key_dispute_hold()), &(config.dispute_hold_per_day as i128));
+        env.storage().persistent().set(&ParamKey::Param(key_volume_hold()), &config.volume_hold_per_hour);
+        Ok(())
+    }
+
+    /// Points governance at the RBAC contract that authorizes `set_param` (#1429).
+    pub fn set_protocol_rbac(env: Env, admin: Address, rbac_contract: Address) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::NotAdmin);
+        }
+        init_protocol_params(&env, &rbac_contract);
+        Ok(())
+    }
+
+    /// Governance update of one detection threshold (#1429). The caller must hold
+    /// GOVERNANCE_ADMIN in the RBAC contract. Accepts only the three threshold keys.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) -> Result<(), Error> {
+        if !is_threshold_key(&key) {
+            return Err(Error::UnknownParam);
+        }
+        write_param(&env, &caller, &key, value);
         Ok(())
     }
 
     /// Returns the current threshold configuration.
     pub fn get_thresholds(env: Env) -> AnomalyConfig {
-        env.storage()
-            .instance()
-            .get(&DataKey::Config)
-            .unwrap_or(AnomalyConfig {
-                escrow_warn_per_hour: DEFAULT_ESCROW_WARN_PER_HOUR,
-                dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
-                volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
-            })
+        load_config(&env)
     }
 
     /// Check an action for anomalies and update metrics.
@@ -344,11 +384,7 @@ impl AnomalyDetectorContract {
             return Ok(AnomalyResult::Hold);
         }
 
-        let config: AnomalyConfig = env.storage().instance().get(&DataKey::Config).unwrap_or(AnomalyConfig {
-            escrow_warn_per_hour: DEFAULT_ESCROW_WARN_PER_HOUR,
-            dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
-            volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
-        });
+        let config = load_config(env);
 
         let now = env.ledger().timestamp();
         let mut metrics = Self::get_or_default_metrics(env, &user, now);
