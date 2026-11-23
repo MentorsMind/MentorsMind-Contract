@@ -12,6 +12,7 @@ pub struct MockSnapshot;
 #[derive(Clone)]
 enum MockDataKey {
     Weight(u32, Address),
+    StakedBalance(Address),
 }
 
 #[contractimpl]
@@ -30,10 +31,30 @@ impl MockSnapshot {
     }
 }
 
+#[contract]
+pub struct MockStaking;
+
+#[contractimpl]
+impl MockStaking {
+    pub fn set_staked_balance(env: Env, staker: Address, amount: i128) {
+        env.storage()
+            .persistent()
+            .set(&MockDataKey::StakedBalance(staker), &amount);
+    }
+
+    pub fn get_staked_balance(env: Env, staker: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&MockDataKey::StakedBalance(staker))
+            .unwrap_or(0)
+    }
+}
+
 struct Fixture {
     env: Env,
     contract_id: Address,
     snapshot_id: Address,
+    staking_id: Address,
     admin: Address,
 }
 
@@ -46,15 +67,18 @@ impl Fixture {
 
         let admin = Address::generate(&env);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let staking_id = env.register_contract(None, MockStaking);
         let contract_id = env.register_contract(None, DelegationContract);
 
         let contract = DelegationContractClient::new(&env, &contract_id);
         contract.initialize(&admin, &snapshot_id);
+        contract.set_staking_contract(&admin, &staking_id);
 
         Self {
             env,
             contract_id,
             snapshot_id,
+            staking_id,
             admin,
         }
     }
@@ -67,10 +91,15 @@ impl Fixture {
         MockSnapshotClient::new(&self.env, &self.snapshot_id)
     }
 
+    fn staking(&self) -> MockStakingClient<'_> {
+        MockStakingClient::new(&self.env, &self.staking_id)
+    }
+
     /// Creates a voter holding `weight` and returns its address.
     fn voter(&self, weight: i128) -> Address {
         let voter = Address::generate(&self.env);
         self.snapshot().set_weight(&PROPOSAL, &voter, &weight);
+        self.staking().set_staked_balance(&voter, &weight);
         voter
     }
 }
@@ -141,6 +170,23 @@ fn test_several_delegators_accumulate_on_one_delegate() {
     assert_eq!(contract.get_voting_weight(&PROPOSAL, &delegate), 135);
     assert_eq!(contract.get_voting_weight(&PROPOSAL, &first), 0);
     assert_eq!(contract.get_voting_weight(&PROPOSAL, &second), 0);
+}
+
+#[test]
+fn test_delegated_power_tracks_live_stake_after_unstake() {
+    let f = Fixture::setup();
+    let contract = f.contract();
+
+    let delegator = f.voter(100);
+    let delegate = f.voter(40);
+    contract.delegate(&delegator, &delegate);
+    assert_eq!(contract.get_voting_weight(&PROPOSAL, &delegate), 140);
+
+    f.staking().set_staked_balance(&delegator, &60);
+    assert_eq!(contract.get_voting_weight(&PROPOSAL, &delegate), 100);
+
+    f.staking().set_staked_balance(&delegator, &0);
+    assert_eq!(contract.get_voting_weight(&PROPOSAL, &delegate), 40);
 }
 
 // ── Revocation ────────────────────────────────────────────────────────────────
@@ -301,48 +347,36 @@ fn test_rejected_cycle_leaves_state_untouched() {
 }
 
 #[test]
-fn test_chain_deeper_than_max_depth_is_capped() {
+fn test_depth_three_chain_is_accepted_and_depth_four_is_rejected() {
     let f = Fixture::setup();
     let contract = f.contract();
 
-    // Build a chain one hop longer than the traversal cap.
-    let holders: std::vec::Vec<Address> = (0..(MAX_CHAIN_DEPTH + 2)).map(|_| f.voter(10)).collect();
+    let holders: std::vec::Vec<Address> = (0..5).map(|_| f.voter(10)).collect();
+    assert_eq!(MAX_DELEGATION_DEPTH, 3);
 
-    for i in 0..(holders.len() - 1) {
-        contract.delegate(&holders[i], &holders[i + 1]);
-    }
+    assert_eq!(contract.delegate(&holders[2], &holders[3]), Ok(()));
+    assert_eq!(contract.delegate(&holders[1], &holders[2]), Ok(()));
+    assert_eq!(contract.delegate(&holders[0], &holders[1]), Ok(()));
 
-    let tail = holders.len() - 1;
-
-    // The tail is the only holder allowed to vote. Resolution counts the
-    // tail's own weight plus one delegator per resolvable hop, and stops at
-    // MAX_CHAIN_DEPTH, so the holder at the far end of the chain is dropped
-    // rather than followed.
-    let resolved = contract.get_voting_weight(&PROPOSAL, &holders[tail]);
-    assert_eq!(resolved, 10 * (MAX_CHAIN_DEPTH as i128 + 1));
-
-    // Everyone upstream has delegated their weight away.
-    for holder in holders.iter().take(tail) {
-        assert_eq!(contract.get_voting_weight(&PROPOSAL, holder), 0);
-    }
+    assert_eq!(
+        contract.try_delegate(&holders[4], &holders[0]),
+        Ok(Err(DelegationError::DelegationDepthExceeded))
+    );
+    assert_eq!(contract.get_delegate(&holders[4]), None);
+    assert_eq!(contract.get_voting_weight(&PROPOSAL, &holders[4]), 10);
+    assert_eq!(contract.get_voting_weight(&PROPOSAL, &holders[0]), 0);
 }
 
 #[test]
-fn test_chain_at_the_depth_limit_is_accepted() {
+fn test_configured_depth_cannot_exceed_hard_limit() {
     let f = Fixture::setup();
     let contract = f.contract();
 
-    let holders: std::vec::Vec<Address> = (0..MAX_CHAIN_DEPTH).map(|_| f.voter(10)).collect();
-
-    for i in 0..(holders.len() - 1) {
-        contract.delegate(&holders[i], &holders[i + 1]);
-    }
-
-    let tail = holders.len() - 1;
-    assert_eq!(
-        contract.get_voting_weight(&PROPOSAL, &holders[tail]),
-        10 * MAX_CHAIN_DEPTH as i128
-    );
+    assert_eq!(contract.get_max_delegation_depth(), MAX_DELEGATION_DEPTH);
+    assert!(contract
+        .try_set_max_delegation_depth(&f.admin, &(MAX_DELEGATION_DEPTH + 1))
+        .is_err());
+    assert_eq!(contract.get_max_delegation_depth(), MAX_DELEGATION_DEPTH);
 }
 
 // ── Guards ────────────────────────────────────────────────────────────────────
@@ -413,4 +447,3 @@ fn test_delegators_pagination_returns_correct_slice() {
     assert_eq!(page3.len(), 1);
     assert_eq!(page3.get(0).unwrap(), d5);
 }
-
