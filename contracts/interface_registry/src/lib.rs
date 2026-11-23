@@ -2,6 +2,9 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
+/// How long a deregistration waits before it may be finalized (#1432).
+pub const DEREGISTER_COOLDOWN_SECS: u64 = 48 * 3600;
+
 /// Errors returned by interface registration (#1431).
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -11,6 +14,12 @@ pub enum Error {
     VersionNotBumped = 1,
     /// The supplied version is zero.
     InvalidVersion = 2,
+    /// No interface is registered under that id.
+    InterfaceNotFound = 3,
+    /// Finalize was called with no deregistration pending.
+    DeregistrationNotPending = 4,
+    /// The deregistration cooldown has not elapsed yet.
+    CooldownActive = 5,
 }
 
 #[contracttype]
@@ -25,6 +34,8 @@ pub enum DataKey {
     Quarantined(Address),
     /// Minimum acceptable version per interface id (#1431).
     MinVersion(Symbol),
+    /// Ledger time at which `deregister_interface` was first called (#1432).
+    PendingDeregistration(Symbol),
 }
 
 #[contracttype]
@@ -58,6 +69,76 @@ pub struct InterfaceRegistryContract;
 
 #[contractimpl]
 impl InterfaceRegistryContract {
+    /// Starts the cooldown before `interface_id` is removed (#1432).
+    ///
+    /// The interface keeps working for `DEREGISTER_COOLDOWN_SECS`, so dependent
+    /// contracts can react. A repeat call during the cooldown keeps the original
+    /// timestamp. Returns the time after which `finalize_deregistration` may run.
+    pub fn deregister_interface(env: Env, interface_id: Symbol) -> Result<u64, Error> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Interface(interface_id.clone())) {
+            return Err(Error::InterfaceNotFound);
+        }
+
+        let key = DataKey::PendingDeregistration(interface_id);
+        let proposed_at = match env.storage().persistent().get::<_, u64>(&key) {
+            Some(existing) => existing,
+            None => {
+                let now = env.ledger().timestamp();
+                env.storage().persistent().set(&key, &now);
+                now
+            }
+        };
+        Ok(proposed_at.saturating_add(DEREGISTER_COOLDOWN_SECS))
+    }
+
+    /// Removes an interface once its deregistration cooldown has elapsed (#1432).
+    pub fn finalize_deregistration(env: Env, interface_id: Symbol) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        let pending_key = DataKey::PendingDeregistration(interface_id.clone());
+        let proposed_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(Error::DeregistrationNotPending)?;
+        let now = env.ledger().timestamp();
+        if now < proposed_at.saturating_add(DEREGISTER_COOLDOWN_SECS) {
+            return Err(Error::CooldownActive);
+        }
+
+        env.storage().persistent().remove(&DataKey::Interface(interface_id.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::InterfaceDescriptor(interface_id.clone()));
+        env.storage().persistent().remove(&pending_key);
+
+        let ids: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterfaceIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut kept: Vec<Symbol> = Vec::new(&env);
+        for id in ids.iter() {
+            if id != interface_id {
+                kept.push_back(id);
+            }
+        }
+        env.storage().persistent().set(&DataKey::InterfaceIds, &kept);
+        Ok(())
+    }
+
     const YIELD_INTERFACE: &'static str = "yield_v1";
     /// Canonical interface id under which resolution oracles are registered.
     /// Consumers (e.g. the prediction market) validate an oracle address by

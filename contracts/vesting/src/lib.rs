@@ -536,6 +536,10 @@ impl VestingContract {
         let actual_start = if start == 0 { now } else { start };
         let cliff_end = actual_start.saturating_add(cliff_seconds);
         let vesting_end = actual_start.saturating_add(vesting_seconds);
+        // A cliff that ends at or after the schedule ends would never let tokens vest.
+        if cliff_end >= vesting_end {
+            soroban_sdk::panic_with_error!(&env, Error::InvalidSchedule);
+        }
 
         let schedule = VestingSchedule {
             beneficiary: beneficiary.clone(),
