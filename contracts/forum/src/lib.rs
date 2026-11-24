@@ -69,6 +69,7 @@ pub struct Post {
     pub downvotes: i128,
     pub reply_count: u32,
     pub moderation_count: u32,
+    pub deleted: bool,
 }
 
 #[contracttype]
@@ -278,6 +279,7 @@ impl ForumContract {
             downvotes: 0,
             reply_count: 0,
             moderation_count: 0,
+            deleted: false,
         };
 
         env.storage().persistent().set(&POST_COUNT, &count);
@@ -338,7 +340,7 @@ impl ForumContract {
         author.require_auth();
 
         let post = Self::get_post(env.clone(), post_id);
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -411,7 +413,7 @@ impl ForumContract {
         voter.require_auth();
 
         let mut post = Self::get_post(env.clone(), post_id);
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -526,7 +528,7 @@ impl ForumContract {
             panic!("only post author can mark best answer");
         }
 
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -632,6 +634,7 @@ impl ForumContract {
                 ModerationAction::Delete => {
                     let was_active = post.status == PostStatus::Active;
                     post.status = PostStatus::Deleted;
+                    post.deleted = true;
                     if was_active {
                         let active_posts = env.storage().persistent().get(&DataKey::ActivePosts).unwrap_or(0u32);
                         env.storage().persistent().set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
@@ -660,6 +663,43 @@ impl ForumContract {
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("MOD_ACT"), target_id),
             (moderator, is_reply, action),
+        );
+    }
+
+    pub fn delete_post(env: Env, author: Address, post_id: u32) {
+        author.require_auth();
+
+        let mut post = Self::get_post(env.clone(), post_id);
+        if post.author != author {
+            panic!("only post author can delete post");
+        }
+        if post.deleted || post.status == PostStatus::Deleted {
+            panic!("post already deleted");
+        }
+
+        let was_active = post.status == PostStatus::Active;
+        post.status = PostStatus::Deleted;
+        post.deleted = true;
+        post.updated_at = env.ledger().timestamp();
+
+        if was_active {
+            let active_posts = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ActivePosts)
+                .unwrap_or(0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Post(post_id), &post);
+
+        env.events().publish(
+            (symbol_short!("FRM"), symbol_short!("POST_DEL"), post_id),
+            author,
         );
     }
 
@@ -762,7 +802,7 @@ impl ForumContract {
                 .persistent()
                 .get::<_, Post>(&DataKey::Post(current_id))
             {
-                if post.category_id == category_id && post.status == PostStatus::Active {
+                if post.category_id == category_id && post.status == PostStatus::Active && !post.deleted {
                     posts.push_back(current_id);
                     found += 1;
                 }
@@ -770,6 +810,16 @@ impl ForumContract {
         }
 
         posts
+    }
+
+    pub fn is_parent_deleted(env: Env, post_id: u32) -> bool {
+        let post = Self::get_post(env, post_id);
+        post.deleted || post.status == PostStatus::Deleted
+    }
+
+    pub fn is_reply_orphaned(env: Env, reply_id: u32) -> bool {
+        let reply = Self::get_reply(env.clone(), reply_id);
+        Self::is_parent_deleted(env, reply.post_id)
     }
 
     pub fn get_replies_by_post(env: Env, post_id: u32, limit: u32) -> Vec<u32> {
