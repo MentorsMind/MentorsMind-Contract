@@ -1,0 +1,5 @@
+# Timelock schedule/execute test: MIN_DELAY plus timestamp tolerance
+init_tl 0
+tl_schedule 1 172800 0
+advance 172860
+tl_execute 0

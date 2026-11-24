@@ -1,0 +1,6 @@
+# From fuzz_happy_path_always_succeeds_when_valid: 3-of-5 Nop proposal
+init_ms 5 3
+ms_propose 0 0 0
+ms_sign 1 1
+ms_sign 2 1
+ms_execute 1
