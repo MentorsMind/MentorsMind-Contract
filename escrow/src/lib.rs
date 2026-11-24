@@ -112,6 +112,7 @@ use shared::session_uniqueness::{
 pub enum Error {
     SessionAuthFailed = 1,
     DuplicateEntry = 2,
+    SanctionedParty = 3,
 }
 
 
@@ -387,6 +388,12 @@ pub trait InsuranceContractTrait {
     fn get_pool_balance(env: Env) -> i128;
 }
 
+/// Cross-contract client for the Sanctions contract used to screen escrow parties.
+#[soroban_sdk::contractclient(name = "SanctionsClient")]
+pub trait SanctionsContractTrait {
+    fn is_sanctioned(env: Env, address: Address) -> bool;
+}
+
 /// Local mirror of `multisig_admin::ProposalRecord` used for cross-contract
 /// validation of emergency release approvals. Field order MUST match the
 /// multisig definition for correct SCV serialization.
@@ -426,6 +433,8 @@ pub enum DataKey {
     StakingContract,
     ReputationContract,
     InsuranceContract,
+    /// Address of the Sanctions contract consulted when creating an escrow.
+    SanctionsContract,
     /// Interface registry consulted to authenticate cross-contract peers
     /// (staking/reputation/insurance) before they're wired in. Optional:
     /// absent config skips verification so tests/early deployments work
@@ -433,6 +442,8 @@ pub enum DataKey {
     InterfaceRegistry,
     /// Address of the MultisigAdmin contract used for emergency release approvals.
     MultisigAdmin,
+    /// Address of the sanctions contract used to block restricted parties.
+    SanctionsContract,
     /// PER-ESCROW failure tracking with exponential backoff (replaced global tracking)
     FailureRecord(u64),
     /// Watchlist of escrow IDs reported as stuck (after grace period elapsed).
@@ -1053,6 +1064,47 @@ impl EscrowContract {
         env.storage().instance().set(&LIQUIDITY_POOL, &pool_address);
     }
 
+    /// Set sanctions contract address (admin only).
+    pub fn set_sanctions_contract(env: Env, sanctions_contract: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::SanctionsContract, &sanctions_contract);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SanctionsContract, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    fn assert_not_sanctioned(env: &Env, address: &Address) {
+        if let Some(sanctions_contract) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::SanctionsContract)
+        {
+            env.storage().persistent().extend_ttl(
+                &DataKey::SanctionsContract,
+                ESCROW_TTL_THRESHOLD,
+                ESCROW_TTL_BUMP,
+            );
+            let sanctioned: bool = env.invoke_contract(
+                &sanctions_contract,
+                &Symbol::new(env, "is_sanctioned"),
+                (address.clone(),).into_val(env),
+            );
+            if sanctioned {
+                panic_with_error!(env, Error::SanctionedParty);
+            }
+        }
+    }
+
     /// Enable or disable dynamic fee (admin only)
     pub fn set_dynamic_fee_enabled(env: Env, enabled: bool) {
         let admin: Address = env
@@ -1397,6 +1449,33 @@ impl EscrowContract {
             .set(&DataKey::InsuranceContract, &insurance);
         env.storage().persistent().extend_ttl(
             &DataKey::InsuranceContract,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+    }
+
+    /// Set the sanctions contract address used to screen mentor and learner
+    /// when an escrow is created (admin only).
+    pub fn set_sanctions_contract(env: Env, admin: Address, sanctions: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+        Self::_require_authorized_peer(&env, &sanctions, Symbol::new(&env, "sanctions_v1"));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SanctionsContract, &sanctions);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SanctionsContract,
             ESCROW_TTL_THRESHOLD,
             ESCROW_TTL_BUMP,
         );
@@ -4005,6 +4084,9 @@ impl EscrowContract {
             panic!("Token not approved");
         }
 
+        Self::assert_not_sanctioned(&env, &mentor);
+        Self::assert_not_sanctioned(&env, &learner);
+
         // Every individual milestone must itself be a strictly positive,
         // economically sane amount. Validating only the summed total would
         // let a negative milestone offset an inflated one while still
@@ -4475,6 +4557,9 @@ impl EscrowContract {
             .require_sufficient_for_division(amount, total_sessions as i128, "amount")
             .validate_or_panic();
 
+        Self::assert_not_sanctioned(&env, &mentor);
+        Self::assert_not_sanctioned(&env, &learner);
+
         // *** STRICT WHITELIST VALIDATION ***
         // This is the critical security check: only admin-approved tokens are accepted.
         // The token address is checked against the persistent whitelist registry.
@@ -4489,6 +4574,18 @@ impl EscrowContract {
         }
         if dest_asset != token_address && !Self::_is_token_approved(&env, &dest_asset) {
             panic!("Dest asset token not approved");
+        }
+
+        // --- Sanctions screening ---
+        if let Some(sanctions) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::SanctionsContract)
+        {
+            let client = SanctionsClient::new(&env, &sanctions);
+            if client.is_sanctioned(&mentor) || client.is_sanctioned(&learner) {
+                panic_with_error!(&env, Error::SanctionedParty);
+            }
         }
 
         // --- Auth ---
@@ -5923,6 +6020,7 @@ mod test {
         token::{Client as TokenClient, StellarAssetClient},
         Address, Env, Vec, IntoVal, Symbol, TryFromVal,
     };
+    extern crate sanctions;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -6037,6 +6135,73 @@ mod test {
         let id = f.create_escrow_at(1_000, 0);
         f.open_dispute(id);
         id
+    }
+
+    #[contract]
+    struct MockSanctionsContract;
+
+    #[contractimpl]
+    impl MockSanctionsContract {
+        pub fn set_sanctioned(env: Env, user: Address, sanctioned: bool) {
+            env.storage().persistent().set(&user, &sanctioned);
+        }
+
+        pub fn is_sanctioned(env: Env, user: Address) -> bool {
+            env.storage().persistent().get(&user).unwrap_or(false)
+        }
+    }
+
+    fn with_sanctions(f: &TestFixture) -> Address {
+        let sanctions = f.env.register_contract(None, MockSanctionsContract);
+        f.client().set_sanctions_contract(&f.admin, &sanctions);
+        sanctions
+    }
+
+    #[test]
+    fn test_create_escrow_rejects_sanctioned_mentor() {
+        let f = TestFixture::setup();
+        let sanctions = with_sanctions(&f);
+        MockSanctionsContractClient::new(&f.env, &sanctions).set_sanctioned(&f.mentor, &true);
+
+        let result = f.client().try_create_escrow(
+            &f.mentor,
+            &f.learner,
+            &500,
+            &symbol_short!("S1"),
+            &f.token_address,
+            &0u64,
+            &1u32,
+        );
+        assert_eq!(result, Err(Ok(Error::SanctionedParty)));
+    }
+
+    #[test]
+    fn test_create_escrow_rejects_sanctioned_learner() {
+        let f = TestFixture::setup();
+        let sanctions = with_sanctions(&f);
+        MockSanctionsContractClient::new(&f.env, &sanctions).set_sanctioned(&f.learner, &true);
+
+        let result = f.client().try_create_escrow(
+            &f.mentor,
+            &f.learner,
+            &500,
+            &symbol_short!("S1"),
+            &f.token_address,
+            &0u64,
+            &1u32,
+        );
+        assert_eq!(result, Err(Ok(Error::SanctionedParty)));
+    }
+
+    #[test]
+    fn test_create_escrow_allows_clean_parties_with_sanctions_configured() {
+        let f = TestFixture::setup();
+        let sanctions = with_sanctions(&f);
+        let client = MockSanctionsContractClient::new(&f.env, &sanctions);
+        client.set_sanctioned(&f.mentor, &false);
+        client.set_sanctioned(&f.learner, &false);
+
+        assert_eq!(f.create_escrow_at(500, 0), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -6817,6 +6982,38 @@ mod test {
     }
 
     /// Test: Revoked token cannot be used to create escrow
+    #[test]
+    fn test_create_escrow_blocks_sanctioned_parties() {
+        let f = Setup::new();
+        let mentor = Address::generate(&f.env);
+        let learner = f.learner.clone();
+        let amount = 1_000_000;
+        f.token.mint(&learner, &amount);
+
+        let sanc_id = f.env.register_contract(None, sanctions::Sanctions);
+        let sanc = sanctions::SanctionsClient::new(&f.env, &sanc_id);
+        sanc.initialize(&f.admin);
+        f.client().set_sanctions_contract(&sanc_id);
+
+        let mentor_hash = sanctions::hash_address(&f.env, &mentor);
+        sanc.add_to_list(&mentor_hash);
+        let res = f.client().try_create_escrow(&mentor, &learner, &amount, &Symbol::new(&f.env, "s1"), &f.token.address, &0, &1);
+        assert!(res.is_err());
+
+        let learner_hash = sanctions::hash_address(&f.env, &learner);
+        sanc.add_to_list(&learner_hash);
+        let mentor2 = Address::generate(&f.env);
+        let res2 = f.client().try_create_escrow(&mentor2, &learner, &amount, &Symbol::new(&f.env, "s2"), &f.token.address, &0, &1);
+        assert!(res2.is_err());
+
+        // clean parties
+        sanc.remove_from_list(&mentor_hash);
+        sanc.remove_from_list(&learner_hash);
+        let mentor3 = Address::generate(&f.env);
+        let id = f.client().create_escrow(&mentor3, &learner, &amount, &Symbol::new(&f.env, "s3"), &f.token.address, &0, &1);
+        assert!(id > 0);
+    }
+
     #[test]
     fn test_revoked_token_cannot_create_escrow() {
         let f = TestFixture::setup();

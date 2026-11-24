@@ -7,11 +7,18 @@ use shared::{PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT};
 const MAX_BATCH: u32 = 100;
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SanctionRecord {
+    /// `None` means the sanction does not expire.
+    pub expiry: Option<u64>,
+}
+
+#[contracttype]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Admin,
-    /// BytesN<32> hash -> bool (present = sanctioned)
+    /// BytesN<32> hash -> SanctionRecord (present = sanctioned)
     Sanctioned(BytesN<32>),
 }
 
@@ -33,12 +40,13 @@ impl Sanctions {
     }
 
     /// Add a single SHA-256 hash to the sanctions list. Admin only.
-    pub fn add_to_list(env: Env, address_hash: BytesN<32>) {
+    /// `expiry` of `None` records a sanction that does not expire.
+    pub fn add_to_list(env: Env, address_hash: BytesN<32>, expiry: Option<u64>) {
         Self::require_admin(&env);
         let key = DataKey::Sanctioned(address_hash.clone());
         env.storage()
             .persistent()
-            .set(&key, &true);
+            .set(&key, &SanctionRecord { expiry });
         env.storage().persistent().extend_ttl(
             &key,
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -59,7 +67,7 @@ impl Sanctions {
     }
 
     /// Batch add up to 100 hashes. Admin only.
-    pub fn add_batch(env: Env, hashes: Vec<BytesN<32>>) {
+    pub fn add_batch(env: Env, hashes: Vec<BytesN<32>>, expiry: Option<u64>) {
         Self::require_admin(&env);
         if hashes.len() > MAX_BATCH {
             panic!("batch exceeds 100");
@@ -68,7 +76,7 @@ impl Sanctions {
             let key = DataKey::Sanctioned(hash.clone());
             env.storage()
                 .persistent()
-                .set(&key, &true);
+                .set(&key, &SanctionRecord { expiry });
             env.storage().persistent().extend_ttl(
                 &key,
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -79,25 +87,45 @@ impl Sanctions {
         }
     }
 
+    /// Extend or replace the expiry of an active sanction. Admin only.
+    pub fn renew_sanction(env: Env, address_hash: BytesN<32>, expiry: Option<u64>) {
+        Self::require_admin(&env);
+        let key = DataKey::Sanctioned(address_hash);
+        let record: SanctionRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("sanction not found");
+        if record.expiry.map_or(false, |old| old < env.ledger().timestamp()) {
+            panic!("sanction already expired");
+        }
+        env.storage()
+            .persistent()
+            .set(&key, &SanctionRecord { expiry });
+    }
+
     /// Hash the Address via SHA-256 of its XDR encoding and check the list.
     pub fn is_sanctioned(env: Env, address: Address) -> bool {
         let hash = hash_address(&env, &address);
         let key = DataKey::Sanctioned(hash);
-        let is_sanctioned = env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(false);
+        let record: Option<SanctionRecord> = env.storage().persistent().get(&key);
+        let now = env.ledger().timestamp();
 
-        // Extend TTL on read to keep frequently-checked entries hot
-        if is_sanctioned {
-            env.storage().persistent().extend_ttl(
-                &key,
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        match record {
+            Some(record) if record.expiry.map_or(false, |expiry| expiry < now) => {
+                env.storage().persistent().remove(&key);
+                false
+            }
+            Some(_) => {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                true
+            }
+            None => false,
         }
-
-        is_sanctioned
     }
 
     fn require_admin(env: &Env) {
@@ -119,7 +147,7 @@ pub fn hash_address(env: &Env, address: &Address) -> BytesN<32> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn deploy(env: &Env) -> (SanctionsClient, Address) {
         let contract_id = env.register_contract(None, Sanctions);
@@ -139,7 +167,7 @@ mod test {
         let hash = hash_address(&env, &bad_actor);
 
         assert!(!c.is_sanctioned(&bad_actor));
-        c.add_to_list(&hash);
+        c.add_to_list(&hash, &None);
         assert!(c.is_sanctioned(&bad_actor));
     }
 
@@ -153,7 +181,7 @@ mod test {
         let innocent = Address::generate(&env);
         let hash = hash_address(&env, &bad_actor);
 
-        c.add_to_list(&hash);
+        c.add_to_list(&hash, &None);
         assert!(!c.is_sanctioned(&innocent));
     }
 
@@ -166,7 +194,7 @@ mod test {
         let addr = Address::generate(&env);
         let hash = hash_address(&env, &addr);
 
-        c.add_to_list(&hash);
+        c.add_to_list(&hash, &None);
         assert!(c.is_sanctioned(&addr));
         c.remove_from_list(&hash);
         assert!(!c.is_sanctioned(&addr));
@@ -184,7 +212,7 @@ mod test {
             hashes.push_back(hash_address(&env, a));
         }
 
-        c.add_batch(&hashes);
+        c.add_batch(&hashes, &None);
         for a in &addrs {
             assert!(c.is_sanctioned(a));
         }
@@ -201,7 +229,7 @@ mod test {
         for _ in 0..101 {
             hashes.push_back(BytesN::from_array(&env, &[0u8; 32]));
         }
-        c.add_batch(&hashes);
+        c.add_batch(&hashes, &None);
     }
 
     #[test]
@@ -214,7 +242,7 @@ mod test {
         let hash = hash_address(&env, &addr);
 
         // Add to list with TTL extension
-        c.add_to_list(&hash);
+        c.add_to_list(&hash, &None);
         assert!(c.is_sanctioned(&addr));
 
         // Verify entry is still readable after TTL extension on read
@@ -224,11 +252,48 @@ mod test {
         let addr2 = Address::generate(&env);
         let mut hashes: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::Vec::new(&env);
         hashes.push_back(hash_address(&env, &addr2));
-        c.add_batch(&hashes);
+        c.add_batch(&hashes, &None);
         assert!(c.is_sanctioned(&addr2));
 
         // Multiple reads should keep TTL extended
         assert!(c.is_sanctioned(&addr));
         assert!(c.is_sanctioned(&addr2));
+    }
+
+    #[test]
+    fn test_expired_sanction_is_cleared() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, _) = deploy(&env);
+        let bad_actor = Address::generate(&env);
+        let hash = hash_address(&env, &bad_actor);
+
+        c.add_to_list(&hash, &Some(1000));
+        env.ledger().set_timestamp(1000);
+        assert!(c.is_sanctioned(&bad_actor));
+
+        env.ledger().set_timestamp(1001);
+        assert!(!c.is_sanctioned(&bad_actor));
+        assert!(env.as_contract(&c.address, || {
+            !env.storage()
+                .persistent()
+                .has(&DataKey::Sanctioned(hash.clone()))
+        }));
+    }
+
+    #[test]
+    fn test_renew_sanction_before_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, _) = deploy(&env);
+        let bad_actor = Address::generate(&env);
+        let hash = hash_address(&env, &bad_actor);
+
+        c.add_to_list(&hash, &Some(1000));
+        env.ledger().set_timestamp(900);
+        c.renew_sanction(&hash, &Some(5000));
+
+        env.ledger().set_timestamp(2000);
+        assert!(c.is_sanctioned(&bad_actor));
     }
 }
