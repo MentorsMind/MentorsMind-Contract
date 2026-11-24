@@ -96,6 +96,8 @@ pub enum DataKey {
     CrossPlatformIdentity(Address, Symbol),
     /// Fraud alerts logged for a user.
     FraudAlertLog(Address),
+    /// Whether a KycExpired event has been emitted for the current record.
+    KycExpiredEmitted(Address),
 }
 
 /// Maximum length of the rolling per-(accessor,subject) access log kept for
@@ -133,28 +135,23 @@ impl KycRegistry {
     }
 
     /// Set the KYC level for a user. Admin only.
-    pub fn set_kyc_level(
-        env: Env,
-        operator: Address,
-        user: Address,
+    fn upsert_kyc(
+        env: &Env,
+        user: &Address,
         level: KycLevel,
         expiry: u64,
         provider_hash: BytesN<32>,
     ) {
-        Self::require_operator(&env, &operator);
-
         let now = env.ledger().timestamp();
         if expiry <= now {
             panic!("KYC expiry must be in the future");
         }
 
-        // Remove old expiry index entry if it exists
         if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user.clone())) {
             env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, user.clone()));
-        } else {
-            // Add user to registry if this is their first KYC record
-            Self::add_user_to_registry(&env, &user);
         }
+
+        Self::add_user_to_registry(env, user);
 
         let record = KycRecord {
             level,
@@ -173,32 +170,45 @@ impl KycRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::ExpiryIndex(expiry, user.clone()), &true);
-
-        env.events()
-            .publish((symbol_short!("kyc_set"), user), record.level);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::KycExpiryAlert(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::KycExpiredEmitted(user.clone()));
     }
 
-    /// Batch set KYC levels for multiple institutional users (Issue #754).
-    /// Operator only. Validates all expiries in the batch before mutating state.
-    pub fn batch_set_kyc_level(env: Env, operator: Address, entries: Vec<KycBatchEntry>) {
+    /// Set the KYC level for a user. Admin only.
+    pub fn set_kyc_level(
+        env: Env,
+        operator: Address,
+        user: Address,
+        level: KycLevel,
+        expiry: u64,
+        provider_hash: BytesN<32>,
+    ) {
+        Self::require_operator(&env, &operator);
+        Self::upsert_kyc(&env, &user, level, expiry, provider_hash);
+        env.events()
+            .publish((symbol_short!("kyc_set"), user), level);
+    }
+
+    /// Batch set KYC levels for multiple institutional users.
+    /// Operator only. Processes valid entries and returns per-entry success flags.
+    pub fn batch_set_kyc_level(env: Env, operator: Address, entries: Vec<KycBatchEntry>) -> Vec<bool> {
         Self::require_operator(&env, &operator);
         let now = env.ledger().timestamp();
+        let mut results = Vec::new(&env);
+        let mut success_count: u32 = 0;
 
-        // Validate all entries first (fail-fast batch rule)
         for entry in entries.iter() {
             if entry.expiry <= now {
-                panic!("KYC expiry must be in the future");
-            }
-        }
-
-        let count = entries.len();
-        for entry in entries.iter() {
-            // Remove old expiry index entry if it exists
-            if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(entry.user.clone())) {
-                env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, entry.user.clone()));
-            } else {
-                // Add user to registry if this is their first KYC record
-                Self::add_user_to_registry(&env, &entry.user);
+                results.push_back(false);
+                env.events().publish(
+                    (symbol_short!("kyc_err"), entry.user.clone()),
+                    (symbol_short!("bad_exp"),),
+                );
+                continue;
             }
 
             let record = KycRecord {
@@ -221,7 +231,8 @@ impl KycRegistry {
         }
 
         env.events()
-            .publish((symbol_short!("kyc_btch"), operator), count);
+            .publish((symbol_short!("kyc_btch"), operator), success_count);
+        results
     }
 
     /// Update KYC records one entry at a time, returning a result per entry.
@@ -413,17 +424,6 @@ impl KycRegistry {
         new_expiry: u64,
     ) {
         Self::require_operator(&env, &operator);
-
-        let now = env.ledger().timestamp();
-        if new_expiry <= now {
-            panic!("KYC expiry must be in the future");
-        }
-
-        // Remove old expiry index entry if it exists
-        if let Some(old_record) = env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user.clone())) {
-            env.storage().persistent().remove(&DataKey::ExpiryIndex(old_record.expiry, user.clone()));
-        }
-
         let provider_hash = env
             .storage()
             .persistent()
@@ -453,7 +453,7 @@ impl KycRegistry {
             .set(&DataKey::ExpiryIndex(new_expiry, user.clone()), &true);
 
         env.events()
-            .publish((symbol_short!("kyc_renew"), user), (record.level, new_expiry));
+            .publish((symbol_short!("kyc_renew"), user), (new_level, new_expiry));
     }
 
     /// Check whether a user's KYC is within the 30-day pre-expiry alert window

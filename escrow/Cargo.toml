@@ -16,6 +16,7 @@ shared = { path = "../contracts/shared" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+sanctions = { path = "../contracts/sanctions" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

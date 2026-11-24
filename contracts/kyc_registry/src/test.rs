@@ -181,6 +181,7 @@ fn test_expired_kyc_returns_none_and_expiry_query() {
 
     env.ledger().set_timestamp(1001);
     assert_eq!(client.get_kyc_level(&user), KycLevel::None);
+    assert_eq!(client.get_kyc_level(&user), KycLevel::None);
 }
 
 #[test]
