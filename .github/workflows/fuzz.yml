@@ -1,0 +1,28 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-seed-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Verify fuzz_stateful_harness seed corpus
+        run: |
+          test -d fuzz/corpus/fuzz_stateful_harness
+          test "$(find fuzz/corpus/fuzz_stateful_harness -maxdepth 1 -type f | wc -l)" -ge 10
+
+      - name: Replay seed corpus and run fuzz_stateful_harness
+        run: cargo test --manifest-path fuzz/Cargo.toml --test fuzz_stateful_harness

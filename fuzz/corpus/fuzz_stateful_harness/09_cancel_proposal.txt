@@ -1,0 +1,4 @@
+# Proposer cancels a pending proposal before execution
+init_ms 3 2
+ms_propose 0 0 0
+ms_cancel 0 1

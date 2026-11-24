@@ -2,10 +2,11 @@
 
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
-    IntoVal, MuxedAddress,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Env, String, Symbol, IntoVal, MuxedAddress,
 };
 use soroban_token_sdk::metadata::TokenMetadata;
+use shared::safe_math::SafeMath;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -17,6 +18,8 @@ pub enum Error {
     InsufficientAllowance = 4,
     Unauthorized = 5,
     SupplyCapExceeded = 6,
+    AnnualCapExceeded = 7,
+    InvalidCapBps = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +54,15 @@ pub struct BurnEventData {
     pub amount: i128,
 }
 
+/// Supply change emitted by mint/burn so indexers can track total supply.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplyChangedEventData {
+    pub action: String,
+    pub amount: i128,
+    pub new_total_supply: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApproveEventData {
@@ -79,9 +91,29 @@ pub enum DataKey {
     PauseGuardian,
     /// `true` while the token is paused; absent/`false` means active.
     Paused,
+    /// Cumulative amount minted in the current rolling 365-day window.
+    MintedThisYear,
+    /// Unix timestamp at which the current mint window started.
+    MintWindowStart,
+    /// Governance-controlled annual mint cap, in basis points of supply.
+    AnnualMintCapBps,
+    /// Pending governance change to the annual mint cap.
+    AnnualCapProposal,
 }
 
 const SUPPLY_CAP: i128 = 100_000_000 * 10_000_000; // 100M with 7 decimals
+const BPS_DENOMINATOR: i128 = 10_000;
+const ANNUAL_MINT_CAP_BPS: i128 = 1_000; // 10% of supply per rolling year by default
+const MIN_ANNUAL_MINT_CAP: i128 = 1_000_000 * 10_000_000; // floor allows initial bootstrap
+const YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
+const CAP_PROPOSAL_DELAY_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnnualCapProposal {
+    pub cap_bps: i128,
+    pub proposed_at: u64,
+}
 
 #[contract]
 pub struct MNTToken;
@@ -112,6 +144,73 @@ impl MNTToken {
         env.storage()
             .persistent()
             .set(&DataKey::TotalSupply, &0i128);
+    }
+
+    /// Governance: propose a new annual mint cap (basis points of supply).
+    /// The change can only be applied after a 30-day delay.
+    pub fn propose_annual_mint_cap(env: Env, admin: Address, cap_bps: i128) {
+        Self::require_admin(&env, &admin);
+        if cap_bps <= 0 || cap_bps > BPS_DENOMINATOR {
+            panic_with_error!(&env, Error::InvalidCapBps);
+        }
+        env.storage().persistent().set(
+            &DataKey::AnnualCapProposal,
+            &AnnualCapProposal {
+                cap_bps,
+                proposed_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Governance: apply a previously proposed cap after the 30-day delay.
+    pub fn apply_annual_mint_cap(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        let proposal: AnnualCapProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AnnualCapProposal)
+            .expect("No annual cap proposal");
+        let now = env.ledger().timestamp();
+        if now < proposal.proposed_at.saturating_add(CAP_PROPOSAL_DELAY_SECONDS) {
+            panic!("30-day proposal delay not elapsed");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AnnualMintCapBps, &proposal.cap_bps);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AnnualCapProposal);
+    }
+
+    pub fn get_annual_mint_cap_bps(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnnualMintCapBps)
+            .unwrap_or(ANNUAL_MINT_CAP_BPS)
+    }
+
+    /// Amount minted so far in the current rolling 365-day window.
+    pub fn minted_this_year(env: Env) -> i128 {
+        let now = env.ledger().timestamp();
+        let start: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MintWindowStart)
+            .unwrap_or(now);
+        if now.saturating_sub(start) >= YEAR_SECONDS {
+            0
+        } else {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MintedThisYear)
+                .unwrap_or(0)
+        }
+    }
+
+    fn annual_cap_amount(env: &Env, total_supply: i128) -> i128 {
+        let cap_bps = Self::get_annual_mint_cap_bps(env.clone());
+        let relative_cap = total_supply.saturating_mul(cap_bps) / BPS_DENOMINATOR;
+        relative_cap.max(MIN_ANNUAL_MINT_CAP)
     }
 
     /// Mint new tokens (admin only).
@@ -150,6 +249,23 @@ impl MNTToken {
             panic!("Supply cap exceeded");
         }
 
+        // Rolling 365-day inflation cap, measured at the start of the window.
+        let now = env.ledger().timestamp();
+        let window_start: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MintWindowStart)
+            .unwrap_or(now);
+        let (window_start, minted) = if now.saturating_sub(window_start) >= YEAR_SECONDS {
+            (now, 0i128)
+        } else {
+            (window_start, Self::minted_this_year(env.clone()))
+        };
+        let annual_cap = Self::annual_cap_amount(&env, total_supply);
+        if minted.saturating_add(amount) > annual_cap {
+            panic_with_error!(&env, Error::AnnualCapExceeded);
+        }
+
         let balance = Self::balance(env.clone(), to.clone());
         env.storage()
             .persistent()
@@ -157,6 +273,24 @@ impl MNTToken {
         env.storage()
             .persistent()
             .set(&DataKey::TotalSupply, &new_total_supply);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MintedThisYear, &(minted + amount));
+        env.storage()
+            .persistent()
+            .set(&DataKey::MintWindowStart, &window_start);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                symbol_short!("SupplyChg"),
+            ),
+            SupplyChangedEventData {
+                action: String::from_str(&env, "mint"),
+                amount,
+                new_total_supply,
+            },
+        );
 
         env.events().publish(
             (
@@ -192,12 +326,25 @@ impl MNTToken {
         }
 
         let total_supply = Self::total_supply(env.clone());
+        let new_total_supply = total_supply - amount;
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(balance - amount));
         env.storage()
             .persistent()
-            .set(&DataKey::TotalSupply, &(total_supply - amount));
+            .set(&DataKey::TotalSupply, &new_total_supply);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                symbol_short!("SupplyChg"),
+            ),
+            SupplyChangedEventData {
+                action: String::from_str(&env, "burn"),
+                amount,
+                new_total_supply,
+            },
+        );
 
         env.events().publish(
             (
@@ -420,9 +567,14 @@ impl TokenInterface for MNTToken {
         }
 
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
-        if allowance < amount {
-            panic!("Insufficient allowance");
+        // Guard the decrement explicitly: SafeMath::safe_sub panics with a
+        // generic underflow error, while this entry point must report the
+        // token-specific InsufficientAllowance error.
+        match allowance.checked_sub(amount) {
+            Some(value) if value >= 0 => (),
+            _ => panic_with_error!(&env, Error::InsufficientAllowance),
         }
+        let remaining_allowance = SafeMath::safe_sub(allowance, &env, amount);
 
         let from_balance = Self::balance(env.clone(), from.clone());
         if from_balance < amount {
@@ -433,7 +585,7 @@ impl TokenInterface for MNTToken {
 
         env.storage().persistent().set(
             &DataKey::Allowance(from.clone(), spender.clone()),
-            &(allowance - amount),
+            &remaining_allowance,
         );
         env.storage()
             .persistent()
@@ -483,15 +635,8 @@ impl TokenInterface for MNTToken {
             .persistent()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
+        let new_total_supply = total_supply - amount;
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "MNTToken"),
-                Symbol::new(&env, "Burn"),
-                from.clone(),
-            ),
-            BurnEventData { amount },
-        );
         env.storage().persistent().set(
             &DataKey::Allowance(from.clone(), spender.clone()),
             &(allowance - amount),
@@ -501,7 +646,28 @@ impl TokenInterface for MNTToken {
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         env.storage()
             .persistent()
-            .set(&DataKey::TotalSupply, &(total_supply - amount));
+            .set(&DataKey::TotalSupply, &new_total_supply);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                symbol_short!("SupplyChg"),
+            ),
+            SupplyChangedEventData {
+                action: String::from_str(&env, "burn"),
+                amount,
+                new_total_supply,
+            },
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                Symbol::new(&env, "Burn"),
+                from.clone(),
+            ),
+            BurnEventData { amount },
+        );
 
         env.events().publish((symbol_short!("burn"), from), amount);
     }
@@ -537,7 +703,7 @@ impl TokenInterface for MNTToken {
 mod test {
     extern crate std;
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
     use soroban_sdk::xdr::{ContractEventBody, ScAddress};
     use soroban_sdk::{Env, IntoVal, Symbol, TryFromVal, Val, Vec};
 
@@ -571,6 +737,19 @@ mod test {
             .rev()
             .find(|(_, topics, _)| topics.get(0).map(|t| t.shallow_eq(&ns)).unwrap_or(false))
             .expect("no MNTToken event")
+    }
+
+    /// The `SupplyChanged` event from the most recent invocation.
+    fn last_supply_changed_event(env: &Env) -> SupplyChangedEventData {
+        let topic: Val = symbol_short!("SupplyChg").into_val(env);
+        all_events(env)
+            .into_iter()
+            .rev()
+            .find(|(_, topics, _)| {
+                topics.get(1).map(|t| t.shallow_eq(&topic)).unwrap_or(false)
+            })
+            .map(|(_, _, data)| SupplyChangedEventData::try_from_val(env, &data).unwrap())
+            .expect("no SupplyChanged event")
     }
 
     fn setup() -> (Env, Address, Address, MNTTokenClient<'static>) {
@@ -642,6 +821,32 @@ mod test {
         );
         let burn_data = BurnEventData::try_from_val(&env, &last_event.2).unwrap();
         assert_eq!(burn_data.amount, 400);
+    }
+
+    #[test]
+    fn test_supply_changed_events_track_mint_and_burn() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = MNTTokenClient::new(&env, &env.register(MNTToken, ()));
+
+        client.initialize(&admin);
+        client.mint(&user, &1_000);
+
+        let mint_event = last_supply_changed_event(&env);
+        assert_eq!(mint_event.action, String::from_str(&env, "mint"));
+        assert_eq!(mint_event.amount, 1_000);
+        assert_eq!(mint_event.new_total_supply, 1_000);
+        assert_eq!(client.total_supply(), 1_000);
+
+        client.burn(&user, &400);
+
+        let burn_event = last_supply_changed_event(&env);
+        assert_eq!(burn_event.action, String::from_str(&env, "burn"));
+        assert_eq!(burn_event.amount, 400);
+        assert_eq!(burn_event.new_total_supply, 600);
+        assert_eq!(client.total_supply(), 600);
     }
 
     #[test]
@@ -741,11 +946,63 @@ mod test {
 
         client.initialize(&admin);
 
-        // Mints nearly up to cap
-        client.mint(&user, &SUPPLY_CAP);
+        // Mint up to the cap across rolling yearly windows so the annual
+        // inflation cap does not interfere with this supply-cap check.
+        for _ in 0..100 {
+            env.ledger().with_mut(|li| li.timestamp += YEAR_SECONDS);
+            client.mint(&user, &MIN_ANNUAL_MINT_CAP);
+        }
+        assert_eq!(client.total_supply(), SUPPLY_CAP);
 
         // This should fail
         client.mint(&user, &1);
+    }
+
+    #[test]
+    fn test_annual_cap_enforced() {
+        let (env, _admin, _guardian, client) = setup();
+        let user = Address::generate(&env);
+
+        client.mint(&user, &MIN_ANNUAL_MINT_CAP);
+        assert_eq!(client.minted_this_year(), MIN_ANNUAL_MINT_CAP);
+        match client.try_mint(&user, &1).err().unwrap() {
+            Ok(e) => assert_eq!(e.get_code(), Error::AnnualCapExceeded as u32),
+            Err(e) => panic!("unexpected invoke error: {e:?}"),
+        }
+        assert_eq!(client.total_supply(), MIN_ANNUAL_MINT_CAP);
+    }
+
+    #[test]
+    fn test_annual_cap_rolling_window_resets_after_365_days() {
+        let (env, _admin, _guardian, client) = setup();
+        let user = Address::generate(&env);
+
+        client.mint(&user, &MIN_ANNUAL_MINT_CAP);
+        env.ledger().with_mut(|li| li.timestamp += YEAR_SECONDS);
+        assert_eq!(client.minted_this_year(), 0);
+
+        client.mint(&user, &1);
+        assert_eq!(client.minted_this_year(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "30-day proposal delay not elapsed")]
+    fn test_annual_cap_change_requires_30_day_delay() {
+        let (_env, admin, _guardian, client) = setup();
+        client.propose_annual_mint_cap(&admin, &5_000);
+        client.apply_annual_mint_cap(&admin);
+    }
+
+    #[test]
+    fn test_annual_cap_change_applies_after_delay() {
+        let (env, admin, _guardian, client) = setup();
+        assert_eq!(client.get_annual_mint_cap_bps(), ANNUAL_MINT_CAP_BPS);
+
+        client.propose_annual_mint_cap(&admin, &5_000);
+        env.ledger()
+            .with_mut(|li| li.timestamp += CAP_PROPOSAL_DELAY_SECONDS);
+        client.apply_annual_mint_cap(&admin);
+        assert_eq!(client.get_annual_mint_cap_bps(), 5_000);
     }
 
     // -----------------------------------------------------------------------
@@ -941,5 +1198,29 @@ mod test {
             *topics,
             (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Unpaused")).into_val(&env)
         );
+    }
+
+    #[test]
+    fn test_transfer_from_allowance_underflow_guard() {
+        let (env, _admin, _guardian, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.mint(&owner, &1_000);
+        client.approve(&owner, &spender, &500, &100);
+
+        match client
+            .try_transfer_from(&spender, &owner, &recipient, &501)
+            .err()
+            .unwrap()
+        {
+            Ok(e) => assert_eq!(e.get_code(), Error::InsufficientAllowance as u32),
+            Err(e) => panic!("unexpected invoke error: {e:?}"),
+        }
+
+        // Nothing moved: the guard aborts before any storage write.
+        assert_eq!(client.allowance(&owner, &spender), 500);
+        assert_eq!(client.balance(&owner), 1_000);
+        assert_eq!(client.balance(&recipient), 0);
     }
 }

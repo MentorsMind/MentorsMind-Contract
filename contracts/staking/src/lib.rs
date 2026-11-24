@@ -1260,6 +1260,15 @@ impl StakingContract {
             .ok_or(Error::NoStakeFound)
     }
 
+    /// Return the current staked amount for `staker`, or zero when unstaked.
+    pub fn get_staked_balance(env: Env, staker: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, StakeRecord>(&DataKey::Stake(staker))
+            .map(|record| record.amount)
+            .unwrap_or(0)
+    }
+
     /// Get the staking tier for a mentor without deserializing the full StakeRecord.
     ///
     /// Returns the tier level of a mentor's stake, or 0 if the mentor has no stake.

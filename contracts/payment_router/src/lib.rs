@@ -2,8 +2,8 @@
 
 use shared::mev_protection::{detect_atomic_arbitrage, enforce_protocol_isolation};
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, token, Address, BytesN, Env,
-    IntoVal, Symbol, Val, Vec,
+    contract, contractimpl, contracterror, contracttype, panic_with_error, symbol_short, token,
+    Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -16,6 +16,8 @@ use soroban_sdk::{
 pub enum Error {
     /// Cross-chain MEV / atomic arbitrage detected — route rejected.
     MevProtection = 1,
+    /// A large cross-chain payment requires an oracle for price validation.
+    OracleRequired = 2,
 }
 
 // Source chain constants
@@ -29,6 +31,9 @@ pub const CHAIN_BSC: u32 = 4;
 /// 500 bps = 5 %.  Bridged payments carry higher manipulation risk, so we
 /// use a tighter threshold than the oracle's own circuit breaker.
 pub const ORACLE_PRICE_DEVIATION_BPS: i128 = 500;
+
+/// Cross-chain payments above this amount require an oracle configuration.
+pub const ORACLE_REQUIRED_THRESHOLD: i128 = 10_000;
 
 #[derive(Clone)]
 #[contracttype]
@@ -265,9 +270,13 @@ impl PaymentRouter {
         // Get config
         let config = Self::get_config(env.clone());
 
-        // Oracle price-manipulation check for cross-chain payments.
-        if let Some(ref oracle) = config.oracle_contract {
-            Self::validate_oracle_price(&env, oracle, &token);
+        // Large cross-chain payments must have oracle-backed price validation.
+        match config.oracle_contract {
+            Some(ref oracle) => Self::validate_oracle_price(&env, oracle, &token),
+            None if source_chain != CHAIN_STELLAR && amount > ORACLE_REQUIRED_THRESHOLD => {
+                panic_with_error!(&env, Error::OracleRequired);
+            }
+            None => {}
         }
 
         // Calculate fee and net amount
@@ -1258,6 +1267,50 @@ mod test {
         assert_eq!(route.source_chain, CHAIN_ETHEREUM);
         assert_eq!(route.amount, amount);
         assert!(fixture.router_client.is_tx_processed(&tx_hash));
+    }
+
+    #[test]
+    fn test_cross_chain_payment_at_or_below_oracle_threshold_needs_no_oracle() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+        let tx_hash = BytesN::from_array(&fixture.env, &[0x21u8; 32]);
+        fixture.mark_bridge_vaa_processed(&tx_hash);
+
+        let escrow_id = fixture.router_client.route_payment(
+            &CHAIN_ETHEREUM,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &ORACLE_REQUIRED_THRESHOLD,
+            &fixture.token_client.address,
+        );
+
+        assert_eq!(escrow_id, 1);
+        assert_eq!(
+            fixture.router_client.get_route_details(&tx_hash).amount,
+            ORACLE_REQUIRED_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_large_cross_chain_payment_requires_oracle() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+        let tx_hash = BytesN::from_array(&fixture.env, &[0x22u8; 32]);
+        fixture.mark_bridge_vaa_processed(&tx_hash);
+
+        let result = fixture.router_client.try_route_payment(
+            &CHAIN_ETHEREUM,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &(ORACLE_REQUIRED_THRESHOLD + 1),
+            &fixture.token_client.address,
+        );
+
+        assert_eq!(result, Err(Ok(Error::OracleRequired)));
     }
 
     #[test]

@@ -1,0 +1,6 @@
+# Governance action: lower threshold from 3 to 2
+init_ms 5 3
+ms_propose 0 3 2
+ms_sign 1 1
+ms_sign 2 1
+ms_execute 1

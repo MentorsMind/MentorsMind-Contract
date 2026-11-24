@@ -13,17 +13,9 @@ on:
       - 'contracts/shared/**'
       - 'benchmarks/**'
       - '.github/workflows/benchmarks.yml'
+  # Every merge to main refreshes the committed baselines used by PR comparisons.
   push:
     branches: [main]
-    paths:
-      - 'escrow/**'
-      - 'contracts/staking/**'
-      - 'contracts/governance/**'
-      - 'contracts/timelock/**'
-      - 'contracts/upgrade_registry/**'
-      - 'contracts/dispute_evidence/**'
-      - 'contracts/shared/**'
-      - 'benchmarks/**'
   # Nightly scheduled run on main to catch drift over time.
   schedule:
     - cron: '0 3 * * *'
@@ -116,7 +108,7 @@ jobs:
           echo "GITHUB_SHA=${{ github.sha }}" >> "$GITHUB_ENV"
           echo "GITHUB_REF_NAME=${{ github.ref_name }}" >> "$GITHUB_ENV"
 
-      # Run the benchmark binary; exits 1 on >10% regression.
+      # Run the benchmark binary; exits 1 on >5% regression.
       - name: Run benchmarks
         id: bench
         run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
@@ -221,7 +213,7 @@ jobs:
 
               ${table}
 
-              > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+              > Baselines gated at **±5%**. WASM alert at **> 64 KB**.
               > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})${optimizationStatus}
 
               **📊 Coverage:** ${results.length} functions across ${[...new Set(results.map(r => r.contract))].length} contracts`;
@@ -255,3 +247,54 @@ jobs:
               console.error('Failed to create PR comment:', error.message);
               // Don't fail the workflow if comment creation fails
             }
+
+  # Regenerate baselines after each merge to main so future PR comparisons use
+  # the latest committed measurements instead of stale manual snapshots.
+  update-baselines:
+    name: Update benchmark baselines
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91'
+          targets: wasm32v1-none
+
+      - name: Build WASM binaries (release)
+        run: |
+          cargo build \
+            --target wasm32v1-none \
+            --release \
+            -p mentorminds-escrow \
+            -p mentorminds-staking \
+            -p mentorminds-governance \
+            -p mentorminds-timelock \
+            -p mentorminds-upgrade-registry \
+            -p mentorminds-dispute-evidence
+
+      - name: Generate fresh benchmark report
+        continue-on-error: true
+        run: cargo run -p mentorminds-benchmarks
+
+      - name: Stage regenerated baselines
+        run: |
+          test -f benchmarks/results/report.json
+          cp benchmarks/results/report.json benchmarks/baselines.json
+
+      - name: Commit regenerated baselines
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(bench): auto-update baselines from ${{ github.sha }}'
+          file_pattern: benchmarks/baselines.json
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'

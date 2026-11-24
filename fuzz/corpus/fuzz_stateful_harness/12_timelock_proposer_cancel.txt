@@ -1,0 +1,4 @@
+# Timelock permission test: proposer cancels own operation
+init_tl 0
+tl_schedule 1 172800 5
+tl_cancel 1 0

@@ -5,8 +5,19 @@ use shared::events::{
 };
 use shared::pause_guard::require_not_paused;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal,
+    Symbol,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AllowanceNotFound = 1,
+    InsufficientAllowance = 2,
+    AllowanceExpired = 3,
+    InvalidAmount = 4,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +30,7 @@ pub struct AllowanceRecord {
     pub period_seconds: u64,
     pub periods_used: u32,
     pub last_pull_timestamp: u64,
+    pub expires_at: Option<u64>,
 }
 
 #[contracttype]
@@ -76,6 +88,28 @@ impl RecurringAllowanceContract {
         max_periods: u32,
         period_seconds: u64,
     ) {
+        Self::authorize_with_expiry(
+            env,
+            owner,
+            spender,
+            token,
+            amount_per_period,
+            max_periods,
+            period_seconds,
+            None,
+        );
+    }
+
+    pub fn authorize_with_expiry(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        token: Address,
+        amount_per_period: i128,
+        max_periods: u32,
+        period_seconds: u64,
+        expires_at: Option<u64>,
+    ) {
         owner.require_auth();
 
         if amount_per_period <= 0 {
@@ -98,6 +132,7 @@ impl RecurringAllowanceContract {
             period_seconds,
             periods_used: 0,
             last_pull_timestamp: 0,
+            expires_at,
         };
 
         env.storage().persistent().set(&key, &record);
@@ -107,6 +142,44 @@ impl RecurringAllowanceContract {
             evt_allowance_authorized(&env),
             (spender, token, amount_per_period, max_periods, period_seconds),
         );
+    }
+
+    pub fn deduct_allowance(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let key = DataKey::Allowance(owner.clone(), spender.clone(), token.clone());
+        let mut record: AllowanceRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::AllowanceNotFound)?;
+
+        if let Some(expiry) = record.expires_at {
+            if env.ledger().timestamp() >= expiry {
+                return Err(Error::AllowanceExpired);
+            }
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let remaining = record
+            .amount_per_period
+            .checked_sub(amount)
+            .ok_or(Error::InsufficientAllowance)?;
+
+        if remaining < 0 {
+            return Err(Error::InsufficientAllowance);
+        }
+
+        record.amount_per_period = remaining;
+        env.storage().persistent().set(&key, &record);
+        Ok(())
     }
 
     pub fn pull_payment(env: Env, spender: Address, owner: Address, token: Address, amount: i128) {
@@ -130,6 +203,12 @@ impl RecurringAllowanceContract {
             .persistent()
             .get(&key)
             .expect("allowance not found");
+
+        if let Some(expiry) = record.expires_at {
+            if env.ledger().timestamp() >= expiry {
+                panic!("allowance expired");
+            }
+        }
 
         if record.periods_used >= record.max_periods {
             panic!("allowance exhausted");
@@ -384,5 +463,70 @@ mod tests {
         allowance.revoke(&owner, &spender, &token_id);
 
         allowance.get_allowance(&owner, &spender, &token_id);
+    }
+
+    #[test]
+    fn test_deduct_allowance_underflow_protection() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let allowance_id = env.register_contract(None, RecurringAllowanceContract);
+        let token_id = env.register_contract(None, MockToken);
+        let allowance = RecurringAllowanceContractClient::new(&env, &allowance_id);
+
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        allowance.authorize(&owner, &spender, &token_id, &100, &5, &60);
+
+        // Deduct partial amount successfully
+        let res = allowance.try_deduct_allowance(&owner, &spender, &token_id, &40);
+        assert!(res.is_ok());
+        let record = allowance.get_allowance(&owner, &spender, &token_id);
+        assert_eq!(record.amount_per_period, 60);
+
+        // Deduct more than remaining balance (60 - 70 < 0) -> Error::InsufficientAllowance (#2)
+        let err_res = allowance.try_deduct_allowance(&owner, &spender, &token_id, &70);
+        assert_eq!(err_res, Err(Ok(Error::InsufficientAllowance)));
+
+        // Verify balance was not decremented on failure
+        let record_after = allowance.get_allowance(&owner, &spender, &token_id);
+        assert_eq!(record_after.amount_per_period, 60);
+    }
+
+    #[test]
+    fn test_allowance_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let allowance_id = env.register_contract(None, RecurringAllowanceContract);
+        let token_id = env.register_contract(None, MockToken);
+        let allowance = RecurringAllowanceContractClient::new(&env, &allowance_id);
+
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+
+        // Authorize with expiry at timestamp 200
+        allowance.authorize_with_expiry(&owner, &spender, &token_id, &150, &3, &60, &Some(200));
+
+        let record = allowance.get_allowance(&owner, &spender, &token_id);
+        assert_eq!(record.expires_at, Some(200));
+
+        // Deduct at timestamp 150 (before expiry) -> succeeds
+        env.ledger().set_timestamp(150);
+        let res = allowance.try_deduct_allowance(&owner, &spender, &token_id, &50);
+        assert!(res.is_ok());
+
+        // At timestamp 200 (expired) -> Error::AllowanceExpired (#3)
+        env.ledger().set_timestamp(200);
+        let err_res = allowance.try_deduct_allowance(&owner, &spender, &token_id, &50);
+        assert_eq!(err_res, Err(Ok(Error::AllowanceExpired)));
+
+        // Past expiry at timestamp 250 -> rejected
+        env.ledger().set_timestamp(250);
+        let err_res2 = allowance.try_deduct_allowance(&owner, &spender, &token_id, &10);
+        assert_eq!(err_res2, Err(Ok(Error::AllowanceExpired)));
     }
 }
