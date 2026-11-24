@@ -30,10 +30,27 @@ use std::collections::HashMap;
 
 use crate::types::{
     DiffKind, EnumSchema, MigrationReport, SchemaDiff, SchemaSnapshot, Severity, StructSchema,
+    VariantDef,
 };
+
+/// Default similarity (0.0..=1.0) required to report a likely rename.
+pub const DEFAULT_RENAME_SIMILARITY_THRESHOLD: f64 = 0.70;
 
 /// Compare `baseline` (old) against `current` (new) and produce a report.
 pub fn diff(baseline: &SchemaSnapshot, current: &SchemaSnapshot) -> MigrationReport {
+    diff_with_threshold(baseline, current, DEFAULT_RENAME_SIMILARITY_THRESHOLD)
+}
+
+/// Compare snapshots with a caller-supplied rename similarity threshold.
+///
+/// `similarity_threshold` is in the range 0.0..=1.0; higher values require
+/// the old and new variant names to be closer before a `LIKELY_RENAME`
+/// warning is emitted.
+pub fn diff_with_threshold(
+    baseline: &SchemaSnapshot,
+    current: &SchemaSnapshot,
+    similarity_threshold: f64,
+) -> MigrationReport {
     let mut diffs: Vec<SchemaDiff> = Vec::new();
 
     // Index baseline contracts by name.
@@ -52,7 +69,13 @@ pub fn diff(baseline: &SchemaSnapshot, current: &SchemaSnapshot) -> MigrationRep
     for (name, base_contract) in &baseline_map {
         if let Some(curr_contract) = current_map.get(name) {
             // Diff enums.
-            diff_enums(name, &base_contract.enums, &curr_contract.enums, &mut diffs);
+            diff_enums(
+                name,
+                &base_contract.enums,
+                &curr_contract.enums,
+                similarity_threshold,
+                &mut diffs,
+            );
             // Diff structs.
             diff_structs(name, &base_contract.structs, &curr_contract.structs, &mut diffs);
         } else {
@@ -108,6 +131,7 @@ fn diff_enums(
     contract: &str,
     baseline: &[EnumSchema],
     current: &[EnumSchema],
+    similarity_threshold: f64,
     out: &mut Vec<SchemaDiff>,
 ) {
     let base_map: HashMap<&str, &EnumSchema> =
@@ -117,7 +141,7 @@ fn diff_enums(
 
     for (name, base_enum) in &base_map {
         if let Some(curr_enum) = curr_map.get(name) {
-            diff_enum_variants(contract, name, base_enum, curr_enum, out);
+            diff_enum_variants(contract, name, base_enum, curr_enum, similarity_threshold, out);
         } else {
             out.push(SchemaDiff {
                 contract: contract.to_string(),
@@ -151,6 +175,7 @@ fn diff_enum_variants(
     enum_name: &str,
     base: &EnumSchema,
     curr: &EnumSchema,
+    similarity_threshold: f64,
     out: &mut Vec<SchemaDiff>,
 ) {
     let base_map: HashMap<&str, _> = base.variants.iter().map(|v| (v.name.as_str(), v)).collect();
@@ -186,9 +211,25 @@ fn diff_enum_variants(
         });
     }
 
-    // Removed variants.
+    // Removed variants. A similar added variant is reported as a likely
+    // semantic rename in addition to the raw removal/addition diffs.
     for (name, _) in &base_map {
         if !curr_map.contains_key(name) {
+            if let Some((new_name, similarity)) = closest_added_variant(name, &base_map, &curr_map) {
+                if similarity >= similarity_threshold {
+                    out.push(SchemaDiff {
+                        contract: contract.to_string(),
+                        type_name: enum_name.to_string(),
+                        severity: Severity::Warning,
+                        kind: DiffKind::LikelyRename,
+                        description: format!(
+                            "LIKELY_RENAME: variant `{enum_name}::{name}` was removed and \
+                             `{enum_name}::{new_name}` was added (name similarity {similarity:.2}). \
+                             If this is a rename, plan a storage key migration."
+                        ),
+                    });
+                }
+            }
             out.push(SchemaDiff {
                 contract: contract.to_string(),
                 type_name: enum_name.to_string(),
@@ -369,5 +410,112 @@ fn diff_struct_fields(
                 new = common_curr.join(", "),
             ),
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rename heuristics
+// ---------------------------------------------------------------------------
+
+/// Find the most similar genuinely-new variant for a removed variant.
+fn closest_added_variant<'a>(
+    removed: &str,
+    base_map: &HashMap<&str, &VariantDef>,
+    curr_map: &'a HashMap<&str, &VariantDef>,
+) -> Option<(&'a str, f64)> {
+    curr_map
+        .keys()
+        .filter(|name| !base_map.contains_key(**name))
+        .map(|name| (*name, name_similarity(removed, name)))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// Normalised Levenshtein similarity: `1 - distance / max(len_a, len_b)`.
+fn name_similarity(a: &str, b: &str) -> f64 {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + usize::from(ca != cb));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    let distance = previous[b.len()] as f64;
+    1.0 - (distance / a.len().max(b.len()) as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ContractSchema, FieldDef, StorageTier, VariantDef};
+
+    fn snapshot(variant_names: &[&str]) -> SchemaSnapshot {
+        SchemaSnapshot {
+            version: "v1".into(),
+            captured_at: "now".into(),
+            ref_name: "main".into(),
+            sha: "sha".into(),
+            contracts: vec![ContractSchema {
+                contract: "test".into(),
+                source_path: "lib.rs".into(),
+                enums: vec![EnumSchema {
+                    name: "DataKey".into(),
+                    variants: variant_names
+                        .iter()
+                        .map(|name| VariantDef {
+                            name: (*name).into(),
+                            fields: vec![],
+                            comment: None,
+                        })
+                        .collect(),
+                    inferred_tier: StorageTier::Persistent,
+                }],
+                structs: vec![StructSchema {
+                    name: "Unrelated".into(),
+                    fields: vec![FieldDef { name: "x".into(), ty: "u64".into() }],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn detects_likely_variant_rename() {
+        let report = diff(
+            &snapshot(&["Admin", "MentorBalance"]),
+            &snapshot(&["Admin", "MentorBalances"]),
+        );
+        let renames: Vec<_> = report
+            .diffs
+            .iter()
+            .filter(|d| d.kind == DiffKind::LikelyRename)
+            .collect();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].severity, Severity::Warning);
+        assert!(renames[0].description.contains("LIKELY_RENAME"));
+        assert!(renames[0].description.contains("MentorBalances"));
+    }
+
+    #[test]
+    fn threshold_is_configurable() {
+        let baseline = snapshot(&["Admin", "Stake"]);
+        let current = snapshot(&["Admin", "Staking"]);
+        let strict = diff_with_threshold(&baseline, &current, 0.95);
+        let lenient = diff_with_threshold(&baseline, &current, 0.5);
+        assert!(!strict.diffs.iter().any(|d| d.kind == DiffKind::LikelyRename));
+        assert!(lenient.diffs.iter().any(|d| d.kind == DiffKind::LikelyRename));
+    }
+
+    #[test]
+    fn unrelated_variants_are_not_renames() {
+        let report = diff(&snapshot(&["Admin", "Foo"]), &snapshot(&["Admin", "Bar"]));
+        assert!(!report.diffs.iter().any(|d| d.kind == DiffKind::LikelyRename));
     }
 }

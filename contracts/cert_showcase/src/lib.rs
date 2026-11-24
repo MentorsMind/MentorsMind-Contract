@@ -5,6 +5,20 @@ use soroban_sdk::{contract, contractevent, contractclient, contractimpl, contrac
 #[contractclient(name = "CertificatesClient")]
 pub trait CertificatesTrait {
     fn verify_certificate(env: Env, cert_id: u64) -> (bool, CertificateRecord);
+    fn get_certificate_learner(env: Env, cert_id: u64) -> Address;
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    AlreadyShowcased = 2,
+    NotShowcased = 3,
+    NotInitialized = 4,
+    CertificateNotFound = 5,
+    TooManyFeaturedLearners = 6,
+    NotCertificateOwner = 7,
 }
 
 #[contracttype]
@@ -17,8 +31,17 @@ pub struct CertificateRecord {
     pub sessions_completed: u32,
     pub issued_at: u64,
     pub revoked: bool,
+    pub revocation_reason: Option<BytesN<32>>,
     pub session_id: soroban_sdk::Symbol,
     pub rating_at_time: u64,
+    pub assessment_id: Option<Symbol>,
+    pub assessment_verified: bool,
+    pub assessment_authenticity_score: u32,
+    pub peer_review_consensus: bool,
+    pub integrity_hash: BytesN<32>,
+    pub correction_history: Vec<Symbol>,
+    pub authenticity_verified: bool,
+    pub gaming_detection_score: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +118,17 @@ impl CertShowcase {
     pub fn showcase(env: Env, learner: Address, cert_id: u64) -> Result<(), Error> {
         learner.require_auth();
 
+        let cert_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CertificatesContract)
+            .ok_or(Error::NotInitialized)?;
+        let cert_learner = CertificatesClient::new(&env, &cert_contract)
+            .get_certificate_learner(&cert_id);
+        if cert_learner != learner {
+            return Err(Error::NotCertificateOwner);
+        }
+
         let mut showcase: Vec<u64> = env
             .storage()
             .persistent()
@@ -117,6 +151,11 @@ impl CertShowcase {
             cert_id,
         }.publish(env);
         Ok(())
+    }
+
+    /// Add a certificate to the caller's showcase after proving ownership.
+    pub fn add_to_showcase(env: Env, learner: Address, cert_id: u64) -> Result<(), Error> {
+        Self::showcase(env, learner, cert_id)
     }
 
     /// Remove a certificate from learner's showcase
@@ -289,6 +328,31 @@ impl CertShowcase {
 mod tests {
     use super::*;
 
+    #[contract]
+    struct MockCertificates;
+
+    #[contractimpl]
+    impl MockCertificates {
+        pub fn set_owner(env: Env, owner: Address) {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "owner"), &owner);
+        }
+
+        pub fn get_certificate_learner(env: Env, _cert_id: u64) -> Address {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "owner"))
+                .expect("owner not set")
+        }
+    }
+
+    fn setup_certs(env: &Env, learner: &Address) -> Address {
+        let cert_contract = env.register_contract(None, MockCertificates);
+        MockCertificatesClient::new(env, &cert_contract).set_owner(learner);
+        cert_contract
+    }
+
     #[test]
     fn test_showcase() {
         let env = Env::default();
@@ -297,7 +361,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let learner = Address::generate(&env);
-        let cert_contract = Address::generate(&env);
+        let cert_contract = setup_certs(&env, &learner);
 
         env.mock_all_auths();
         client.initialize(&admin, &cert_contract).unwrap();
@@ -316,7 +380,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let learner = Address::generate(&env);
-        let cert_contract = Address::generate(&env);
+        let cert_contract = setup_certs(&env, &learner);
 
         env.mock_all_auths();
         client.initialize(&admin, &cert_contract).unwrap();
@@ -337,7 +401,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let learner = Address::generate(&env);
-        let cert_contract = Address::generate(&env);
+        let cert_contract = setup_certs(&env, &learner);
 
         env.mock_all_auths();
         client.initialize(&admin, &cert_contract).unwrap();
@@ -379,7 +443,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let learner = Address::generate(&env);
-        let cert_contract = Address::generate(&env);
+        let cert_contract = setup_certs(&env, &learner);
 
         env.mock_all_auths();
         client.initialize(&admin, &cert_contract).unwrap();
@@ -435,7 +499,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let learner = Address::generate(&env);
-        let cert_contract = Address::generate(&env);
+        let cert_contract = setup_certs(&env, &learner);
 
         env.mock_all_auths();
         client.initialize(&admin, &cert_contract).unwrap();
@@ -460,5 +524,28 @@ mod tests {
         // Test limit clamped to MAX_PAGE_SIZE
         let large_page = client.get_learner_certs_page(&learner, &0, &1000);
         assert!(large_page.len() <= 50); // MAX_PAGE_SIZE
+    }
+
+    #[test]
+    fn test_add_to_showcase_requires_certificate_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CertShowcase);
+        let client = CertShowcaseClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let cert_contract = setup_certs(&env, &owner);
+        client.initialize(&admin, &cert_contract).unwrap();
+
+        assert_eq!(
+            client.try_add_to_showcase(&stranger, &1),
+            Err(Ok(Error::NotCertificateOwner))
+        );
+        assert_eq!(client.get_showcase(&stranger).len(), 0);
+
+        client.add_to_showcase(&owner, &1).unwrap();
+        assert_eq!(client.get_showcase(&owner).len(), 1);
     }
 }

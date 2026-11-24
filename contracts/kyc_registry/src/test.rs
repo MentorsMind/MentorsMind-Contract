@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, BytesN, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 #[test]
 fn test_kyc_lifecycle() {
@@ -624,9 +624,8 @@ fn test_get_expiring_kyc_returns_near_expiry_records() {
     assert_eq!(no_expiring.len(), 0);
 }
 
-
 #[test]
-fn test_set_kyc_level_deduplicates_user_registry() {
+fn test_expired_kyc_emits_expired_event_once() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -634,55 +633,98 @@ fn test_set_kyc_level_deduplicates_user_registry() {
     let user = Address::generate(&env);
     let contract_id = env.register_contract(None, KycRegistry);
     let client = KycRegistryClient::new(&env, &contract_id);
-
     client.initialize(&admin);
-    let provider_hash = BytesN::from_array(&env, &[0; 32]);
-    client.set_kyc_level(&admin, &user, &KycLevel::Basic, &1000, &provider_hash);
-    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &2000, &provider_hash);
 
-    env.as_contract(&contract_id, || {
-        let users: soroban_sdk::Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserRegistry)
-            .unwrap();
-        let count: u32 = env.storage().persistent().get(&DataKey::UserCount).unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(count, 1);
-    });
+    let provider_hash = BytesN::from_array(&env, &[0; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Institutional, &1000, &provider_hash);
+    env.ledger().set_timestamp(1001);
+
+    let before = env.events().all().len();
+    assert_eq!(client.get_kyc_level(&user), KycLevel::None);
+    let after_first = env.events().all().len();
+    assert_eq!(after_first, before + 1);
+
+    assert_eq!(client.get_kyc_level(&user), KycLevel::None);
+    assert_eq!(env.events().all().len(), after_first);
 }
 
 #[test]
-fn test_batch_set_kyc_level_returns_per_entry_results() {
+fn test_batch_update_kyc_returns_one_result_per_entry() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let user_ok = Address::generate(&env);
-    let user_bad = Address::generate(&env);
+    let first = Address::generate(&env);
+    let invalid = Address::generate(&env);
+    let last = Address::generate(&env);
     let contract_id = env.register_contract(None, KycRegistry);
     let client = KycRegistryClient::new(&env, &contract_id);
     client.initialize(&admin);
 
-    env.ledger().set_timestamp(100);
-    let provider_hash = BytesN::from_array(&env, &[1; 32]);
-    let mut entries = soroban_sdk::Vec::new(&env);
+    let provider_hash = BytesN::from_array(&env, &[2; 32]);
+    let mut entries = Vec::new(&env);
     entries.push_back(KycBatchEntry {
-        user: user_ok.clone(),
+        user: first.clone(),
         level: KycLevel::Basic,
-        expiry: 200,
+        expiry: 5000,
         provider_hash: provider_hash.clone(),
     });
     entries.push_back(KycBatchEntry {
-        user: user_bad.clone(),
-        level: KycLevel::Enhanced,
-        expiry: 100,
+        user: invalid.clone(),
+        level: KycLevel::Basic,
+        expiry: 0,
         provider_hash: provider_hash.clone(),
+    });
+    entries.push_back(KycBatchEntry {
+        user: last.clone(),
+        level: KycLevel::Enhanced,
+        expiry: 5000,
+        provider_hash,
     });
 
-    let results = client.batch_set_kyc_level(&admin, &entries);
-    assert_eq!(results.get(0), Some(true));
-    assert_eq!(results.get(1), Some(false));
-    assert_eq!(client.get_kyc_level(&user_ok), KycLevel::Basic);
-    assert_eq!(client.get_kyc_level(&user_bad), KycLevel::None);
+    let results = client.batch_update_kyc(&admin, &entries);
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0), Some(Ok(())));
+    assert_eq!(results.get(1), Some(Err(Error::InvalidExpiry)));
+    assert_eq!(results.get(2), Some(Ok(())));
+
+    assert_eq!(client.get_kyc_level(&first), KycLevel::Basic);
+    assert_eq!(client.get_kyc_level(&invalid), KycLevel::None);
+    assert_eq!(client.get_kyc_level(&last), KycLevel::Enhanced);
 }
+
+#[test]
+fn test_user_registry_does_not_duplicate_addresses() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let provider_hash = BytesN::from_array(&env, &[3; 32]);
+    client.set_kyc_level(&admin, &user, &KycLevel::Basic, &1000, &provider_hash);
+    client.set_kyc_level(&admin, &user, &KycLevel::Enhanced, &2000, &provider_hash);
+    client.revoke_kyc(&admin, &user);
+    client.set_kyc_level(&admin, &user, &KycLevel::Basic, &3000, &provider_hash);
+
+    let count = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::UserCount)
+            .unwrap_or(0)
+    });
+    assert_eq!(count, 1);
+
+    let users: Vec<Address> = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserRegistry)
+            .unwrap_or(Vec::new(&env))
+    });
+    assert_eq!(users.len(), 1);
+    assert!(users.contains(&user));
+}
+

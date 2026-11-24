@@ -43,6 +43,8 @@ pub const DEFAULT_PLATFORM_FEE_BPS: i128 = 250; // 2.5%
 #[repr(u32)]
 pub enum Error {
     FeeGamingDetected = 1,
+    /// `renew` already succeeded for this subscription in the current ledger (#1393).
+    AlreadyRenewedThisLedger = 2,
 }
 
 #[contracttype]
@@ -85,6 +87,9 @@ pub enum DataKey {
     SubCounter,
     Plan(u32),
     Sub(u32),
+    /// Number of subscriptions in `Active` status per plan (#1394). Plan
+    /// price changes are rejected while this is non-zero.
+    ActiveSubscriberCount(u32),
     /// Stores the pre-authorized maximum pull amount (i128) for auto-renewal.
     /// Key: subscription_id → i128 allowance remaining.
     RenewalAllowance(u32),
@@ -108,6 +113,10 @@ pub enum DataKey {
     /// Count and volume of successful early renewals, tracked per learner.
     GraceRenewalCount(Address),
     GraceRenewalVolume(Address),
+    /// Ledger sequence at which `renew` last succeeded for a subscription
+    /// (#1393). Absent until the first renewal; `renew` is rejected when it
+    /// equals the current ledger sequence. Key: subscription_id → u32.
+    LastRenewedLedger(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +412,59 @@ impl SubscriptionContract {
         plan_id
     }
 
+    /// Change a plan's monthly price (mentor only).
+    ///
+    /// Active subscriptions reference the plan by ID and renew at its current
+    /// price, so a change would bill learners more than they agreed to. The
+    /// change is rejected while any subscription to the plan is `Active`
+    /// (#1394); the mentor can create a new plan for the new price instead.
+    pub fn update_plan_price(env: Env, mentor: Address, plan_id: u32, new_price: i128) {
+        mentor.require_auth();
+        if new_price <= 0 {
+            panic!("price must be positive");
+        }
+        let mut plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id))
+            .expect("plan not found");
+        if plan.mentor != mentor {
+            panic!("not plan owner");
+        }
+        if Self::get_active_subscriber_count(env.clone(), plan_id) > 0 {
+            panic!("plan has active subscribers");
+        }
+        let old_price = plan.price_per_month;
+        plan.price_per_month = new_price;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+        env.events().publish(
+            (symbol_short!("price_upd"), plan_id),
+            (mentor, old_price, new_price),
+        );
+    }
+
+    /// Number of `Active` subscriptions currently referencing a plan.
+    pub fn get_active_subscriber_count(env: Env, plan_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveSubscriberCount(plan_id))
+            .unwrap_or(0)
+    }
+
+    fn bump_active(env: &Env, plan_id: u32) {
+        let key = DataKey::ActiveSubscriberCount(plan_id);
+        let n: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &n.saturating_add(1));
+    }
+
+    fn drop_active(env: &Env, plan_id: u32) {
+        let key = DataKey::ActiveSubscriberCount(plan_id);
+        let n: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &n.saturating_sub(1));
+    }
+
     // -----------------------------------------------------------------------
     // Subscriptions
     // -----------------------------------------------------------------------
@@ -442,6 +504,7 @@ impl SubscriptionContract {
         env.storage()
             .persistent()
             .set(&DataKey::SubCounter, &(sub_id + 1));
+        Self::bump_active(&env, plan_id);
 
         env.events().publish(
             (symbol_short!("subscrbd"), plan_id),
@@ -470,6 +533,20 @@ impl SubscriptionContract {
             panic!("subscription not active");
         }
 
+        // Same-ledger guard (#1393): refuse a second renewal of the same
+        // subscription in the ledger where it was last renewed, so a duplicate
+        // renewal can never over-extend the subscription or bill the learner
+        // twice. `Option` rather than a defaulted number: ledger sequence 0 is
+        // a real value (it is the default in tests) and must not look "renewed".
+        let current_ledger = env.ledger().sequence();
+        let last_renewed: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastRenewedLedger(subscription_id));
+        if last_renewed == Some(current_ledger) {
+            return Err(Error::AlreadyRenewedThisLedger);
+        }
+
         let now = env.ledger().timestamp();
 
         // Check whether the subscription has lapsed (past billing date + expiry grace).
@@ -481,6 +558,7 @@ impl SubscriptionContract {
             // Subscription has lapsed past the grace window — transition to Expired
             // and return gracefully.  The learner must create a new subscription.
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -527,6 +605,7 @@ impl SubscriptionContract {
 
         if allowance < required || available < required {
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -596,10 +675,18 @@ impl SubscriptionContract {
         env.storage()
             .persistent()
             .set(&DataKey::Sub(subscription_id), &record);
+        // Remember the ledger of this successful renewal (see guard above).
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastRenewedLedger(subscription_id), &current_ledger);
 
         env.events().publish(
             (symbol_short!("renewed"), subscription_id),
             (record.learner, record.plan_id),
+        );
+        env.events().publish(
+            (symbol_short!("renewpaid"), subscription_id),
+            (record.mentor, required, now),
         );
         Ok(())
     }
@@ -618,7 +705,11 @@ impl SubscriptionContract {
             panic!("already cancelled");
         }
 
+        let was_active = record.status == SubscriptionStatus::Active;
         record.status = SubscriptionStatus::Cancelled;
+        if was_active {
+            Self::drop_active(&env, record.plan_id);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Sub(subscription_id), &record);
@@ -644,6 +735,7 @@ impl SubscriptionContract {
         }
 
         record.status = SubscriptionStatus::Paused;
+        Self::drop_active(&env, record.plan_id);
         env.storage()
             .persistent()
             .set(&DataKey::Sub(subscription_id), &record);
@@ -681,6 +773,7 @@ impl SubscriptionContract {
             .expect("timestamp overflow");
         if now >= expiry_deadline {
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -729,6 +822,7 @@ impl SubscriptionContract {
 
         if now >= expiry_deadline {
             record.status = SubscriptionStatus::Expired;
+            Self::drop_active(&env, record.plan_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Sub(subscription_id), &record);
@@ -755,27 +849,71 @@ impl SubscriptionContract {
             .expect("plan not found")
     }
 
-    /// Get the total count of subscriptions.
+    /// Get the count of active subscriptions.
     pub fn get_subscription_count(env: Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SubCounter)
-            .unwrap_or(0)
-    }
-
-    /// Get a paginated page of subscriptions.
-    pub fn get_subscriptions_page(env: Env, offset: u32, limit: u32) -> Vec<SubscriptionRecord> {
-        let count = env.storage()
+        let count = env
+            .storage()
             .persistent()
             .get(&DataKey::SubCounter)
             .unwrap_or(0);
+        let mut active_count = 0;
 
-        let (start, end) = Pagination::bounds(count, offset, limit);
+        for id in 0..count {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubscriptionRecord>(&DataKey::Sub(id))
+            {
+                if record.status == SubscriptionStatus::Active {
+                    active_count += 1;
+                }
+            }
+        }
+
+        active_count
+    }
+
+    /// Get a paginated page of active subscriptions.
+    pub fn get_subscriptions_page(env: Env, offset: u32, limit: u32) -> Vec<SubscriptionRecord> {
+        let count = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubCounter)
+            .unwrap_or(0);
+        let mut active_count = 0;
+
+        for id in 0..count {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubscriptionRecord>(&DataKey::Sub(id))
+            {
+                if record.status == SubscriptionStatus::Active {
+                    active_count += 1;
+                }
+            }
+        }
+
+        let (start, end) = Pagination::bounds(active_count, offset, limit);
         let mut page = Vec::new(&env);
+        let mut active_index = 0;
 
-        for i in start..end {
-            if let Some(record) = env.storage().persistent().get(&DataKey::Sub(i)) {
-                page.push_back(record);
+        for id in 0..count {
+            if active_index >= end {
+                break;
+            }
+
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubscriptionRecord>(&DataKey::Sub(id))
+            {
+                if record.status == SubscriptionStatus::Active {
+                    if active_index >= start {
+                        page.push_back(record);
+                    }
+                    active_index += 1;
+                }
             }
         }
 
@@ -1288,6 +1426,8 @@ mod test {
             let record = client.get_subscription(&sub_id);
             env.ledger().with_mut(|ledger| {
                 ledger.timestamp = record.next_billing_date - RENEWAL_GRACE_SECS;
+                // Each renewal lands in its own ledger (#1393).
+                ledger.sequence_number += 1;
             });
             client.authorize_renewal(&sub_id, &100i128);
             client.renew(&sub_id);
@@ -1296,6 +1436,7 @@ mod test {
         let record = client.get_subscription(&sub_id);
         env.ledger().with_mut(|ledger| {
             ledger.timestamp = record.next_billing_date - RENEWAL_GRACE_SECS;
+            ledger.sequence_number += 1;
         });
         client.authorize_renewal(&sub_id, &100i128);
 
@@ -1535,9 +1676,10 @@ mod test {
         assert_eq!(status.allowance_remaining, 100);
         assert!(status.is_auto_renewable);
 
-        // --- Renewal 2 ---
+        // --- Renewal 2 --- (a later ledger than renewal 1, #1393)
         env.ledger().with_mut(|li| {
             li.timestamp += SECONDS_PER_MONTH;
+            li.sequence_number += 1;
         });
         client.renew(&sub_id);
         assert_eq!(token.balance(&learner), 0);
@@ -1553,6 +1695,7 @@ mod test {
         // --- Renewal 3: insufficient allowance → Expired, no panic ---
         env.ledger().with_mut(|li| {
             li.timestamp += SECONDS_PER_MONTH;
+            li.sequence_number += 1;
         });
         client.renew(&sub_id); // must NOT panic
         let record = client.get_subscription(&sub_id);
@@ -1870,6 +2013,60 @@ mod test {
         assert_eq!(page.get(0).unwrap().plan_id, plan_id);
     }
 
+    #[test]
+    fn test_subscription_queries_only_include_active_records() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let active_id = client.subscribe(&learner, &plan_id);
+        let cancelled_id = client.subscribe(&learner, &plan_id);
+        let paused_id = client.subscribe(&learner, &plan_id);
+        let expired_id = client.subscribe(&learner, &plan_id);
+
+        client.cancel(&cancelled_id);
+        client.pause(&paused_id);
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + SUBSCRIPTION_EXPIRY_GRACE_SECS
+        });
+        client.check_expiry(&expired_id);
+        let later_active_id = client.subscribe(&learner, &plan_id);
+        client.use_session(&later_active_id);
+
+        assert_eq!(client.get_subscription_count(), 2);
+        let page = client.get_subscriptions_page(&0u32, &1u32);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().status, SubscriptionStatus::Active);
+        assert_eq!(page.get(0).unwrap().sessions_used, 0);
+        let page = client.get_subscriptions_page(&1u32, &1u32);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().status, SubscriptionStatus::Active);
+        assert_eq!(page.get(0).unwrap().sessions_used, 1);
+        assert!(client.get_subscriptions_page(&2u32, &1u32).is_empty());
+        assert_eq!(
+            client.get_subscription(&active_id).status,
+            SubscriptionStatus::Active
+        );
+        assert_eq!(
+            client.get_subscription(&cancelled_id).status,
+            SubscriptionStatus::Cancelled
+        );
+        assert_eq!(
+            client.get_subscription(&paused_id).status,
+            SubscriptionStatus::Paused
+        );
+        assert_eq!(
+            client.get_subscription(&expired_id).status,
+            SubscriptionStatus::Expired
+        );
+        assert_eq!(
+            client.get_subscription(&later_active_id).status,
+            SubscriptionStatus::Active
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Auto-renewal tests for issue #3
     // -----------------------------------------------------------------------
@@ -1951,5 +2148,164 @@ mod test {
         // No payment should be pulled when subscription expires
         assert_eq!(token.balance(&learner), 900);
         assert_eq!(token.balance(&escrow), 98);
+    }
+
+    // -----------------------------------------------------------------------
+    // Same-ledger renewal guard (#1393)
+    // -----------------------------------------------------------------------
+
+    /// Subscribes `learner` to a fresh 100-unit plan with a 500-unit renewal
+    /// allowance and moves the clock to just past the first billing date.
+    fn subscribe_ready_to_renew(
+        env: &Env,
+        client: &SubscriptionContractClient,
+        admin: &Address,
+        mentor: &Address,
+        learner: &Address,
+    ) -> (u32, Address) {
+        let (token_address, _token, token_admin) = create_token(env, admin, client);
+        approve_token(env, client, admin, &token_address);
+        token_admin.mint(learner, &1_000);
+
+        let plan_id = client.create_plan(mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(learner, &plan_id);
+        client.authorize_renewal(&sub_id, &500i128);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + 1;
+        });
+        (sub_id, token_address)
+    }
+
+    fn last_renewed_ledger(env: &Env, client: &SubscriptionContractClient, sub_id: u32) -> Option<u32> {
+        env.as_contract(&client.address, || {
+            env.storage().persistent().get(&DataKey::LastRenewedLedger(sub_id))
+        })
+    }
+
+    #[test]
+    fn test_second_renewal_in_the_same_ledger_is_rejected() {
+        let (env, client, admin, escrow, mentor, learner) = setup();
+        let (sub_id, token_address) =
+            subscribe_ready_to_renew(&env, &client, &admin, &mentor, &learner);
+        let token = TokenClient::new(&env, &token_address);
+
+        client.renew(&sub_id);
+        let after_first = client.get_subscription(&sub_id);
+        let learner_balance = token.balance(&learner);
+        let escrow_balance = token.balance(&escrow);
+        let allowance = client.get_renewal_status(&sub_id).allowance_remaining;
+
+        // Same ledger sequence: the second renewal must be refused with the
+        // dedicated error, not a generic panic.
+        assert!(matches!(
+            client.try_renew(&sub_id),
+            Err(Ok(Error::AlreadyRenewedThisLedger))
+        ));
+
+        // Nothing changed: no extra billing period, no second payment, no allowance used.
+        let after_second = client.get_subscription(&sub_id);
+        assert_eq!(after_second.next_billing_date, after_first.next_billing_date);
+        assert_eq!(token.balance(&learner), learner_balance);
+        assert_eq!(token.balance(&escrow), escrow_balance);
+        assert_eq!(client.get_renewal_status(&sub_id).allowance_remaining, allowance);
+    }
+
+    #[test]
+    fn test_renewal_records_the_ledger_it_happened_in() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (sub_id, _token) = subscribe_ready_to_renew(&env, &client, &admin, &mentor, &learner);
+        env.ledger().with_mut(|li| li.sequence_number = 77);
+
+        assert_eq!(last_renewed_ledger(&env, &client, sub_id), None);
+        client.renew(&sub_id);
+        assert_eq!(last_renewed_ledger(&env, &client, sub_id), Some(77));
+    }
+
+    #[test]
+    fn test_first_renewal_is_allowed_at_ledger_sequence_zero() {
+        // The test environment starts at sequence 0; that must not look like
+        // "already renewed" when nothing has been renewed yet.
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (sub_id, _token) = subscribe_ready_to_renew(&env, &client, &admin, &mentor, &learner);
+        assert_eq!(env.ledger().sequence(), 0);
+
+        client.renew(&sub_id);
+
+        assert_eq!(last_renewed_ledger(&env, &client, sub_id), Some(0));
+        assert!(matches!(
+            client.try_renew(&sub_id),
+            Err(Ok(Error::AlreadyRenewedThisLedger))
+        ));
+    }
+
+    #[test]
+    fn test_renewal_is_allowed_again_in_a_later_ledger() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (sub_id, _token) = subscribe_ready_to_renew(&env, &client, &admin, &mentor, &learner);
+
+        client.renew(&sub_id);
+        let first_billing_date = client.get_subscription(&sub_id).next_billing_date;
+
+        // A month later, in a later ledger, the next renewal goes through.
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH;
+            li.sequence_number += 1;
+        });
+        client.renew(&sub_id);
+
+        let record = client.get_subscription(&sub_id);
+        assert_eq!(record.next_billing_date, first_billing_date + SECONDS_PER_MONTH);
+        assert_eq!(last_renewed_ledger(&env, &client, sub_id), Some(1));
+    }
+
+    #[test]
+    fn test_same_ledger_guard_is_per_subscription() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+
+        let other_learner = Address::generate(&env);
+        token_admin.mint(&learner, &1_000);
+        token_admin.mint(&other_learner, &1_000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let first = client.subscribe(&learner, &plan_id);
+        let second = client.subscribe(&other_learner, &plan_id);
+        client.authorize_renewal(&first, &100i128);
+        client.authorize_renewal(&second, &100i128);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + 1;
+        });
+
+        // Two different subscriptions may renew in the very same ledger.
+        client.renew(&first);
+        client.renew(&second);
+
+        // Each one is individually guarded afterwards.
+        assert!(matches!(client.try_renew(&first), Err(Ok(Error::AlreadyRenewedThisLedger))));
+        assert!(matches!(client.try_renew(&second), Err(Ok(Error::AlreadyRenewedThisLedger))));
+    }
+
+    #[test]
+    fn test_failed_renewal_does_not_arm_the_same_ledger_guard() {
+        // No allowance: the renewal fails (Expired), which is not a successful
+        // renewal, so no ledger is recorded.
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+        token_admin.mint(&learner, &1_000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + 1;
+        });
+
+        client.renew(&sub_id);
+
+        assert_eq!(client.get_subscription(&sub_id).status, SubscriptionStatus::Expired);
+        assert_eq!(last_renewed_ledger(&env, &client, sub_id), None);
     }
 }

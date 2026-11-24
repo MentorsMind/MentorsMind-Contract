@@ -25,6 +25,7 @@ use shared::{
     DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
     DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
 };
+use shared::pagination::{Pagination, MAX_PAGE_SIZE};
 
 // ---------------------------------------------------------------------------
 // Storage Keys
@@ -43,6 +44,7 @@ pub enum DataKey {
     LenderBalance(Address),
     Loan(Address),
     LoanCount,
+    LoanIndex(u32),
     /// Ledger sequence at which a lender last deposited.
     LenderDepositLedger(Address),
     /// Running borrow total for an address within the current ledger sequence.
@@ -274,8 +276,14 @@ impl LendingPool {
     }
 
     /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    #[deprecated(note = "use get_params_paginated for bounded responses")]
     pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
         get_all_params(&env)
+    }
+
+    /// Return paginated protocol parameters for monitoring.
+    pub fn get_params_paginated(env: Env, page: u32, page_size: u32) -> Vec<(Symbol, i128)> {
+        shared::params::get_params_paginated(&env, page, page_size)
     }
 
     // -----------------------------------------------------------------------
@@ -754,6 +762,18 @@ impl LendingPool {
             repaid: false,
         };
 
+        let loan_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoanCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LoanIndex(loan_count), &borrower);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LoanCount, &(loan_count + 1));
+
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
@@ -830,6 +850,32 @@ impl LendingPool {
             .persistent()
             .get(&DataKey::Loan(borrower))
             .ok_or(Error::LoanNotFound)
+    }
+
+    /// Total number of loans created.
+    pub fn get_loan_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::LoanCount).unwrap_or(0)
+    }
+
+    /// Paginated view of loans by creation index.
+    pub fn get_loans_page(env: Env, offset: u32, limit: u32) -> Vec<LoanRecord> {
+        let total = Self::get_loan_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            if let Some(borrower) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::LoanIndex(i))
+            {
+                if let Some(loan) = env.storage().persistent().get::<_, LoanRecord>(&DataKey::Loan(borrower)) {
+                    out.push_back(loan);
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     pub fn get_block_borrow_total(env: Env, borrower: Address) -> i128 {
@@ -1379,5 +1425,23 @@ mod test {
         assert_borrow_rejected(&f, 650);
         // 700 passes.
         assert_borrow_ok(&f, 700);
+    }
+
+    #[test]
+    fn test_loan_pagination_views() {
+        let f = setup();
+        let b1 = Address::generate(&f.env);
+        let b2 = Address::generate(&f.env);
+        f.score.set_score(&700);
+        f.pool.borrow(&b1, &1_000, &symbol_short!("s1"));
+        f.pool.borrow(&b2, &2_000, &symbol_short!("s2"));
+
+        assert_eq!(f.pool.get_loan_count(), 2);
+        let page = f.pool.get_loans_page(&0, &1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().borrower, b1);
+        let page2 = f.pool.get_loans_page(&1, &10);
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2.get(0).unwrap().borrower, b2);
     }
 }

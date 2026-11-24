@@ -388,6 +388,12 @@ pub trait InsuranceContractTrait {
     fn get_pool_balance(env: Env) -> i128;
 }
 
+/// Cross-contract client for the Sanctions contract used to screen escrow parties.
+#[soroban_sdk::contractclient(name = "SanctionsClient")]
+pub trait SanctionsContractTrait {
+    fn is_sanctioned(env: Env, address: Address) -> bool;
+}
+
 /// Local mirror of `multisig_admin::ProposalRecord` used for cross-contract
 /// validation of emergency release approvals. Field order MUST match the
 /// multisig definition for correct SCV serialization.
@@ -427,6 +433,8 @@ pub enum DataKey {
     StakingContract,
     ReputationContract,
     InsuranceContract,
+    /// Address of the Sanctions contract consulted when creating an escrow.
+    SanctionsContract,
     /// Interface registry consulted to authenticate cross-contract peers
     /// (staking/reputation/insurance) before they're wired in. Optional:
     /// absent config skips verification so tests/early deployments work
@@ -618,6 +626,11 @@ const DEFAULT_FEE_BPS: u32 = 500;
 const ESCROW_TTL_THRESHOLD: u32 = 500_000;
 const ESCROW_TTL_BUMP: u32 = 1_000_000;
 
+/// Maximum number of entries kept in an escrow's `DataKey::TransitionLog`
+/// (#1391). When the cap is reached the oldest entries are evicted first, so
+/// per-escrow storage stays bounded however many transitions are recorded.
+const MAX_TRANSITION_LOG_ENTRIES: u32 = 50;
+
 // ---------------------------------------------------------------------------
 // Gas-estimation heuristic constants (#761). Calibrated against
 // `env.budget().cpu_instruction_cost()` measured around a real
@@ -723,6 +736,17 @@ impl EscrowContract {
             .persistent()
             .extend_ttl(&DataKey::EscrowCount, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
+        // Start the admin cooling-off clock at initialization (#1392). Without
+        // this, `LastAdminChange` stays unset until the first admin change is
+        // accepted and the first proposal after `initialize` would bypass
+        // `ADMIN_COOLING_OFF_SECS` (an unset value read as 0).
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastAdminChange, &env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::LastAdminChange, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
         env.storage().persistent().set(&MILESTONE_ESCROW_COUNT, &0u64);
         env.storage()
             .persistent()
@@ -769,7 +793,7 @@ impl EscrowContract {
         let last_change: u64 = env.storage().persistent().get(&DataKey::LastAdminChange).unwrap_or(0);
         let current_time = env.ledger().timestamp();
 
-        if current_time < last_change + ADMIN_COOLING_OFF_SECS {
+        if current_time < last_change.saturating_add(ADMIN_COOLING_OFF_SECS) {
             panic!("Cooling-off period active");
         }
 
@@ -1425,6 +1449,33 @@ impl EscrowContract {
             .set(&DataKey::InsuranceContract, &insurance);
         env.storage().persistent().extend_ttl(
             &DataKey::InsuranceContract,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+    }
+
+    /// Set the sanctions contract address used to screen mentor and learner
+    /// when an escrow is created (admin only).
+    pub fn set_sanctions_contract(env: Env, admin: Address, sanctions: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+        Self::_require_authorized_peer(&env, &sanctions, Symbol::new(&env, "sanctions_v1"));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SanctionsContract, &sanctions);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SanctionsContract,
             ESCROW_TTL_THRESHOLD,
             ESCROW_TTL_BUMP,
         );
@@ -4525,6 +4576,18 @@ impl EscrowContract {
             panic!("Dest asset token not approved");
         }
 
+        // --- Sanctions screening ---
+        if let Some(sanctions) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::SanctionsContract)
+        {
+            let client = SanctionsClient::new(&env, &sanctions);
+            if client.is_sanctioned(&mentor) || client.is_sanctioned(&learner) {
+                panic_with_error!(&env, Error::SanctionedParty);
+            }
+        }
+
         // --- Auth ---
         learner.require_auth();
 
@@ -5724,6 +5787,12 @@ fn transition_status(
         .persistent()
         .get(&log_key)
         .unwrap_or_else(|| Vec::new(env));
+    // Keep the log bounded (#1391): drop the oldest entries until there is room
+    // for the new one. A `while` (not an `if`) also trims a log that was
+    // already over the cap, for example one written before the cap existed.
+    while logs.len() >= MAX_TRANSITION_LOG_ENTRIES {
+        logs.pop_front();
+    }
     logs.push_back(log_entry);
     
     env.storage().persistent().set(&log_key, &logs);
@@ -6066,6 +6135,73 @@ mod test {
         let id = f.create_escrow_at(1_000, 0);
         f.open_dispute(id);
         id
+    }
+
+    #[contract]
+    struct MockSanctionsContract;
+
+    #[contractimpl]
+    impl MockSanctionsContract {
+        pub fn set_sanctioned(env: Env, user: Address, sanctioned: bool) {
+            env.storage().persistent().set(&user, &sanctioned);
+        }
+
+        pub fn is_sanctioned(env: Env, user: Address) -> bool {
+            env.storage().persistent().get(&user).unwrap_or(false)
+        }
+    }
+
+    fn with_sanctions(f: &TestFixture) -> Address {
+        let sanctions = f.env.register_contract(None, MockSanctionsContract);
+        f.client().set_sanctions_contract(&f.admin, &sanctions);
+        sanctions
+    }
+
+    #[test]
+    fn test_create_escrow_rejects_sanctioned_mentor() {
+        let f = TestFixture::setup();
+        let sanctions = with_sanctions(&f);
+        MockSanctionsContractClient::new(&f.env, &sanctions).set_sanctioned(&f.mentor, &true);
+
+        let result = f.client().try_create_escrow(
+            &f.mentor,
+            &f.learner,
+            &500,
+            &symbol_short!("S1"),
+            &f.token_address,
+            &0u64,
+            &1u32,
+        );
+        assert_eq!(result, Err(Ok(Error::SanctionedParty)));
+    }
+
+    #[test]
+    fn test_create_escrow_rejects_sanctioned_learner() {
+        let f = TestFixture::setup();
+        let sanctions = with_sanctions(&f);
+        MockSanctionsContractClient::new(&f.env, &sanctions).set_sanctioned(&f.learner, &true);
+
+        let result = f.client().try_create_escrow(
+            &f.mentor,
+            &f.learner,
+            &500,
+            &symbol_short!("S1"),
+            &f.token_address,
+            &0u64,
+            &1u32,
+        );
+        assert_eq!(result, Err(Ok(Error::SanctionedParty)));
+    }
+
+    #[test]
+    fn test_create_escrow_allows_clean_parties_with_sanctions_configured() {
+        let f = TestFixture::setup();
+        let sanctions = with_sanctions(&f);
+        let client = MockSanctionsContractClient::new(&f.env, &sanctions);
+        client.set_sanctioned(&f.mentor, &false);
+        client.set_sanctioned(&f.learner, &false);
+
+        assert_eq!(f.create_escrow_at(500, 0), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -7194,4 +7330,248 @@ mod test {
 
         f.client().release_funds(&f.learner, &id);
     }
+    // -----------------------------------------------------------------------
+    // Transition log cap (#1391)
+    // -----------------------------------------------------------------------
+
+    /// Records `count` transitions for `escrow_id`, one per ledger second
+    /// starting at `first_timestamp`, so each log entry is identifiable by its
+    /// timestamp. `transition_status` is called directly: the escrow state
+    /// machine only allows a handful of real transitions per escrow, so the cap
+    /// could never be reached through the public entry points.
+    fn log_transitions(f: &TestFixture, escrow_id: u64, count: u32, first_timestamp: u64) {
+        f.env.as_contract(&f.contract_id, || {
+            for i in 0..count {
+                f.env.ledger().set_timestamp(first_timestamp + i as u64);
+                transition_status(
+                    &f.env,
+                    escrow_id,
+                    &EscrowStatus::Pending,
+                    &EscrowStatus::Active,
+                    &f.admin,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_transition_log_stays_at_the_cap_after_many_transitions() {
+        let f = TestFixture::setup();
+        log_transitions(&f, 7, MAX_TRANSITION_LOG_ENTRIES * 3, 1_000);
+
+        let log = f.client().get_transition_log(&7u64);
+        assert_eq!(log.len(), MAX_TRANSITION_LOG_ENTRIES);
+        assert_eq!(MAX_TRANSITION_LOG_ENTRIES, 50);
+    }
+
+    #[test]
+    fn test_transition_log_evicts_the_oldest_entries_and_keeps_the_newest() {
+        let f = TestFixture::setup();
+        // 150 entries with timestamps 1000..=1149; only the newest 50 survive.
+        log_transitions(&f, 7, 150, 1_000);
+
+        let log = f.client().get_transition_log(&7u64);
+        assert_eq!(log.get(0).unwrap().timestamp, 1_100);
+        assert_eq!(log.get(log.len() - 1).unwrap().timestamp, 1_149);
+        for i in 1..log.len() {
+            assert_eq!(
+                log.get(i).unwrap().timestamp,
+                log.get(i - 1).unwrap().timestamp + 1,
+                "entries must stay in chronological order"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transition_log_below_the_cap_keeps_every_entry() {
+        let f = TestFixture::setup();
+        log_transitions(&f, 7, MAX_TRANSITION_LOG_ENTRIES - 1, 1_000);
+
+        let log = f.client().get_transition_log(&7u64);
+        assert_eq!(log.len(), MAX_TRANSITION_LOG_ENTRIES - 1);
+        assert_eq!(log.get(0).unwrap().timestamp, 1_000);
+    }
+
+    #[test]
+    fn test_transition_log_at_the_cap_only_evicts_when_the_next_entry_arrives() {
+        let f = TestFixture::setup();
+        log_transitions(&f, 7, MAX_TRANSITION_LOG_ENTRIES, 1_000);
+
+        let full = f.client().get_transition_log(&7u64);
+        assert_eq!(full.len(), MAX_TRANSITION_LOG_ENTRIES);
+        assert_eq!(full.get(0).unwrap().timestamp, 1_000, "nothing is evicted at exactly the cap");
+
+        log_transitions(&f, 7, 1, 1_000 + MAX_TRANSITION_LOG_ENTRIES as u64);
+
+        let after = f.client().get_transition_log(&7u64);
+        assert_eq!(after.len(), MAX_TRANSITION_LOG_ENTRIES);
+        assert_eq!(after.get(0).unwrap().timestamp, 1_001, "exactly the oldest entry is evicted");
+        assert_eq!(
+            after.get(after.len() - 1).unwrap().timestamp,
+            1_000 + MAX_TRANSITION_LOG_ENTRIES as u64
+        );
+    }
+
+    #[test]
+    fn test_transition_log_cap_applies_per_escrow() {
+        let f = TestFixture::setup();
+        log_transitions(&f, 1, MAX_TRANSITION_LOG_ENTRIES + 30, 1_000);
+        log_transitions(&f, 2, 5, 5_000);
+
+        assert_eq!(f.client().get_transition_log(&1u64).len(), MAX_TRANSITION_LOG_ENTRIES);
+        let other = f.client().get_transition_log(&2u64);
+        assert_eq!(other.len(), 5);
+        assert_eq!(other.get(0).unwrap().timestamp, 5_000);
+    }
+
+    #[test]
+    fn test_transition_log_that_is_already_over_the_cap_is_trimmed_on_the_next_transition() {
+        let f = TestFixture::setup();
+        // A log written before the cap existed: 70 entries, timestamps 1..=70.
+        f.env.as_contract(&f.contract_id, || {
+            let mut legacy: Vec<EscrowTransitionLog> = Vec::new(&f.env);
+            for ts in 1..=70u64 {
+                legacy.push_back(EscrowTransitionLog {
+                    from: EscrowStatus::Pending,
+                    to: EscrowStatus::Active,
+                    actor: f.admin.clone(),
+                    timestamp: ts,
+                });
+            }
+            f.env.storage().persistent().set(&DataKey::TransitionLog(9), &legacy);
+        });
+        assert_eq!(f.client().get_transition_log(&9u64).len(), 70);
+
+        log_transitions(&f, 9, 1, 1_000);
+
+        let log = f.client().get_transition_log(&9u64);
+        assert_eq!(log.len(), MAX_TRANSITION_LOG_ENTRIES);
+        assert_eq!(log.get(0).unwrap().timestamp, 22, "the 21 oldest legacy entries are dropped");
+        assert_eq!(log.get(log.len() - 1).unwrap().timestamp, 1_000);
+    }
+
+    #[test]
+    fn test_transition_log_entry_records_from_to_and_actor() {
+        let f = TestFixture::setup();
+        log_transitions(&f, 3, 1, 4_242);
+
+        let log = f.client().get_transition_log(&3u64);
+        assert_eq!(log.len(), 1);
+        let entry = log.get(0).unwrap();
+        assert_eq!(entry.from, EscrowStatus::Pending);
+        assert_eq!(entry.to, EscrowStatus::Active);
+        assert_eq!(entry.actor, f.admin);
+        assert_eq!(entry.timestamp, 4_242);
+    }
+
+    #[test]
+    fn test_real_dispute_still_logs_its_transition_under_the_cap() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+        f.open_dispute(id);
+
+        let log = f.client().get_transition_log(&id);
+        assert_eq!(log.len(), 1);
+        let entry = log.get(0).unwrap();
+        assert_eq!(entry.from, EscrowStatus::Active);
+        assert_eq!(entry.to, EscrowStatus::Disputed);
+        assert_eq!(entry.actor, f.learner);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin cooling-off period (#1392)
+    // -----------------------------------------------------------------------
+
+    const COOLING_INIT_TIME: u64 = 1_000_000;
+
+    /// Initializes a fresh escrow contract with the ledger clock at `timestamp`.
+    fn init_at(env: &Env, timestamp: u64) -> (EscrowContractClient<'_>, Address, Address) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(timestamp);
+
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(env, &contract_id);
+        client.initialize(&admin, &treasury, &0u32, &Vec::<Address>::new(env), &0u64);
+        (client, contract_id, admin)
+    }
+
+    fn pending_admin_transfer_exists(env: &Env, contract_id: &Address) -> bool {
+        env.as_contract(contract_id, || {
+            env.storage().persistent().has(&DataKey::PendingAdminTransfer)
+        })
+    }
+
+    #[test]
+    fn test_initialize_stores_the_initialization_time_as_last_admin_change() {
+        let env = Env::default();
+        let (_client, contract_id, _admin) = init_at(&env, COOLING_INIT_TIME);
+
+        let stored: Option<u64> = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&DataKey::LastAdminChange)
+        });
+        assert_eq!(stored, Some(COOLING_INIT_TIME));
+    }
+
+    #[test]
+    fn test_first_admin_proposal_inside_the_cooling_off_window_is_rejected() {
+        let env = Env::default();
+        let (client, contract_id, _admin) = init_at(&env, COOLING_INIT_TIME);
+        let new_admin = Address::generate(&env);
+
+        advance_time(&env, 100);
+        assert!(client.try_propose_admin_change(&new_admin).is_err());
+        assert!(!pending_admin_transfer_exists(&env, &contract_id));
+    }
+
+    #[test]
+    fn test_first_admin_proposal_one_second_before_the_window_ends_is_rejected() {
+        let env = Env::default();
+        let (client, contract_id, _admin) = init_at(&env, COOLING_INIT_TIME);
+        let new_admin = Address::generate(&env);
+
+        advance_time(&env, ADMIN_COOLING_OFF_SECS - 1);
+        assert!(client.try_propose_admin_change(&new_admin).is_err());
+        assert!(!pending_admin_transfer_exists(&env, &contract_id));
+    }
+
+    #[test]
+    fn test_first_admin_proposal_is_accepted_when_the_window_has_elapsed() {
+        let env = Env::default();
+        let (client, contract_id, _admin) = init_at(&env, COOLING_INIT_TIME);
+        let new_admin = Address::generate(&env);
+
+        advance_time(&env, ADMIN_COOLING_OFF_SECS);
+        client.propose_admin_change(&new_admin);
+
+        let pending: AdminTransfer = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&DataKey::PendingAdminTransfer).unwrap()
+        });
+        assert_eq!(pending.new_admin, new_admin);
+        assert_eq!(
+            pending.effective_at,
+            COOLING_INIT_TIME + ADMIN_COOLING_OFF_SECS + MIN_ADMIN_TIMELOCK_SECS
+        );
+    }
+
+    #[test]
+    fn test_cooling_off_restarts_after_an_admin_change_is_accepted() {
+        let env = Env::default();
+        let (client, _contract_id, _admin) = init_at(&env, COOLING_INIT_TIME);
+        let second_admin = Address::generate(&env);
+        let third_admin = Address::generate(&env);
+
+        advance_time(&env, ADMIN_COOLING_OFF_SECS);
+        client.propose_admin_change(&second_admin);
+        advance_time(&env, MIN_ADMIN_TIMELOCK_SECS);
+        client.accept_admin_role(&second_admin);
+
+        // The change was just accepted, so another proposal must wait again.
+        assert!(client.try_propose_admin_change(&third_admin).is_err());
+
+        advance_time(&env, ADMIN_COOLING_OFF_SECS);
+        client.propose_admin_change(&third_admin);
+    }
+
 }

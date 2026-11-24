@@ -419,10 +419,10 @@ pub use outcome_authenticity::{
     OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
 };
 pub use params::{
-    get_all_params, get_param, governance_admin_role, init_protocol_params, key_cooldown_days,
-    key_interest_rate_bps, key_min_bond, key_min_credit_score, key_platform_fee_bps,
-    key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver, set_param, ParamKey,
-    DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
+    get_all_params, get_param, get_params_paginated, governance_admin_role, init_protocol_params,
+    key_cooldown_days, key_interest_rate_bps, key_min_bond, key_min_credit_score,
+    key_platform_fee_bps, key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver,
+    set_param, ParamKey, DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
     DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
     DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
 };

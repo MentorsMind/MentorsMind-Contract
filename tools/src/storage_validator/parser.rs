@@ -41,6 +41,13 @@ pub fn parse_file(contract_name: &str, path: &Path) -> std::io::Result<ContractS
 // Internal extraction logic
 // ---------------------------------------------------------------------------
 
+/// Parse `#[contracttype]` definitions from source text (no file I/O).
+///
+/// Used by the scanner to resolve nested types declared in other modules.
+pub fn parse_source(source: &str) -> (Vec<EnumSchema>, Vec<StructSchema>) {
+    extract_types(source)
+}
+
 fn extract_types(source: &str) -> (Vec<EnumSchema>, Vec<StructSchema>) {
     let mut enums = Vec::new();
     let mut structs = Vec::new();

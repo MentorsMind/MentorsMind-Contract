@@ -15,6 +15,9 @@ pub const MIN_REST_HOURS: u32 = 1;
 pub const BURNOUT_RISK_THRESHOLD_BPS: u32 = 7000; // 70%
 /// Mandatory rest period after max hours (hours)
 pub const MANDATORY_REST_HOURS: u32 = 48;
+/// Default lifetime of a wellness flag (7 days). Callers can override this
+/// when setting a flag via `set_wellness_flag`.
+pub const DEFAULT_WELLNESS_FLAG_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Session difficulty weights
 pub const DIFFICULTY_WEIGHTS: [u32; 4] = [10000, 15000, 20000, 30000]; // Easy, Medium, Hard, Expert
 
@@ -73,6 +76,20 @@ pub struct FairDistributionResult {
     pub workload_balance_bps: u32,
     pub mentor_preference_met: bool,
     pub assigned_at: u64,
+}
+
+/// A wellness flag set on a mentor profile (e.g. burnout risk).
+///
+/// Flags automatically expire after their configured window so that resolved
+/// concerns do not penalise mentors indefinitely.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WellnessFlag {
+    pub mentor: Address,
+    pub flag_type: Symbol,
+    pub reason: Symbol,
+    pub set_at: u64,
+    pub expires_at: u64,
 }
 
 #[contracttype]
@@ -346,6 +363,69 @@ pub fn activate_emergency_protection(
     }
 }
 
+/// Set a wellness flag that expires after `ttl_secs` seconds.
+pub fn set_wellness_flag(
+    env: &Env,
+    mentor: &Address,
+    flag_type: Symbol,
+    reason: Symbol,
+    ttl_secs: u64,
+) -> WellnessFlag {
+    let now = env.ledger().timestamp();
+    WellnessFlag {
+        mentor: mentor.clone(),
+        flag_type,
+        reason,
+        set_at: now,
+        expires_at: now.saturating_add(ttl_secs),
+    }
+}
+
+/// Set a wellness flag using the default expiry window.
+pub fn set_default_wellness_flag(
+    env: &Env,
+    mentor: &Address,
+    flag_type: Symbol,
+    reason: Symbol,
+) -> WellnessFlag {
+    set_wellness_flag(env, mentor, flag_type, reason, DEFAULT_WELLNESS_FLAG_TTL_SECS)
+}
+
+/// A flag is active only until its `expires_at` timestamp.
+pub fn is_flag_active(env: &Env, flag: &WellnessFlag) -> bool {
+    flag.expires_at > env.ledger().timestamp()
+}
+
+/// A mentor can request reassessment once the flag has expired.
+pub fn can_request_reassessment(env: &Env, flag: &WellnessFlag) -> bool {
+    !is_flag_active(env, flag)
+}
+
+/// Drop all expired flags, keeping only those still within their window.
+pub fn clear_expired_flags(
+    env: &Env,
+    flags: &Vec<WellnessFlag>,
+) -> Vec<WellnessFlag> {
+    let mut active = Vec::new(env);
+    for flag in flags.iter() {
+        if is_flag_active(env, &flag) {
+            active.push_back(flag);
+        }
+    }
+    active
+}
+
+/// Query whether a mentor currently has an active flag of the given type.
+pub fn has_active_wellness_flag(
+    env: &Env,
+    flags: &Vec<WellnessFlag>,
+    flag_type: &Symbol,
+) -> bool {
+    flags.iter().any(|flag| {
+        flag.flag_type == *flag_type && is_flag_active(env, &flag)
+    })
+}
+
 /// Check if mentor can accept new session
 pub fn can_accept_session(
     env: &Env,
@@ -374,7 +454,7 @@ pub fn can_accept_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, Symbol};
+    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Env, Symbol};
 
     #[test]
     fn test_calculate_burnout_risk_low() {
@@ -540,5 +620,61 @@ mod tests {
         let (can, reason) = can_accept_session(&env, &workload, 2);
         assert!(!can);
         assert_eq!(reason, Symbol::new(&env, "max_sessions_reached"));
+    }
+
+    #[test]
+    fn test_wellness_flag_expires_and_can_be_cleared() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let mentor = Address::generate(&env);
+        let burnout = Symbol::new(&env, "burnout_risk");
+        let reason = Symbol::new(&env, "high_workload");
+
+        let flag = set_wellness_flag(&env, &mentor, burnout.clone(), reason, 3600);
+        assert_eq!(flag.expires_at, 4600);
+        assert!(is_flag_active(&env, &flag));
+        assert!(!can_request_reassessment(&env, &flag));
+
+        env.ledger().set_timestamp(4601);
+        assert!(!is_flag_active(&env, &flag));
+        assert!(can_request_reassessment(&env, &flag));
+
+        let mut flags = Vec::new(&env);
+        flags.push_back(flag);
+        assert!(!has_active_wellness_flag(&env, &flags, &burnout));
+        let remaining = clear_expired_flags(&env, &flags);
+        assert_eq!(remaining.len(), 0);
+    }
+
+    #[test]
+    fn test_only_expired_flags_are_cleared() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let mentor = Address::generate(&env);
+        let flag_type = Symbol::new(&env, "burnout_risk");
+        let expired = set_wellness_flag(
+            &env,
+            &mentor,
+            flag_type.clone(),
+            Symbol::new(&env, "old"),
+            100,
+        );
+        let active = set_wellness_flag(
+            &env,
+            &mentor,
+            flag_type.clone(),
+            Symbol::new(&env, "recent"),
+            5000,
+        );
+
+        env.ledger().set_timestamp(2000);
+        let mut flags = Vec::new(&env);
+        flags.push_back(expired);
+        flags.push_back(active);
+        assert!(has_active_wellness_flag(&env, &flags, &flag_type));
+
+        let remaining = clear_expired_flags(&env, &flags);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap().reason, Symbol::new(&env, "recent"));
     }
 }
