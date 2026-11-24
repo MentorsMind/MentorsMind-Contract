@@ -800,21 +800,67 @@ pub fn isolate_chain(
     );
 }
 
-/// Lift a chain isolation after the cooling-off period has elapsed.
+/// Storage key for the governance proposal approved to lift a chain isolation.
 ///
-/// Returns `true` if isolation was successfully lifted.
-pub fn lift_chain_isolation(env: &Env, chain_id: u32) -> bool {
+/// `ChainIsolationLiftProposalId` is keyed by chain and records the last
+/// proposal that was allowed to re-admit the chain. Isolation cannot be
+/// lifted without a proposal that governance has marked as passed.
+pub const CHAIN_ISOLATION_LIFT_PROPOSAL_ID: Symbol = symbol_short!("cilpropid");
+/// Storage key for governance proposals that have passed.
+pub const GOVERNANCE_PASSED_PROPOSAL: Symbol = symbol_short!("govpassed");
+
+/// Record a governance proposal as passed so it can be used to lift isolation.
+///
+/// Called by the governance contract after a vote succeeds. The shared
+/// module itself does not authenticate callers; the calling contract must
+/// gate this on a passed governance vote.
+pub fn record_governance_proposal_passed(env: &Env, proposal_id: u32) {
+    env.storage()
+        .persistent()
+        .set(&(GOVERNANCE_PASSED_PROPOSAL, proposal_id), &true);
+}
+
+/// Return the governance proposal recorded for the last isolation lift.
+pub fn get_chain_isolation_lift_proposal_id(env: &Env, chain_id: u32) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&(CHAIN_ISOLATION_LIFT_PROPOSAL_ID, chain_id))
+}
+
+/// Lift a chain isolation after the cooling-off period has elapsed and a
+/// governance proposal has passed.
+///
+/// `proposal_id` must be a proposal recorded as passed via
+/// [`record_governance_proposal_passed`]. Returns `true` only when a chain is
+/// isolated, the cooling-off period has elapsed, and the governance vote
+/// approves re-admission.
+pub fn lift_chain_isolation(env: &Env, chain_id: u32, proposal_id: u32) -> bool {
     let key = (symbol_short!("xcisol"), chain_id);
+    let proposal_key = (CHAIN_ISOLATION_LIFT_PROPOSAL_ID, chain_id);
     if let Some(record) = env
         .storage()
         .persistent()
         .get::<_, ChainIsolationRecord>(&key)
     {
-        if env.ledger().timestamp() >= record.lift_eligible_at {
+        if env.ledger().timestamp() >= record.lift_eligible_at
+            && env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&(GOVERNANCE_PASSED_PROPOSAL, proposal_id))
+                .unwrap_or(false)
+            && env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&proposal_key)
+                .map_or(true, |previous| previous != proposal_id)
+        {
             env.storage().persistent().remove(&key);
+            env.storage()
+                .persistent()
+                .set(&proposal_key, &proposal_id);
             env.events().publish(
                 (symbol_short!("xcsync"), symbol_short!("isol_lift")),
-                (chain_id, env.ledger().timestamp()),
+                (chain_id, proposal_id, env.ledger().timestamp()),
             );
             return true;
         }
@@ -1090,19 +1136,26 @@ mod tests {
     }
 
     #[test]
-    fn test_lift_isolation_after_cooldown() {
+    fn test_lift_isolation_after_cooldown_and_governance_approval() {
         let (env, contract_id) = env_at(1_000);
         env.as_contract(&contract_id, || {
             isolate_chain(&env, 3, Symbol::new(&env, "reorg"), 3, 3_600);
             assert!(is_chain_isolated(&env, 3));
 
-            // Still within cooldown
-            assert!(!lift_chain_isolation(&env, 3));
+            // Still within cooldown, and no governance approval.
+            assert!(!lift_chain_isolation(&env, 3, 1));
+            record_governance_proposal_passed(&env, 1);
+            assert!(!lift_chain_isolation(&env, 3, 1));
 
-            // Advance past cooling off period
+            // Advance past cooling off period; proposal must have passed.
             env.ledger().with_mut(|l| l.timestamp = 1_000 + 3_601);
-            assert!(lift_chain_isolation(&env, 3));
+            assert!(!lift_chain_isolation(&env, 3, 2));
+            assert!(lift_chain_isolation(&env, 3, 1));
             assert!(!is_chain_isolated(&env, 3));
+            assert_eq!(get_chain_isolation_lift_proposal_id(&env, 3), Some(1));
+            // The same proposal cannot be replayed to lift a future isolation.
+            isolate_chain(&env, 3, Symbol::new(&env, "reorg"), 3, 3_600);
+            assert!(!lift_chain_isolation(&env, 3, 1));
         });
     }
 

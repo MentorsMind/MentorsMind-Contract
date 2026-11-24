@@ -54,6 +54,15 @@ pub struct BurnEventData {
     pub amount: i128,
 }
 
+/// Supply change emitted by mint/burn so indexers can track total supply.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplyChangedEventData {
+    pub action: String,
+    pub amount: i128,
+    pub new_total_supply: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApproveEventData {
@@ -274,6 +283,18 @@ impl MNTToken {
         env.events().publish(
             (
                 Symbol::new(&env, "MNTToken"),
+                symbol_short!("SupplyChg"),
+            ),
+            SupplyChangedEventData {
+                action: String::from_str(&env, "mint"),
+                amount,
+                new_total_supply,
+            },
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
                 Symbol::new(&env, "Mint"),
                 to.clone(),
             ),
@@ -305,12 +326,25 @@ impl MNTToken {
         }
 
         let total_supply = Self::total_supply(env.clone());
+        let new_total_supply = total_supply - amount;
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(balance - amount));
         env.storage()
             .persistent()
-            .set(&DataKey::TotalSupply, &(total_supply - amount));
+            .set(&DataKey::TotalSupply, &new_total_supply);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                symbol_short!("SupplyChg"),
+            ),
+            SupplyChangedEventData {
+                action: String::from_str(&env, "burn"),
+                amount,
+                new_total_supply,
+            },
+        );
 
         env.events().publish(
             (
@@ -601,15 +635,8 @@ impl TokenInterface for MNTToken {
             .persistent()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
+        let new_total_supply = total_supply - amount;
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "MNTToken"),
-                Symbol::new(&env, "Burn"),
-                from.clone(),
-            ),
-            BurnEventData { amount },
-        );
         env.storage().persistent().set(
             &DataKey::Allowance(from.clone(), spender.clone()),
             &(allowance - amount),
@@ -619,7 +646,28 @@ impl TokenInterface for MNTToken {
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         env.storage()
             .persistent()
-            .set(&DataKey::TotalSupply, &(total_supply - amount));
+            .set(&DataKey::TotalSupply, &new_total_supply);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                symbol_short!("SupplyChg"),
+            ),
+            SupplyChangedEventData {
+                action: String::from_str(&env, "burn"),
+                amount,
+                new_total_supply,
+            },
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MNTToken"),
+                Symbol::new(&env, "Burn"),
+                from.clone(),
+            ),
+            BurnEventData { amount },
+        );
 
         env.events().publish((symbol_short!("burn"), from), amount);
     }
@@ -691,6 +739,19 @@ mod test {
             .expect("no MNTToken event")
     }
 
+    /// The `SupplyChanged` event from the most recent invocation.
+    fn last_supply_changed_event(env: &Env) -> SupplyChangedEventData {
+        let topic: Val = symbol_short!("SupplyChg").into_val(env);
+        all_events(env)
+            .into_iter()
+            .rev()
+            .find(|(_, topics, _)| {
+                topics.get(1).map(|t| t.shallow_eq(&topic)).unwrap_or(false)
+            })
+            .map(|(_, _, data)| SupplyChangedEventData::try_from_val(env, &data).unwrap())
+            .expect("no SupplyChanged event")
+    }
+
     fn setup() -> (Env, Address, Address, MNTTokenClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
@@ -760,6 +821,32 @@ mod test {
         );
         let burn_data = BurnEventData::try_from_val(&env, &last_event.2).unwrap();
         assert_eq!(burn_data.amount, 400);
+    }
+
+    #[test]
+    fn test_supply_changed_events_track_mint_and_burn() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let client = MNTTokenClient::new(&env, &env.register(MNTToken, ()));
+
+        client.initialize(&admin);
+        client.mint(&user, &1_000);
+
+        let mint_event = last_supply_changed_event(&env);
+        assert_eq!(mint_event.action, String::from_str(&env, "mint"));
+        assert_eq!(mint_event.amount, 1_000);
+        assert_eq!(mint_event.new_total_supply, 1_000);
+        assert_eq!(client.total_supply(), 1_000);
+
+        client.burn(&user, &400);
+
+        let burn_event = last_supply_changed_event(&env);
+        assert_eq!(burn_event.action, String::from_str(&env, "burn"));
+        assert_eq!(burn_event.amount, 400);
+        assert_eq!(burn_event.new_total_supply, 600);
+        assert_eq!(client.total_supply(), 600);
     }
 
     #[test]
