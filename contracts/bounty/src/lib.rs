@@ -844,6 +844,36 @@ impl BountyContract {
             .unwrap_or(0)
     }
 
+    /// Get a bounded page of bounty records in ascending ID order.
+    ///
+    /// `offset` is zero-based and `limit` is clamped to `MAX_PAGE_SIZE` by
+    /// `Pagination::bounds`, so a single call never iterates the full
+    /// (unbounded) bounty set. An out-of-range `offset` yields an empty page
+    /// rather than panicking.
+    pub fn get_bounties_page(env: Env, offset: u32, limit: u32) -> Vec<BountyRecord> {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BountyCount)
+            .unwrap_or(0);
+
+        // Bounty IDs are 1-based (the counter is pre-incremented in
+        // `post_bounty`), so the 0-based window index `i` maps to `Bounty(i + 1)`.
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            if let Some(bounty) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BountyRecord>(&DataKey::Bounty(i + 1))
+            {
+                result.push_back(bounty);
+            }
+        }
+
+        result
+    }
+
     /// Get claim evidence for a bounty and learner.
     pub fn get_claim_evidence(env: Env, bounty_id: u32, learner: Address) -> EvidenceBundle {
         env.storage()
@@ -861,6 +891,7 @@ impl BountyContract {
 mod test {
     extern crate std;
     use super::*;
+    use shared::MAX_PAGE_SIZE;
     use soroban_sdk::{
         testutils::{Address as _, Ledger, LedgerInfo},
         Address, Env,
@@ -1566,6 +1597,38 @@ mod test {
         let second_claimant = claimants.get(1).unwrap();
         let second_claim = f.client().get_claim(&id, &second_claimant);
         assert_eq!(second_claim.status, ClaimStatus::Pending);
+    }
+
+    #[test]
+    fn test_get_bounties_page() {
+        let f = TestFixture::setup();
+
+        // Fund the poster for a full page plus one extra bounty.
+        let total: u32 = MAX_PAGE_SIZE + 1;
+        f.token().mint(&f.poster, &(100_000 * total as i128));
+
+        for _ in 0..total {
+            f.post_default_bounty();
+        }
+        assert_eq!(f.client().get_bounty_count(), total);
+
+        // `limit` is clamped to MAX_PAGE_SIZE instead of trusting the caller.
+        let first = f.client().get_bounties_page(&0, &u32::MAX);
+        assert_eq!(first.len(), MAX_PAGE_SIZE);
+        assert_eq!(first.get(0).unwrap().id, 1);
+        assert_eq!(first.get(MAX_PAGE_SIZE - 1).unwrap().id, MAX_PAGE_SIZE);
+
+        // The next page holds the single remaining bounty.
+        let rest = f.client().get_bounties_page(&MAX_PAGE_SIZE, &MAX_PAGE_SIZE);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest.get(0).unwrap().id, total);
+
+        // Offsets at or past the end yield an empty page instead of panicking.
+        assert!(f.client().get_bounties_page(&total, &MAX_PAGE_SIZE).is_empty());
+        assert!(f
+            .client()
+            .get_bounties_page(&(total + 10), &MAX_PAGE_SIZE)
+            .is_empty());
     }
 }
 

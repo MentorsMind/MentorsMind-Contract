@@ -1,6 +1,7 @@
 #![no_std]
 
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::Pagination;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractclient, contractimpl, contracttype, Address, Env,
     Symbol, Vec,
@@ -176,7 +177,7 @@ impl EndorsementsContract {
             endorsee,
             skill,
             endorser,
-        }.publish(env);
+        }.publish(&env);
 
         // Report health metric for endorsement creation
         if let Some(dashboard) = env
@@ -301,6 +302,36 @@ impl EndorsementsContract {
             .persistent()
             .get(&DataKey::Endorsers(endorsee, skill))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Paginated view over the endorser list for a given endorsee/skill pair.
+    ///
+    /// The full `Endorsers` vector is read once and then sliced with
+    /// `Pagination::bounds`, which clamps `limit` to `MAX_PAGE_SIZE`, so a
+    /// single call never returns more than a bounded number of entries. An
+    /// out-of-range `offset` yields an empty page rather than panicking.
+    pub fn get_endorsers_page(
+        env: Env,
+        endorsee: Address,
+        skill: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        let endorsers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Endorsers(endorsee, skill))
+            .unwrap_or(Vec::new(&env));
+
+        let (start, end) = Pagination::bounds(endorsers.len(), offset, limit);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            if let Some(endorser) = endorsers.get(i) {
+                page.push_back(endorser);
+            }
+        }
+
+        page
     }
 
     pub fn get_endorsed_skills(env: Env, endorsee: Address) -> Vec<(Symbol, u32)> {
@@ -463,6 +494,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use shared::MAX_PAGE_SIZE;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{contract, contractimpl, symbol_short};
 

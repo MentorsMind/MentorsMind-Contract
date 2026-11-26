@@ -1,5 +1,7 @@
 #![no_std]
 
+use shared::Pagination;
+use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
@@ -140,6 +142,8 @@ pub enum DataKey {
     TotalReplies,
     ActivePosts,
     TotalStakedMnt,
+    /// Ordinal index into a category's posts: (category_id, ordinal) -> post_id.
+    CategoryIndex(u32, u32),
 }
 
 #[contract]
@@ -202,6 +206,9 @@ impl ForumContract {
         category_id: u32,
         stake_amount: i128,
     ) -> u32 {
+        // Prevent reentrancy via the staked token transfer below.
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("FORUM"));
+
         author.require_auth();
 
         let day = env.ledger().timestamp() / SECONDS_PER_DAY;
@@ -232,6 +239,7 @@ impl ForumContract {
         if !category.is_active {
             panic!("category not active");
         }
+        let category_index: u32 = category.post_count;
 
         // Check reputation threshold for certain post types
         let rep_threshold: i128 = env
@@ -296,6 +304,9 @@ impl ForumContract {
             .set(&DataKey::CategoryPost(category_id, count), &true);
         env.storage()
             .persistent()
+            .set(&DataKey::CategoryIndex(category_id, category_index), &count);
+        env.storage()
+            .persistent()
             .set(&DataKey::UserPost(author.clone(), count), &true);
         let total_posts = env.storage().persistent().get(&DataKey::TotalPosts).unwrap_or(0u32);
         env.storage().persistent().set(&DataKey::TotalPosts, &total_posts.checked_add(1).expect("total posts overflow"));
@@ -337,6 +348,9 @@ impl ForumContract {
         content_hash: BytesN<32>,
         stake_amount: i128,
     ) -> u32 {
+        // Prevent reentrancy via the staked token transfer below.
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("FORUM"));
+
         author.require_auth();
 
         let post = Self::get_post(env.clone(), post_id);
@@ -575,6 +589,9 @@ impl ForumContract {
         action: ModerationAction,
         _reason: Bytes,
     ) {
+        // Prevent reentrancy via the stake refund transfer on Delete below.
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("FORUM"));
+
         moderator.require_auth();
 
         let mod_threshold: u32 = env
@@ -787,20 +804,53 @@ impl ForumContract {
         }
     }
 
-    pub fn get_posts_by_category(env: Env, category_id: u32, limit: u32) -> Vec<u32> {
-        let mut posts = Vec::new(&env);
-        let max_results = limit;
-        let mut found = 0u32;
+    pub fn get_post_count(env: Env) -> u32 {
+        env.storage().persistent().get(&POST_COUNT).unwrap_or(0)
+    }
 
-        for current_id in 1..=1000 {
-            // Reasonable limit to prevent infinite loops
-            if found >= max_results {
-                break;
-            }
-            if let Some(post) = env
+    pub fn get_posts_page(env: Env, offset: u32, limit: u32) -> Vec<u32> {
+        let count: u32 = env.storage().persistent().get(&POST_COUNT).unwrap_or(0);
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut posts = Vec::new(&env);
+        // Post IDs are sequential and 1-based.
+        for i in start..end {
+            posts.push_back(i + 1);
+        }
+        posts
+    }
+
+    pub fn get_posts_by_category(
+        env: Env,
+        category_id: u32,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        let category = Self::get_category(env.clone(), category_id);
+        let (start, end) = Pagination::bounds(category.post_count, offset, limit);
+        let mut posts = Vec::new(&env);
+        for i in start..end {
+            if let Some(post_id) = env
                 .storage()
                 .persistent()
-                .get::<_, Post>(&DataKey::Post(current_id))
+                .get::<_, u32>(&DataKey::CategoryIndex(category_id, i))
+            {
+                posts.push_back(post_id);
+            }
+        }
+        posts
+    }
+
+    pub fn get_replies_page(env: Env, post_id: u32, offset: u32, limit: u32) -> Vec<u32> {
+        let post = Self::get_post(env.clone(), post_id);
+        let (start, end) = Pagination::bounds(post.reply_count, offset, limit);
+        let mut replies = Vec::new(&env);
+        // Reply IDs are sequential and 1-based within a post.
+        for i in start..end {
+            let reply_id = i + 1;
+            if let Some(reply) = env
+                .storage()
+                .persistent()
+                .get::<_, Reply>(&DataKey::Reply(reply_id))
             {
                 if post.category_id == category_id && post.status == PostStatus::Active && !post.deleted {
                     posts.push_back(current_id);
@@ -808,8 +858,7 @@ impl ForumContract {
                 }
             }
         }
-
-        posts
+        replies
     }
 
     pub fn is_parent_deleted(env: Env, post_id: u32) -> bool {
@@ -943,6 +992,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use shared::MAX_PAGE_SIZE;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[contract]
@@ -1145,8 +1195,192 @@ mod tests {
         assert_eq!(responder_rep.reputation, 50); // Best answer bonus
     }
 
+    /// A token whose `transfer` re-enters the forum contract, simulating a
+    /// malicious token attempting to exploit the stake transfer flow.
+    #[contract]
+    pub struct ReentrantToken;
+
+    #[contractimpl]
+    impl ReentrantToken {
+        pub fn set_forum(env: Env, forum: Address) {
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("FORUM"), &forum);
+        }
+
+        pub fn set_reenter(env: Env, on: bool) {
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("REENTER"), &on);
+        }
+
+        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+            let reenter: bool = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("REENTER"))
+                .unwrap_or(false);
+            if reenter {
+                let forum_addr: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&symbol_short!("FORUM"))
+                    .unwrap();
+                let forum = ForumContractClient::new(&env, &forum_addr);
+                let title = Bytes::from_slice(&env, b"reentrant");
+                let content_hash = BytesN::from_array(&env, &[7u8; 32]);
+                forum.create_post(
+                    &env.current_contract_address(),
+                    &title,
+                    &content_hash,
+                    &PostType::Question,
+                    &1,
+                    &1_000_000i128,
+                );
+            }
+        }
+    }
+
     #[test]
-    fn test_post_rate_limit_and_daily_reset() {
+    fn test_reentrancy_guard_fires_on_create_post() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, ReentrantToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = ReentrantTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author = Address::generate(&env);
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
+        token.set_forum(&forum_id);
+        token.set_reenter(&true);
+
+        let title = Bytes::from_slice(&env, b"Attack");
+        let content_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        // The transfer re-enters create_post, which must be rejected by the guard.
+        let result = forum.try_create_post(
+            &author,
+            &title,
+            &content_hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reentrancy_guard_fires_on_create_reply() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, ReentrantToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = ReentrantTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author = Address::generate(&env);
+        let responder = Address::generate(&env);
+
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(3u32),
+        );
+        token.set_forum(&forum_id);
+
+        // Create the post with reentrancy disabled.
+        token.set_reenter(&false);
+        let title = Bytes::from_slice(&env, b"Question");
+        let content_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let post_id = forum.create_post(
+            &author,
+            &title,
+            &content_hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+
+        // Enable reentrancy and attempt the reply.
+        token.set_reenter(&true);
+        let reply_hash = BytesN::from_array(&env, &[2u8; 32]);
+        let result = forum.try_create_reply(&responder, &post_id, &reply_hash, &1_000_000i128);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reentrancy_guard_fires_on_moderate_delete() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let forum_id = env.register_contract(None, ForumContract);
+        let token_id = env.register_contract(None, ReentrantToken);
+        let forum = ForumContractClient::new(&env, &forum_id);
+        let token = ReentrantTokenClient::new(&env, &token_id);
+
+        let admin = Address::generate(&env);
+        let author = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        // Threshold 1 so a single upvote is enough to moderate.
+        forum.initialize(
+            &admin,
+            &token_id,
+            &Some(10i128),
+            &Some(1_000_000i128),
+            &Some(1u32),
+        );
+        token.set_forum(&forum_id);
+
+        // Create the post with reentrancy disabled.
+        token.set_reenter(&false);
+        let title = Bytes::from_slice(&env, b"Post");
+        let content_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let post_id = forum.create_post(
+            &author,
+            &title,
+            &content_hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+
+        // Give the author reputation so it can moderate.
+        forum.vote_post(&voter, &post_id, &true);
+        assert_eq!(forum.get_user_reputation(&author).reputation, 1);
+
+        // Enable reentrancy and moderate-delete, which triggers the stake refund.
+        token.set_reenter(&true);
+        let reason = Bytes::from_slice(&env, b"spam");
+        let result = forum.try_moderate_content(
+            &author,
+            &post_id,
+            &false,
+            &ModerationAction::Delete,
+            &reason,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_posts_page_and_category() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1157,6 +1391,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let author = Address::generate(&env);
+
         forum.initialize(
             &admin,
             &token_id,
@@ -1213,6 +1448,8 @@ mod tests {
 
         let admin = Address::generate(&env);
         let author = Address::generate(&env);
+        let responder = Address::generate(&env);
+
         forum.initialize(
             &admin,
             &token_id,
