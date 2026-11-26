@@ -74,6 +74,10 @@ pub enum DataKey {
     IsaPaymentSchedule(u32),
     /// Index: (status, count_at_status) -> isa_id for filtered enumeration
     IsaByStatus(IsaStatus, u32),
+    /// Index: (learner, idx) -> isa_id
+    LearnerIsas(Address, u32),
+    /// Count of ISAs for learner
+    LearnerIsaCount(Address),
 }
 
 #[contract]
@@ -127,13 +131,7 @@ impl ISAContract {
             None => return 0,
         };
 
-        if !isa.active || isa.completion_reason != CompletionReason::None {
-            return 0;
-        }
-
-        let cap_amount = isa.funded_amount
-            .checked_mul(isa.cap_multiple as i128)
-            .expect("cap overflow");
+        let cap_amount = Self::cap_amount(&isa);
         cap_amount.saturating_sub(isa.total_shared).max(0)
     }
 
@@ -197,6 +195,19 @@ impl ISAContract {
 
         // Add to Active status index
         Self::update_status_index(&env, next_id, IsaStatus::Active);
+
+        let learner_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerIsaCount(learner.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::LearnerIsas(learner.clone(), learner_count),
+            &next_id,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::LearnerIsaCount(learner.clone()), &(learner_count + 1));
 
         env.events().publish(
             (Symbol::new(&env, "isa_created"), next_id, learner),
@@ -482,16 +493,51 @@ impl ISAContract {
         false
     }
 
-    /// Remaining obligation: cap_multiple * funded_amount - total_paid. Zero once capped.
-    pub fn get_remaining_obligation(env: Env, isa_id: u32) -> i128 {
-        let isa: ISARecord = env
+    /// Total number of ISAs created.
+    pub fn get_isa_count(env: Env) -> u32 {
+        let next: u32 = env.storage().instance().get(&DataKey::NextIsaId).unwrap_or(1);
+        next.saturating_sub(1)
+    }
+
+    /// Paginated view of all ISAs by creation id.
+    pub fn get_isas_page(env: Env, offset: u32, limit: u32) -> Vec<ISARecord> {
+        let total = Self::get_isa_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            let isa_id = i + 1;
+            if let Some(isa) = env.storage().persistent().get::<_, ISARecord>(&DataKey::Isa(isa_id)) {
+                out.push_back(isa);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Paginated view of a learner's ISAs.
+    pub fn get_learner_isas(env: Env, learner: Address, offset: u32, limit: u32) -> Vec<ISARecord> {
+        let total: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::Isa(isa_id))
-            .expect("isa not found");
-
-        let cap_amount = Self::cap_amount(&isa);
-        cap_amount.saturating_sub(isa.total_shared).max(0)
+            .get(&DataKey::LearnerIsaCount(learner.clone()))
+            .unwrap_or(0);
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            if let Some(isa_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::LearnerIsas(learner.clone(), i))
+            {
+                if let Some(isa) = env.storage().persistent().get::<_, ISARecord>(&DataKey::Isa(isa_id)) {
+                    out.push_back(isa);
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     fn complete_isa(env: &Env, isa_id: u32, isa: &mut ISARecord, reason_tag: &str) {
@@ -774,6 +820,29 @@ mod tests {
         // Request with large limit should be clamped to MAX_PAGE_SIZE
         let result = f.client().get_isas_by_status(&IsaStatus::Active, &0, &1_000);
         assert!(result.len() <= MAX_PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn test_isa_pagination_views() {
+        let f = Fixture::setup();
+        let isa1 = f.create_default_isa();
+        let isa2 = f.create_default_isa();
+        let learner2 = Address::generate(&f.env);
+        let isa3 = f.client().create_isa(&learner2, &f.funder, &500, &500, &200, &6);
+
+        assert_eq!(f.client().get_isa_count(), 3);
+        let page = f.client().get_isas_page(&1, &1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().isa_id, isa2);
+
+        let learner_isas = f.client().get_learner_isas(&f.learner, &0, &10);
+        assert_eq!(learner_isas.len(), 2);
+        assert_eq!(learner_isas.get(0).unwrap().isa_id, isa1);
+        assert_eq!(learner_isas.get(1).unwrap().isa_id, isa2);
+
+        let learner2_isas = f.client().get_learner_isas(&learner2, &0, &10);
+        assert_eq!(learner2_isas.len(), 1);
+        assert_eq!(learner2_isas.get(0).unwrap().isa_id, isa3);
     }
 }
 

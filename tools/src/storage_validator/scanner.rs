@@ -4,10 +4,11 @@
 /// with `[lib]` or `[[bin]]` sections, then parses their primary source file.
 /// Contract name is derived from the `name` field in `[package]`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use crate::parser::parse_file;
+use crate::parser::{parse_file, parse_source};
 use crate::types::{ContractSchema, SchemaSnapshot};
 
 /// Directories to skip during workspace scanning.
@@ -102,13 +103,13 @@ fn try_parse_contract(dir: &Path, cargo_toml: &PathBuf) -> Option<ContractSchema
     };
 
     match parse_file(&contract_name, &source_path) {
-        Ok(schema) => {
+        Ok(mut schema) => {
             // Only include crates that actually have contracttype definitions.
             if schema.enums.is_empty() && schema.structs.is_empty() {
-                None
-            } else {
-                Some(schema)
+                return None;
             }
+            resolve_nested_types(dir, &mut schema);
+            Some(schema)
         }
         Err(e) => {
             eprintln!(
@@ -119,6 +120,97 @@ fn try_parse_contract(dir: &Path, cargo_toml: &PathBuf) -> Option<ContractSchema
             None
         }
     }
+}
+
+/// Recursively resolve `#[contracttype]` types referenced by struct fields
+/// and enum payloads, including types declared in other source files and
+/// types nested more than one level deep.
+fn resolve_nested_types(dir: &Path, schema: &mut ContractSchema) {
+    let sources = rust_sources(&dir.join("src"));
+
+    // Each pass discovers at least one new type; iterate until no new type is
+    // found (bounded to guard against pathological cyclic references).
+    for _ in 0..16 {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for s in &schema.structs {
+            for field in &s.fields {
+                collect_referenced_types(&field.ty, &mut referenced);
+            }
+        }
+        for e in &schema.enums {
+            for variant in &e.variants {
+                for field in &variant.fields {
+                    collect_referenced_types(field, &mut referenced);
+                }
+            }
+        }
+
+        let known_structs: HashSet<String> =
+            schema.structs.iter().map(|s| s.name.clone()).collect();
+        let known_enums: HashSet<String> = schema.enums.iter().map(|e| e.name.clone()).collect();
+        let mut added = false;
+
+        for path in &sources {
+            let Ok(source) = fs::read_to_string(path) else { continue };
+            let (enums, structs) = parse_source(&source);
+            for e in enums {
+                if referenced.contains(&e.name) && !known_enums.contains(&e.name) && !known_structs.contains(&e.name) {
+                    schema.enums.push(e);
+                    added = true;
+                }
+            }
+            for s in structs {
+                if referenced.contains(&s.name) && !known_structs.contains(&s.name) && !known_enums.contains(&s.name) {
+                    schema.structs.push(s);
+                    added = true;
+                }
+            }
+        }
+
+        if !added {
+            break;
+        }
+    }
+
+    schema.enums.sort_by(|a, b| a.name.cmp(&b.name));
+    schema.structs.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+/// Collect uppercase type identifiers from a field type such as
+/// `Vec<NestedRecord>` or `Option<Inner>`.
+fn collect_referenced_types(ty: &str, out: &mut HashSet<String>) {
+    let mut start: Option<usize> = None;
+    for (idx, ch) in ty.char_indices().chain(std::iter::once((ty.len(), ' '))) {
+        if ch.is_alphabetic() || ch == '_' {
+            if start.is_none() {
+                start = Some(idx);
+            }
+        } else if let Some(begin) = start.take() {
+            let word = &ty[begin..idx];
+            if word.chars().next().is_some_and(|c| c.is_uppercase()) {
+                out.insert(word.to_string());
+            }
+        }
+    }
+}
+
+/// All `.rs` files under a crate's `src` directory.
+fn rust_sources(src: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![src.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    files
 }
 
 /// Extract the `name` field from `[package]` in a `Cargo.toml`.
@@ -175,4 +267,74 @@ pub fn list_snapshots() -> Vec<String> {
         .unwrap_or_default();
     versions.sort();
     versions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::differ::diff;
+    use crate::types::{DiffKind, SchemaSnapshot};
+
+    fn fixture(name: &str, nested_field_type: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!("mm-scanner-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"test-contract\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[contracttype]\npub struct Outer {\n    pub inner: Inner,\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/nested.rs"),
+            format!(
+                "#[contracttype]\npub struct Inner {{\n    pub value: InnerValue,\n}}\n\
+                 #[contracttype]\npub struct InnerValue {{\n    pub amount: {nested_field_type},\n}}\n"
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    fn snapshot_for(root: &Path) -> SchemaSnapshot {
+        let cargo = root.join("Cargo.toml");
+        let schema = try_parse_contract(root, &cargo).unwrap();
+        SchemaSnapshot {
+            version: "v1".into(),
+            captured_at: "now".into(),
+            ref_name: "main".into(),
+            sha: "sha".into(),
+            contracts: vec![schema],
+        }
+    }
+
+    #[test]
+    fn resolves_two_levels_of_nested_types() {
+        let root = fixture("nested", "u64");
+        let mut snapshot = snapshot_for(&root);
+        let schema = snapshot.contracts.remove(0);
+        let names: Vec<_> = schema.structs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Outer"));
+        assert!(names.contains(&"Inner"));
+        assert!(names.contains(&"InnerValue"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_type_changes_are_reported_by_differ() {
+        let old_root = fixture("old", "u64");
+        let new_root = fixture("new", "i128");
+        let baseline = snapshot_for(&old_root);
+        let current = snapshot_for(&new_root);
+        let report = diff(&baseline, &current);
+        assert!(report.diffs.iter().any(|d| {
+            d.kind == DiffKind::FieldTypeChanged && d.description.contains("InnerValue")
+        }));
+        fs::remove_dir_all(old_root).unwrap();
+        fs::remove_dir_all(new_root).unwrap();
+    }
 }

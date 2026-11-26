@@ -618,9 +618,14 @@ impl BridgeReceiver {
     }
 
     /// Lift isolation for a chain after the cooling-off period.
-    pub fn lift_bridge_chain_isolation(env: Env, admin: Address, chain_id: u32) -> bool {
+    pub fn lift_bridge_chain_isolation(
+        env: Env,
+        admin: Address,
+        chain_id: u32,
+        proposal_id: u32,
+    ) -> bool {
         Self::require_admin(&env, &admin);
-        let result = lift_chain_isolation(&env, chain_id);
+        let result = lift_chain_isolation(&env, chain_id, proposal_id);
 
         if result {
             env.events().publish(
@@ -642,6 +647,7 @@ impl BridgeReceiver {
 #[cfg(test)]
 mod test {
     use super::*;
+    use shared::record_governance_proposal_passed;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger;
     use soroban_sdk::BytesN;
@@ -830,13 +836,15 @@ mod test {
         client.emergency_isolate_chain(&admin, &CHAIN_ETHEREUM, &soroban_sdk::Symbol::new(&env, "test"));
         assert!(client.is_bridge_chain_isolated(&CHAIN_ETHEREUM));
 
-        // Cannot lift within 24h cooldown.
-        let lifted = client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM);
+        // Cannot lift within 24h cooldown, even with governance approval.
+        env.as_contract(&contract_id, || record_governance_proposal_passed(&env, 7));
+        let lifted = client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM, &7);
         assert!(!lifted);
 
-        // Advance 25 hours.
+        // Advance 25 hours. Governance approval is required.
         env.ledger().with_mut(|l| l.timestamp = 25 * 60 * 60);
-        let lifted = client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM);
+        assert!(!client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM, &8));
+        let lifted = client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM, &7);
         assert!(lifted);
         assert!(!client.is_bridge_chain_isolated(&CHAIN_ETHEREUM));
     }

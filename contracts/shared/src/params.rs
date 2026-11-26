@@ -211,6 +211,7 @@ pub fn set_param(env: &Env, caller: &Address, key: &Symbol, value: i128) {
 ///
 /// Returns the governance-stored value for each key that has one, and the
 /// compile-time default for keys that governance has not yet updated.
+#[deprecated(note = "use get_params_paginated for bounded responses")]
 pub fn get_all_params(env: &Env) -> Vec<(Symbol, i128)> {
     let keys: Vec<Symbol> = env
         .storage()
@@ -260,5 +261,26 @@ pub fn get_all_params(env: &Env) -> Vec<(Symbol, i128)> {
         }
     }
 
+    out
+}
+
+/// Return a paginated slice of protocol parameters for off-chain monitoring.
+///
+/// Includes canonical defaults and any governance-registered extra keys.
+/// `page` is 0-indexed; `page_size` is clamped to `MAX_PAGE_SIZE`.
+pub fn get_params_paginated(env: &Env, page: u32, page_size: u32) -> Vec<(Symbol, i128)> {
+    let all = get_all_params(env);
+    let total = all.len();
+    let start = page.saturating_mul(page_size);
+    let (_, end) = crate::pagination::Pagination::bounds(total, start, page_size);
+
+    let mut out: Vec<(Symbol, i128)> = Vec::new(env);
+    let mut i = start;
+    while i < end {
+        if let Some(item) = all.get(i) {
+            out.push_back(item);
+        }
+        i += 1;
+    }
     out
 }

@@ -3,7 +3,7 @@
 ///
 /// Uses soroban-sdk testutils to measure CPU instruction count and storage I/O
 /// per contract entry point. Results are compared against `baselines.json`
-/// and the process exits with code 1 if any metric regresses more than 10%.
+/// and the process exits with code 1 if any metric regresses more than 5%.
 ///
 /// Output:
 ///   - benchmarks/results/report.json   — full machine-readable results
@@ -52,7 +52,7 @@ fn main() {
             write_job_summary(&results, &regressions);
             std::process::exit(1);
         }
-        println!("\n✅  All metrics within 10% of baseline.");
+        println!("\n✅  All metrics within 5% of baseline.");
         write_job_summary(&results, &[]);
     } else {
         println!(
@@ -82,7 +82,7 @@ fn emit_annotations(regressions: &[harness::Regression]) {
         // GitHub Actions annotation syntax:
         //   ::error title=<title>::<message>
         println!(
-            "::error title=Performance Regression [{}/{}]::Metric `{}` exceeded 10% baseline — baseline={}, measured={}, delta=+{:.1}%",
+            "::error title=Performance Regression [{}/{}]::Metric `{}` exceeded 5% baseline — baseline={}, measured={}, delta=+{:.1}%",
             r.contract, r.entry_point, r.metric, r.baseline, r.measured, r.pct_change
         );
     }

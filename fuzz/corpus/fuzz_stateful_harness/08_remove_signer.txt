@@ -1,0 +1,6 @@
+# Governance action: remove signer 4 while keeping threshold valid
+init_ms 5 3
+ms_propose 0 2 4
+ms_sign 1 1
+ms_sign 2 1
+ms_execute 1

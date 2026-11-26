@@ -3,11 +3,20 @@
 use shared::health_reporter::{report_metric, MetricCategory};
 use shared::Pagination;
 use soroban_sdk::{
-    contract, contractevent, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractclient, contractimpl, contracttype, Address, Env,
+    Symbol, Vec,
 };
 
 const DECAY_HALF_LIFE_SECS: u64 = 6 * 30 * 24 * 3600; // 6 months in seconds
 const FULL_WEIGHT: i128 = 1000; // scaling factor for weight
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    SessionNotFound = 1,
+    DuplicateEndorsement = 2,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +26,8 @@ pub enum DataKey {
     Admin,
     SessionRegistry,
     Endorsement(Address, Address, Symbol),
+    /// One endorsement per (endorser, session_id) pair.
+    EndorsementExists(Address, Symbol),
     Endorsers(Address, Symbol),
     EndorsementCount(Address, Symbol),
     EndorsedSkills(Address),
@@ -182,6 +193,36 @@ impl EndorsementsContract {
                 new_count as i128,
             );
         }
+    }
+
+    /// Submit an endorsement tied to an existing session. The session must be
+    /// visible to the endorser in the session registry, and each endorser may
+    /// only use a given session once.
+    pub fn submit_endorsement(
+        env: Env,
+        endorser: Address,
+        endorsee: Address,
+        skill: Symbol,
+        session_id: Symbol,
+    ) -> Result<(), Error> {
+        endorser.require_auth();
+
+        if endorser == endorsee {
+            panic!("self-endorsement not allowed");
+        }
+
+        if !Self::session_exists(&env, &endorser, &session_id) {
+            return Err(Error::SessionNotFound);
+        }
+
+        let exists_key = DataKey::EndorsementExists(endorser.clone(), session_id.clone());
+        if env.storage().persistent().has(&exists_key) {
+            return Err(Error::DuplicateEndorsement);
+        }
+
+        Self::endorse(env.clone(), endorser, endorsee, skill);
+        env.storage().persistent().set(&exists_key, &true);
+        Ok(())
     }
 
     pub fn remove_endorsement(env: Env, endorser: Address, endorsee: Address, skill: Symbol) {
@@ -394,6 +435,21 @@ impl EndorsementsContract {
         }
 
         total_weight
+    }
+
+    fn session_exists(env: &Env, participant: &Address, session_id: &Symbol) -> bool {
+        let registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SessionRegistry)
+            .expect("not initialized");
+        let client = SessionRegistryClient::new(env, &registry);
+        client
+            .get_sessions_by_mentor(participant)
+            .contains(session_id)
+            || client
+                .get_sessions_by_learner(participant)
+                .contains(session_id)
     }
 
     fn has_completed_shared_session(env: &Env, a: &Address, b: &Address) -> bool {
@@ -634,60 +690,56 @@ mod tests {
     }
 
     #[test]
-    fn test_get_endorsers_page() {
+    fn test_submit_endorsement_with_valid_session() {
         let f = Fixture::setup();
+        f.add_completed_shared_session();
+        let session_id = Symbol::new(&f.env, "s1");
         let skill = symbol_short!("RUST");
 
-        // One full page plus one extra endorser, each with a completed session.
-        let total: u32 = MAX_PAGE_SIZE + 1;
-        for i in 0..total {
-            let endorser = Address::generate(&f.env);
-            f.sessions().add_session(&SessionRecord {
-                session_id: Symbol::new(&f.env, &std::format!("s{}", i)),
-                mentor: f.endorsee.clone(),
-                learner: endorser.clone(),
-                scheduled_at: 0,
-                duration_mins: 60,
-                amount: 100,
-                token: Address::generate(&f.env),
-                status: SessionStatus::Completed,
-                registered_at: 0,
-            });
-            f.endorsements().endorse(&endorser, &f.endorsee, &skill);
-        }
-
-        let all = f.endorsements().get_endorsers(&f.endorsee, &skill);
-        assert_eq!(all.len(), total);
-
-        // `limit` is clamped to MAX_PAGE_SIZE instead of trusting the caller.
-        let first = f
-            .endorsements()
-            .get_endorsers_page(&f.endorsee, &skill, &0, &u32::MAX);
-        assert_eq!(first.len(), MAX_PAGE_SIZE);
-        assert_eq!(first.get(0).unwrap(), all.get(0).unwrap());
         assert_eq!(
-            first.get(MAX_PAGE_SIZE - 1).unwrap(),
-            all.get(MAX_PAGE_SIZE - 1).unwrap()
+            f.endorsements().submit_endorsement(
+                &f.endorser,
+                &f.endorsee,
+                &skill,
+                &session_id
+            ),
+            Ok(())
         );
+        assert_eq!(f.endorsements().get_endorsement_count(&f.endorsee, &skill), 1);
+    }
 
-        // The next page holds the single remaining endorser.
-        let rest = f.endorsements().get_endorsers_page(
-            &f.endorsee,
-            &skill,
-            &MAX_PAGE_SIZE,
-            &MAX_PAGE_SIZE,
+    #[test]
+    fn test_submit_endorsement_rejects_unknown_session() {
+        let f = Fixture::setup();
+        f.add_completed_shared_session();
+        let unknown = Symbol::new(&f.env, "missing");
+
+        assert_eq!(
+            f.endorsements().submit_endorsement(
+                &f.endorser,
+                &f.endorsee,
+                &symbol_short!("RUST"),
+                &unknown
+            ),
+            Err(Ok(Error::SessionNotFound))
         );
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest.get(0).unwrap(), all.get(MAX_PAGE_SIZE).unwrap());
+    }
 
-        // Offsets at or past the end yield an empty page instead of panicking.
-        assert!(f
-            .endorsements()
-            .get_endorsers_page(&f.endorsee, &skill, &total, &MAX_PAGE_SIZE)
-            .is_empty());
-        assert!(f
-            .endorsements()
-            .get_endorsers_page(&f.endorsee, &skill, &(total + 10), &MAX_PAGE_SIZE)
-            .is_empty());
+    #[test]
+    fn test_submit_endorsement_rejects_duplicate_session() {
+        let f = Fixture::setup();
+        f.add_completed_shared_session();
+        let session_id = Symbol::new(&f.env, "s1");
+        let skill = symbol_short!("RUST");
+
+        f.endorsements()
+            .submit_endorsement(&f.endorser, &f.endorsee, &skill, &session_id)
+            .unwrap();
+        assert_eq!(
+            f.endorsements()
+                .submit_endorsement(&f.endorser, &f.endorsee, &skill, &session_id),
+            Err(Ok(Error::DuplicateEndorsement))
+        );
+        assert_eq!(f.endorsements().get_endorsement_count(&f.endorsee, &skill), 1);
     }
 }

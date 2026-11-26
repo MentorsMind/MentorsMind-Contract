@@ -3,8 +3,6 @@
 use shared::privacy::{
     contain_data_breach, detect_cross_session_leak, record_session_owner, CrossSessionLeakResult,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec, String};
 use shared::{
     // learner protection
     assess_vulnerability,
@@ -20,7 +18,6 @@ use shared::{
     enforce_learner_fair_pricing as shared_enforce_learner_fair_pricing,
     evaluate_fair_access,
     identify_exploitation_patterns as shared_identify_exploitation_patterns,
-    compute_welfare_status as shared_compute_welfare_status,
     VulnerabilityAssessment, EmergencyIntervention, LearnerProtectionRecord,
     // resource management
     allocate_system_resources, manage_session_load, detect_abuse_patterns, check_emergency_trigger,
@@ -36,10 +33,8 @@ use shared::{
     CoordinationFlag,
     CoordinationPattern,
     DemandAuthenticity,
-    EmergencyIntervention,
     FairAccessDecision,
     FairResourceAllocation,
-    LearnerProtectionRecord,
     LoadValidationResult,
     PerformanceInterventionRecord,
     PriceCoordinationFlag,
@@ -48,7 +43,6 @@ use shared::{
     SocialProofRecord,
     TimeSlotFairnessAnalysis,
     TimeSlotInfo,
-    VulnerabilityAssessment,
     PERFORMANCE_RESTORATION_COOLDOWN_SECS,
     // Session uniqueness & replay detection (#905)
     validate_session_nonce,
@@ -77,7 +71,7 @@ use shared::recording_integrity::ConsentRecord;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN, Env, Map,
-    Symbol, Vec,
+    String, Symbol, Vec,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────

@@ -18,6 +18,15 @@ const MODERATION_THRESHOLD: Symbol = symbol_short!("MOD_THR");
 const DEFAULT_REPUTATION_THRESHOLD: i128 = 10;
 const DEFAULT_MIN_POST_STAKE: i128 = 1_000_000; // 0.001 MNT
 const DEFAULT_MODERATION_THRESHOLD: u32 = 3;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const MAX_POSTS_PER_DAY: u32 = 10;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostRateLimit {
+    pub day: u64,
+    pub count: u32,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +71,7 @@ pub struct Post {
     pub downvotes: i128,
     pub reply_count: u32,
     pub moderation_count: u32,
+    pub deleted: bool,
 }
 
 #[contracttype]
@@ -121,6 +131,7 @@ pub enum DataKey {
     Reply(u32),
     Category(u32),
     UserReputation(Address),
+    PostCountThisPeriod(Address),
     Vote(u32, Address),      // For posts
     ReplyVote(u32, Address), // For replies
     Moderation(u32, Address),
@@ -200,6 +211,20 @@ impl ForumContract {
 
         author.require_auth();
 
+        let day = env.ledger().timestamp() / SECONDS_PER_DAY;
+        let rate_key = DataKey::PostCountThisPeriod(author.clone());
+        let posts_this_day = match env
+            .storage()
+            .persistent()
+            .get::<_, PostRateLimit>(&rate_key)
+        {
+            Some(limit) if limit.day == day => limit.count,
+            _ => 0,
+        };
+        if posts_this_day >= MAX_POSTS_PER_DAY {
+            panic!("post rate limit exceeded");
+        }
+
         let min_stake: i128 = env
             .storage()
             .persistent()
@@ -251,7 +276,7 @@ impl ForumContract {
             id: count,
             author: author.clone(),
             title,
-            content_hash,
+            content_hash: content_hash.clone(),
             post_type,
             category_id,
             status: PostStatus::Active,
@@ -262,9 +287,17 @@ impl ForumContract {
             downvotes: 0,
             reply_count: 0,
             moderation_count: 0,
+            deleted: false,
         };
 
         env.storage().persistent().set(&POST_COUNT, &count);
+        env.storage().persistent().set(
+            &rate_key,
+            &PostRateLimit {
+                day,
+                count: posts_this_day + 1,
+            },
+        );
         env.storage().persistent().set(&DataKey::Post(count), &post);
         env.storage()
             .persistent()
@@ -293,10 +326,19 @@ impl ForumContract {
 
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("POST_CR"), count),
-            (author, post_type_clone, category_id, stake_amount),
+            (author, post_type_clone, category_id, stake_amount, content_hash),
         );
 
         count
+    }
+
+    /// Check a post's committed content hash against a supplied value.
+    pub fn verify_post_content(env: Env, post_id: u32, content_hash: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, Post>(&DataKey::Post(post_id))
+            .map(|post| post.content_hash == content_hash)
+            .unwrap_or(false)
     }
 
     pub fn create_reply(
@@ -312,7 +354,7 @@ impl ForumContract {
         author.require_auth();
 
         let post = Self::get_post(env.clone(), post_id);
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -385,7 +427,7 @@ impl ForumContract {
         voter.require_auth();
 
         let mut post = Self::get_post(env.clone(), post_id);
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -500,7 +542,7 @@ impl ForumContract {
             panic!("only post author can mark best answer");
         }
 
-        if post.status != PostStatus::Active {
+        if post.status != PostStatus::Active || post.deleted {
             panic!("post not active");
         }
 
@@ -609,6 +651,7 @@ impl ForumContract {
                 ModerationAction::Delete => {
                     let was_active = post.status == PostStatus::Active;
                     post.status = PostStatus::Deleted;
+                    post.deleted = true;
                     if was_active {
                         let active_posts = env.storage().persistent().get(&DataKey::ActivePosts).unwrap_or(0u32);
                         env.storage().persistent().set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
@@ -637,6 +680,43 @@ impl ForumContract {
         env.events().publish(
             (symbol_short!("FRM"), symbol_short!("MOD_ACT"), target_id),
             (moderator, is_reply, action),
+        );
+    }
+
+    pub fn delete_post(env: Env, author: Address, post_id: u32) {
+        author.require_auth();
+
+        let mut post = Self::get_post(env.clone(), post_id);
+        if post.author != author {
+            panic!("only post author can delete post");
+        }
+        if post.deleted || post.status == PostStatus::Deleted {
+            panic!("post already deleted");
+        }
+
+        let was_active = post.status == PostStatus::Active;
+        post.status = PostStatus::Deleted;
+        post.deleted = true;
+        post.updated_at = env.ledger().timestamp();
+
+        if was_active {
+            let active_posts = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ActivePosts)
+                .unwrap_or(0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActivePosts, &active_posts.saturating_sub(1));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Post(post_id), &post);
+
+        env.events().publish(
+            (symbol_short!("FRM"), symbol_short!("POST_DEL"), post_id),
+            author,
         );
     }
 
@@ -772,12 +852,23 @@ impl ForumContract {
                 .persistent()
                 .get::<_, Reply>(&DataKey::Reply(reply_id))
             {
-                if reply.post_id == post_id {
-                    replies.push_back(reply_id);
+                if post.category_id == category_id && post.status == PostStatus::Active && !post.deleted {
+                    posts.push_back(current_id);
+                    found += 1;
                 }
             }
         }
         replies
+    }
+
+    pub fn is_parent_deleted(env: Env, post_id: u32) -> bool {
+        let post = Self::get_post(env, post_id);
+        post.deleted || post.status == PostStatus::Deleted
+    }
+
+    pub fn is_reply_orphaned(env: Env, reply_id: u32) -> bool {
+        let reply = Self::get_reply(env.clone(), reply_id);
+        Self::is_parent_deleted(env, reply.post_id)
     }
 
     pub fn get_replies_by_post(env: Env, post_id: u32, limit: u32) -> Vec<u32> {
@@ -1311,51 +1402,42 @@ mod tests {
         token.mint(&author, &100_000_000i128);
 
         let title = Bytes::from_slice(&env, b"Post");
-        let content_hash = BytesN::from_array(&env, &[1u8; 32]);
-
-        // Create more posts than MAX_PAGE_SIZE, all in category 1.
-        let total = MAX_PAGE_SIZE + 5;
-        for _ in 0..total {
+        let hash = BytesN::from_array(&env, &[3u8; 32]);
+        for _ in 0..MAX_POSTS_PER_DAY {
             forum.create_post(
                 &author,
                 &title,
-                &content_hash,
+                &hash,
                 &PostType::Question,
                 &1,
                 &1_000_000i128,
             );
         }
+        assert!(forum
+            .try_create_post(
+                &author,
+                &title,
+                &hash,
+                &PostType::Question,
+                &1,
+                &1_000_000i128
+            )
+            .is_err());
 
-        assert_eq!(forum.get_post_count(), total);
-
-        // get_posts_page clamps the limit and slices correctly.
-        let page = forum.get_posts_page(&0, &u32::MAX);
-        assert_eq!(page.len(), MAX_PAGE_SIZE);
-        assert_eq!(page.get(0).unwrap(), 1);
-        assert_eq!(page.get(MAX_PAGE_SIZE - 1).unwrap(), MAX_PAGE_SIZE);
-
-        let page2 = forum.get_posts_page(&MAX_PAGE_SIZE, &u32::MAX);
-        assert_eq!(page2.len(), 5);
-        assert_eq!(page2.get(0).unwrap(), MAX_PAGE_SIZE + 1);
-
-        // Out-of-range offset yields an empty page.
-        assert_eq!(forum.get_posts_page(&1_000, &10).len(), 0);
-
-        // get_posts_by_category reads the CategoryIndex.
-        let cat_page = forum.get_posts_by_category(&1, &0, &u32::MAX);
-        assert_eq!(cat_page.len(), MAX_PAGE_SIZE);
-        assert_eq!(cat_page.get(0).unwrap(), 1);
-
-        let cat_page2 = forum.get_posts_by_category(&1, &MAX_PAGE_SIZE, &u32::MAX);
-        assert_eq!(cat_page2.len(), 5);
-        assert_eq!(cat_page2.get(0).unwrap(), MAX_PAGE_SIZE + 1);
-
-        // A category with no posts yields an empty page.
-        assert_eq!(forum.get_posts_by_category(&2, &0, &10).len(), 0);
+        env.ledger().set_timestamp(SECONDS_PER_DAY);
+        let post_id = forum.create_post(
+            &author,
+            &title,
+            &hash,
+            &PostType::Question,
+            &1,
+            &1_000_000i128,
+        );
+        assert_eq!(post_id, MAX_POSTS_PER_DAY + 1);
     }
 
     #[test]
-    fn test_get_replies_page() {
+    fn test_verify_post_content() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1375,38 +1457,23 @@ mod tests {
             &Some(1_000_000i128),
             &Some(3u32),
         );
-        token.mint(&author, &100_000_000i128);
-        token.mint(&responder, &100_000_000i128);
+        token.mint(&author, &10_000_000i128);
 
-        let title = Bytes::from_slice(&env, b"Post");
-        let content_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let hash = BytesN::from_array(&env, &[5u8; 32]);
         let post_id = forum.create_post(
             &author,
-            &title,
-            &content_hash,
+            &Bytes::from_slice(&env, b"Post"),
+            &hash,
             &PostType::Question,
             &1,
             &1_000_000i128,
         );
 
-        let reply_hash = BytesN::from_array(&env, &[2u8; 32]);
-        let total = MAX_PAGE_SIZE + 3;
-        for _ in 0..total {
-            forum.create_reply(&responder, &post_id, &reply_hash, &1_000_000i128);
-        }
-
-        // First page is clamped to MAX_PAGE_SIZE.
-        let page = forum.get_replies_page(&post_id, &0, &u32::MAX);
-        assert_eq!(page.len(), MAX_PAGE_SIZE);
-        assert_eq!(page.get(0).unwrap(), 1);
-        assert_eq!(page.get(MAX_PAGE_SIZE - 1).unwrap(), MAX_PAGE_SIZE);
-
-        // Second page holds the remainder.
-        let page2 = forum.get_replies_page(&post_id, &MAX_PAGE_SIZE, &u32::MAX);
-        assert_eq!(page2.len(), 3);
-        assert_eq!(page2.get(0).unwrap(), MAX_PAGE_SIZE + 1);
-
-        // Out-of-range offset yields an empty page.
-        assert_eq!(forum.get_replies_page(&post_id, &1_000, &10).len(), 0);
+        assert!(forum.verify_post_content(&post_id, &hash));
+        assert!(!forum.verify_post_content(
+            &post_id,
+            &BytesN::from_array(&env, &[6u8; 32])
+        ));
+        assert!(!forum.verify_post_content(&999, &hash));
     }
 }

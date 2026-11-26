@@ -7,13 +7,11 @@ use soroban_sdk::{
 /// Instance storage: frequently read config.
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const SNAPSHOT: Symbol = symbol_short!("SNAPSHOT");
+const STAKING: Symbol = symbol_short!("STAKING");
 
-/// Maximum number of delegation hops resolved when attributing weight.
-///
-/// Chains longer than this are capped rather than followed, so a cycle that
-/// somehow reaches storage cannot make weight resolution loop forever or blow
-/// the transaction's budget.
-pub const MAX_CHAIN_DEPTH: u32 = 8;
+/// Maximum number of links allowed in a delegation chain.
+pub const MAX_DELEGATION_DEPTH: u32 = 3;
+pub const MAX_CHAIN_DEPTH: u32 = MAX_DELEGATION_DEPTH;
 
 #[contracttype]
 #[derive(Clone)]
@@ -28,6 +26,13 @@ pub enum DataKey {
 #[contractclient(name = "SnapshotClient")]
 pub trait SnapshotTrait {
     fn get_voting_power(env: Env, proposal_id: u32, voter: Address) -> i128;
+}
+
+#[contractclient(name = "StakingClient")]
+pub trait StakingTrait {
+    fn get_staked_balance(env: Env, staker: Address) -> i128;
+}
+
 use shared::events::{
     emit_delegation_event, evt_del_delegated, evt_del_suspended, evt_del_undelegated,
 };
@@ -76,7 +81,7 @@ pub enum DataKey {
 #[repr(u32)]
 pub enum DelegationError {
     CircularDelegation = 1,
-    DepthExceeded = 2,
+    DelegationDepthExceeded = 2,
     ConcentrationExceeded = 3,
     DelegationSuspended = 4,
 }
@@ -110,6 +115,20 @@ impl DelegationContract {
         env.storage().instance().set(&SNAPSHOT, &snapshot_contract);
     }
 
+    pub fn set_staking_contract(env: Env, admin: Address, staking_contract: Address) {
+        Self::require_initialized(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+        env.storage().instance().set(&STAKING, &staking_contract);
+    }
+
     /// Delegates all of the caller's governance weight to `delegate`.
     ///
     /// Rejects self-delegation and any delegation that would close a cycle,
@@ -126,10 +145,10 @@ impl DelegationContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
-        // Set default max delegation depth to 10
+        // The configured limit may be lowered, but never raised above the hard cap.
         env.storage()
             .instance()
-            .set(&DataKey::MaxDelegationDepth, &10u32);
+            .set(&DataKey::MaxDelegationDepth, &MAX_DELEGATION_DEPTH);
         env.storage().instance().set(
             &DataKey::MaxDelegatedPowerBps,
             &shared::DEFAULT_DELEGATION_CAP_BPS,
@@ -149,8 +168,8 @@ impl DelegationContract {
         if admin != stored_admin {
             panic!("unauthorized");
         }
-        if depth < 2 || depth > 100 {
-            panic!("depth must be between 2 and 100");
+        if depth < 2 || depth > MAX_DELEGATION_DEPTH {
+            panic!("depth must be between 2 and MAX_DELEGATION_DEPTH");
         }
         env.storage()
             .instance()
@@ -161,7 +180,8 @@ impl DelegationContract {
         env.storage()
             .instance()
             .get(&DataKey::MaxDelegationDepth)
-            .unwrap_or(10u32)
+            .unwrap_or(MAX_DELEGATION_DEPTH)
+            .min(MAX_DELEGATION_DEPTH)
     }
 
     pub fn set_delegation_power_cap_bps(env: Env, admin: Address, cap_bps: u32) {
@@ -225,7 +245,8 @@ impl DelegationContract {
     /// Validate delegation chain and return its depth.
     /// Returns Ok(depth) if valid chain with no cycles.
     /// Returns Err(DelegationError::CircularDelegation) if cycle detected.
-    /// Returns Err(DelegationError::DepthExceeded) if depth exceeds configured max.
+    /// Returns Err(DelegationError::DelegationDepthExceeded) if the new link
+    /// would exceed the configured maximum depth.
     pub fn validate_delegation_chain(
         env: Env,
         delegator: Address,
@@ -238,16 +259,9 @@ impl DelegationContract {
         let max_depth = Self::get_max_delegation_depth(env.clone());
         let mut seen: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
         let mut cur = delegate.clone();
-        let mut depth: u32 = 0;
+        let mut resulting_depth: u32 = 1;
 
         loop {
-            depth += 1;
-
-            // Check if we've exceeded max depth
-            if depth > max_depth {
-                return Err(DelegationError::DepthExceeded);
-            }
-
             // Check if current address is the delegator (cycle detected)
             if cur == delegator {
                 return Err(DelegationError::CircularDelegation);
@@ -267,15 +281,26 @@ impl DelegationContract {
                 .persistent()
                 .get::<_, Address>(&DataKey::Delegate(cur.clone()))
             {
+                resulting_depth += 1;
+                if resulting_depth > max_depth {
+                    return Err(DelegationError::DelegationDepthExceeded);
+                }
                 cur = next;
             } else {
-                // End of chain reached successfully
-                return Ok(depth);
+                return if resulting_depth <= max_depth {
+                    Ok(resulting_depth)
+                } else {
+                    Err(DelegationError::DelegationDepthExceeded)
+                };
             }
         }
     }
 
-    pub fn delegate(env: Env, delegator: Address, delegate: Address) {
+    pub fn delegate(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), DelegationError> {
         delegator.require_auth();
         if Self::is_delegation_suspended(env.clone()) {
             panic!("delegation suspended");
@@ -284,7 +309,13 @@ impl DelegationContract {
             panic!("cannot delegate to self");
         }
 
-        Self::require_acyclic(&env, &delegator, &delegate);
+        match Self::validate_delegation_chain(env.clone(), delegator.clone(), delegate.clone()) {
+            Ok(_) => {}
+            Err(DelegationError::CircularDelegation) => {
+                panic!("circular delegation");
+            }
+            Err(error) => return Err(error),
+        }
 
         // Drop any previous delegation first so weight is never counted twice.
         Self::unlink(&env, &delegator);
@@ -298,18 +329,6 @@ impl DelegationContract {
             .persistent()
             .get(&DataKey::Delegators(delegate.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        // Validate delegation chain at registration time
-        match Self::validate_delegation_chain(env.clone(), delegator.clone(), delegate.clone()) {
-            Ok(_) => {
-                // Chain is valid, proceed
-            }
-            Err(DelegationError::CircularDelegation) => {
-                panic!("circular delegation");
-            }
-            Err(DelegationError::DepthExceeded) => {
-                panic!("delegation depth exceeded");
-            }
-        }
 
         let max_depth = Self::get_max_delegation_depth(env.clone());
 
@@ -378,6 +397,7 @@ impl DelegationContract {
 
         env.events()
             .publish((Symbol::new(&env, "delegated"), delegator), delegate);
+        Ok(())
     }
 
 
@@ -489,7 +509,9 @@ impl DelegationContract {
         let mut total: i128 = 0;
 
         for delegator in Self::get_delegators(env.clone(), holder.clone()).iter() {
-            let contributed = Self::get_base_weight(env.clone(), proposal_id, delegator.clone())
+            let snapshot_weight =
+                Self::get_base_weight(env.clone(), proposal_id, delegator.clone());
+            let contributed = Self::get_live_delegated_weight(&env, &delegator, snapshot_weight)
                 .checked_add(Self::resolve(
                     env.clone(),
                     proposal_id,
@@ -506,23 +528,18 @@ impl DelegationContract {
         total
     }
 
-    /// Rejects a delegation that would close a cycle, and caps chains that
-    /// already sit at the depth limit.
-    fn require_acyclic(env: &Env, delegator: &Address, delegate: &Address) {
-        let mut current = delegate.clone();
-
-        for _ in 0..MAX_CHAIN_DEPTH {
-            if &current == delegator {
-                panic!("circular delegation");
+    fn get_live_delegated_weight(env: &Env, delegator: &Address, snapshot_weight: i128) -> i128 {
+        let staking: Option<Address> = env.storage().instance().get(&STAKING);
+        match staking {
+            Some(staking_contract) => {
+                let live_stake =
+                    StakingClient::new(env, &staking_contract).get_staked_balance(delegator);
+                // Unstaking reduces snapshot voting power, while later deposits
+                // cannot increase it beyond the proposal's recorded balance.
+                snapshot_weight.min(live_stake).max(0)
             }
-
-            match Self::get_delegate(env.clone(), current.clone()) {
-                Some(next) => current = next,
-                None => return,
-            }
+            None => snapshot_weight,
         }
-
-        panic!("delegation chain too deep");
     }
 
     /// Removes the delegator's outgoing delegation from both indexes.
@@ -1027,36 +1044,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "circular delegation")]
-    fn test_circular_depth_5() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let del_id = env.register_contract(None, DelegationContract);
-        let token_id = env.register_contract(None, MockMntToken);
-
-        let del = DelegationContractClient::new(&env, &del_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-
-        let admin = Address::generate(&env);
-        del.initialize(&admin, &token_id);
-
-        let a = Address::generate(&env);
-        let b = Address::generate(&env);
-        let c = Address::generate(&env);
-        let d = Address::generate(&env);
-        let e = Address::generate(&env);
-
-        // Setup: a→b→c→d→e
-        del.delegate(&a, &b);
-        del.delegate(&b, &c);
-        del.delegate(&c, &d);
-        del.delegate(&d, &e);
-        // Try: e→a (creates cycle of length 5)
-        del.delegate(&e, &a);
-    }
-
-    #[test]
     fn test_chain_delegation_and_effective_power() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1133,12 +1120,11 @@ mod tests {
         let admin = Address::generate(&env);
         del.initialize(&admin, &token_id);
 
-        // Default depth should be 10
-        assert_eq!(del.get_max_delegation_depth(), 10u32);
+        // The default and hard maximum depth is three.
+        assert_eq!(del.get_max_delegation_depth(), MAX_DELEGATION_DEPTH);
 
-        // Set to custom value
-        del.set_max_delegation_depth(&admin, &20u32);
-        assert_eq!(del.get_max_delegation_depth(), 20u32);
+        del.set_max_delegation_depth(&admin, &3u32);
+        assert_eq!(del.get_max_delegation_depth(), MAX_DELEGATION_DEPTH);
     }
 
     // -----------------------

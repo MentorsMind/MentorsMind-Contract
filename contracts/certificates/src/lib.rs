@@ -1,8 +1,8 @@
 #![no_std]
 use shared::{authenticate_learning_outcomes, OutcomeAuthenticity};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
-    Vec, Map, BytesN,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
+    symbol_short, vec, Address, Env, Symbol, Vec, Map, BytesN,
     xdr::ToXdr,
     IntoVal,
 };
@@ -38,6 +38,13 @@ const FRAUD_CONFIDENCE_THRESHOLD_BPS: u32 = 7000; // 70%
 /// Cross-session fraud detection window (seconds)
 const FRAUD_DETECTION_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    DuplicateCertificate = 1,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CertificateRecord {
@@ -48,6 +55,7 @@ pub struct CertificateRecord {
     pub sessions_completed: u32,
     pub issued_at: u64,
     pub revoked: bool,
+    pub revocation_reason: Option<BytesN<32>>,
     pub session_id: Symbol,
     pub rating_at_time: u64,
     // Assessment validation (#911, #914)
@@ -107,6 +115,8 @@ pub enum DataKey {
     Backend,
     Counter,
     Cert(u64),
+    /// Uniqueness guard for (learner, session, skill).
+    CertExists(Address, Symbol, Symbol),
     LearnerCerts(Address),
     SkillCerts(Symbol),
     EscrowContract,
@@ -197,6 +207,11 @@ impl Certificates {
             .expect("not initialized");
         backend.require_auth();
 
+        let exists_key = DataKey::CertExists(learner.clone(), session_id.clone(), skill.clone());
+        if env.storage().persistent().has(&exists_key) {
+            panic_with_error!(&env, Error::DuplicateCertificate);
+        }
+
         // 1. Verify escrow is Released
         let escrow_addr: Address = env
             .storage()
@@ -262,6 +277,7 @@ impl Certificates {
             sessions_completed: sessions.len(),
             issued_at,
             revoked: false,
+            revocation_reason: None,
             session_id: session_id.clone(),
             rating_at_time: rating,
             assessment_id: None,
@@ -275,6 +291,7 @@ impl Certificates {
         };
 
         env.storage().persistent().set(&DataKey::Cert(id), &cert);
+        env.storage().persistent().set(&exists_key, &true);
         push_id(&env, &DataKey::LearnerCerts(learner.clone()), id);
         push_id(&env, &DataKey::SkillCerts(skill.clone()), id);
 
@@ -383,30 +400,59 @@ impl Certificates {
             && cert.sessions_completed >= MIN_SESSIONS_COMPLETED
     }
 
+    /// Return the learner a certificate was issued to. Used by other
+    /// contracts to prove ownership before showcasing a certificate.
+    pub fn get_certificate_learner(env: Env, cert_id: u64) -> Address {
+        let cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+        cert.learner
+    }
+
     /// Soulbound: transfers are forbidden.
     pub fn transfer(_env: Env, _to: Address, _cert_id: u64) {
         panic!("non-transferable");
     }
 
-    /// Admin only: revoke a certificate.
-    pub fn revoke_certificate(env: Env, cert_id: u64) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .expect("not initialized");
-        admin.require_auth();
+    /// Revoke a certificate with a reason hash. Callable by the admin, the
+    /// issuing backend, or the mentor the certificate is attributed to.
+    pub fn revoke_certificate(
+        env: Env,
+        authority: Address,
+        cert_id: u64,
+        reason_hash: BytesN<32>,
+    ) {
+        authority.require_auth();
 
         let mut cert: CertificateRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Cert(cert_id))
             .expect("cert not found");
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        if authority != admin && authority != backend && authority != cert.mentor {
+            panic!("not authorized to revoke certificate");
+        }
+
         cert.revoked = true;
+        cert.revocation_reason = Some(reason_hash.clone());
         env.storage().persistent().set(&DataKey::Cert(cert_id), &cert);
 
-        env.events()
-            .publish((symbol_short!("cert_rev"), cert.learner), cert_id);
+        env.events().publish(
+            (Symbol::new(&env, "CertificateRevoked"), cert.learner),
+            (cert_id, reason_hash),
+        );
     }
 
     /// Returns (is_valid, record). is_valid = exists && !revoked.
@@ -469,6 +515,11 @@ impl Certificates {
             .get(&DataKey::Backend)
             .expect("not initialized");
         backend.require_auth();
+
+        let exists_key = DataKey::CertExists(learner.clone(), session_id.clone(), skill.clone());
+        if env.storage().persistent().has(&exists_key) {
+            panic_with_error!(&env, Error::DuplicateCertificate);
+        }
 
         // 1. Verify escrow is Released
         let escrow_addr: Address = env
@@ -548,6 +599,7 @@ impl Certificates {
             sessions_completed: sessions.len(),
             issued_at,
             revoked: false,
+            revocation_reason: None,
             session_id: session_id.clone(),
             rating_at_time: rating,
             assessment_id: Some(assessment_id.clone()),
@@ -1154,14 +1206,45 @@ mod test {
     fn test_revoke() {
         let env = Env::default();
         env.mock_all_auths();
-        let (c, _, _, learner, mentor) = deploy(&env);
+        let (c, admin, _, learner, mentor) = deploy(&env);
 
         let id = c.issue_certificate(&learner, &mentor, &symbol_short!("RUST"), &symbol_short!("SESS2"), &500u64);
-        c.revoke_certificate(&id);
+        let reason = BytesN::from_array(&env, &[9u8; 32]);
+        c.revoke_certificate(&admin, &id, &reason);
 
         let (valid, record) = c.verify_certificate(&id);
         assert!(!valid);
         assert!(record.revoked);
+        assert_eq!(record.revocation_reason, Some(reason));
+    }
+
+    #[test]
+    fn test_duplicate_certificate_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, _, _, learner, mentor) = deploy(&env);
+
+        let skill = symbol_short!("RUST");
+        let session = symbol_short!("SESS9");
+        c.issue_certificate(&learner, &mentor, &skill, &session, &100u64);
+        let result = c.try_issue_certificate(&learner, &mentor, &skill, &session, &100u64);
+        assert_eq!(result, Err(Ok(Error::DuplicateCertificate)));
+        assert_eq!(c.get_certificates_by_learner(&learner).len(), 1);
+    }
+
+    #[test]
+    fn test_issuing_mentor_can_revoke_and_unauthorized_cannot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, _, _, learner, mentor) = deploy(&env);
+
+        let id = c.issue_certificate(&learner, &mentor, &symbol_short!("GO"), &symbol_short!("SESS10"), &100u64);
+        let reason = BytesN::from_array(&env, &[7u8; 32]);
+        let stranger = Address::generate(&env);
+        assert!(c.try_revoke_certificate(&stranger, &id, &reason).is_err());
+
+        c.revoke_certificate(&mentor, &id, &reason);
+        assert!(!c.verify_certificate(&id).0);
     }
 
     #[test]

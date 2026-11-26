@@ -1,0 +1,5 @@
+# Governance action: add a signer after threshold approval
+init_ms 3 2
+ms_propose 0 1 9
+ms_sign 1 1
+ms_execute 1

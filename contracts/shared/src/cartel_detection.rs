@@ -1,6 +1,11 @@
 
 use soroban_sdk::{contracterror, contracttype, Address, Env, Symbol, Vec};
 
+/// Activity is analysed over the trailing `PATTERN_DETECTION_WINDOW` seconds
+/// rather than a fixed epoch, so patterns split across a window reset are not
+/// missed.
+pub const PATTERN_DETECTION_WINDOW: u64 = 3600;
+
 /// Cartel Detection Error Types
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -104,14 +109,21 @@ impl CartelDetection {
         let mut coordination_patterns: Vec<CoordinationPattern> = Vec::new(env);
         let mut confidence_score = 0u32;
 
+        // Use a sliding window: only events in [now - window, now] count.
+        let recent_activity = Self::recent_slots(env, recent_scheduling_activity);
+        let mut recent_other_activity: Vec<(Address, Vec<TimeSlotInfo>)> = Vec::new(env);
+        for (mentor, slots) in other_mentors_activity.iter() {
+            recent_other_activity.push_back((mentor, Self::recent_slots(env, &slots)));
+        }
+
         // Check for synchronized availability withdrawals
-        if Self::detect_synchronized_withdrawals(env, mentor_id, recent_scheduling_activity) {
+        if Self::detect_synchronized_withdrawals(env, mentor_id, &recent_activity) {
             confidence_score += 25;
             involved_mentors.push_back(mentor_id.clone());
         }
 
         // Check for uniform pricing patterns
-        if Self::detect_uniform_pricing(env, recent_scheduling_activity) {
+        if Self::detect_uniform_pricing(env, &recent_activity) {
             confidence_score += 20;
         }
 
@@ -119,8 +131,8 @@ impl CartelDetection {
         let time_coordination = Self::analyze_time_slot_coordination(
             env,
             mentor_id,
-            recent_scheduling_activity,
-            other_mentors_activity,
+            &recent_activity,
+            &recent_other_activity,
         );
         if time_coordination.is_some() {
             coordination_patterns.push_back(time_coordination.unwrap());
@@ -128,12 +140,12 @@ impl CartelDetection {
         }
 
         // Check for complementary scheduling patterns
-        if Self::detect_complementary_patterns(env, mentor_id, other_mentors_activity) {
+        if Self::detect_complementary_patterns(env, mentor_id, &recent_other_activity) {
             confidence_score += 15;
         }
 
         // Check for communication correlation
-        if Self::detect_communication_correlation(env, mentor_id, other_mentors_activity) {
+        if Self::detect_communication_correlation(env, mentor_id, &recent_other_activity) {
             confidence_score += 20;
         }
 
@@ -270,9 +282,10 @@ impl CartelDetection {
         availability_changes: &Vec<AvailabilityChange>,
     ) -> Vec<CoordinationPattern> {
         let mut suspicious_patterns: Vec<CoordinationPattern> = Vec::new(env);
+        let recent_changes = Self::recent_availability_changes(env, availability_changes);
 
         // Check for simultaneous availability withdrawals with other mentors
-        if Self::detect_simultaneous_changes(env, availability_changes) {
+        if Self::detect_simultaneous_changes(env, &recent_changes) {
             let pattern = CoordinationPattern {
                 pattern_type: 1, // Simultaneous withdrawal
                 mentors_involved: Vec::new(env),
@@ -284,7 +297,7 @@ impl CartelDetection {
         }
 
         // Check for strategic availability windows
-        if Self::detect_strategic_windows(env, availability_changes) {
+        if Self::detect_strategic_windows(env, &recent_changes) {
             let pattern = CoordinationPattern {
                 pattern_type: 2, // Strategic windowing
                 mentors_involved: Vec::new(env),
@@ -296,7 +309,7 @@ impl CartelDetection {
         }
 
         // Check for coordinated price increases
-        if Self::detect_coordinated_pricing(env, availability_changes) {
+        if Self::detect_coordinated_pricing(env, &recent_changes) {
             let pattern = CoordinationPattern {
                 pattern_type: 3, // Coordinated pricing
                 mentors_involved: Vec::new(env),
@@ -339,6 +352,35 @@ impl CartelDetection {
     }
 
     // Helper functions
+
+    /// Whether an event timestamp falls in `[now - window, now]`.
+    fn in_detection_window(env: &Env, timestamp: u64) -> bool {
+        let now = env.ledger().timestamp();
+        timestamp <= now && now.saturating_sub(timestamp) <= PATTERN_DETECTION_WINDOW
+    }
+
+    fn recent_slots(env: &Env, slots: &Vec<TimeSlotInfo>) -> Vec<TimeSlotInfo> {
+        let mut recent = Vec::new(env);
+        for slot in slots.iter() {
+            if Self::in_detection_window(env, slot.slot_start) {
+                recent.push_back(slot);
+            }
+        }
+        recent
+    }
+
+    fn recent_availability_changes(
+        env: &Env,
+        changes: &Vec<AvailabilityChange>,
+    ) -> Vec<AvailabilityChange> {
+        let mut recent = Vec::new(env);
+        for change in changes.iter() {
+            if Self::in_detection_window(env, change.timestamp) {
+                recent.push_back(change);
+            }
+        }
+        recent
+    }
 
     fn detect_synchronized_withdrawals(
         _env: &Env,
@@ -442,4 +484,68 @@ pub struct AvailabilityChange {
     pub old_price: u64,
     pub new_price: u64,
     pub is_now_available: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+
+    fn slot(env: &Env, slot_start: u64, price: u64, available: bool) -> TimeSlotInfo {
+        TimeSlotInfo {
+            slot_start,
+            slot_end: slot_start + 60,
+            mentor: Address::generate(env),
+            price,
+            availability_status: available,
+        }
+    }
+
+    #[test]
+    fn sliding_window_includes_activity_across_fixed_window_boundary() {
+        let env = Env::default();
+        // Fixed 1h windows reset at 3600; these events straddle that reset.
+        env.ledger().set_timestamp(3650);
+        let mentor = Address::generate(&env);
+
+        let mut activity = Vec::new(&env);
+        activity.push_back(slot(&env, 10, 50, true)); // outside sliding window
+        activity.push_back(slot(&env, 3590, 100, false));
+        activity.push_back(slot(&env, 3610, 100, false));
+
+        let recent = CartelDetection::recent_slots(&env, &activity);
+        assert_eq!(recent.len(), 2);
+        assert!(CartelDetection::detect_synchronized_withdrawals(&env, &mentor, &recent));
+        assert!(CartelDetection::detect_uniform_pricing(&env, &recent));
+
+        // Events from a previous epoch no longer count.
+        env.ledger().set_timestamp(8000);
+        let stale = CartelDetection::recent_slots(&env, &activity);
+        assert_eq!(stale.len(), 0);
+        assert!(!CartelDetection::detect_synchronized_withdrawals(&env, &mentor, &stale));
+    }
+
+    #[test]
+    fn availability_changes_use_the_same_sliding_window() {
+        let env = Env::default();
+        env.ledger().set_timestamp(3650);
+        let mentor = Address::generate(&env);
+        let mut changes = Vec::new(&env);
+        for timestamp in [10, 3590, 3610] {
+            changes.push_back(AvailabilityChange {
+                mentor: mentor.clone(),
+                timestamp,
+                slot_start: timestamp,
+                slot_end: timestamp + 60,
+                old_price: 100,
+                new_price: 200,
+                is_now_available: false,
+            });
+        }
+
+        let recent = CartelDetection::recent_availability_changes(&env, &changes);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent.get(0).unwrap().timestamp, 3590);
+        assert_eq!(recent.get(1).unwrap().timestamp, 3610);
+    }
 }

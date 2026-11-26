@@ -205,5 +205,86 @@
     "storage_reads": 5,
     "storage_writes": 3,
     "wasm_bytes": 65536
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "create_milestone_escrow_1",
+    "cpu_instructions": 1280000,
+    "mem_bytes": 17900,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "complete_milestone_1",
+    "cpu_instructions": 920000,
+    "mem_bytes": 14700,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "emergency_release_1",
+    "cpu_instructions": 1000000,
+    "mem_bytes": 15800,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "create_milestone_escrow_5",
+    "cpu_instructions": 2000000,
+    "mem_bytes": 21500,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "complete_milestone_5",
+    "cpu_instructions": 1400000,
+    "mem_bytes": 17500,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "emergency_release_5",
+    "cpu_instructions": 1400000,
+    "mem_bytes": 19000,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "create_milestone_escrow_10",
+    "cpu_instructions": 2900000,
+    "mem_bytes": 26000,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "complete_milestone_10",
+    "cpu_instructions": 2000000,
+    "mem_bytes": 21000,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
+  },
+  {
+    "contract": "escrow",
+    "entry_point": "emergency_release_10",
+    "cpu_instructions": 1900000,
+    "mem_bytes": 23000,
+    "storage_reads": 0,
+    "storage_writes": 0,
+    "wasm_bytes": 0
   }
 ]
