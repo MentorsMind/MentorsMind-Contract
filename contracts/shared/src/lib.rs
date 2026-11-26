@@ -8,6 +8,7 @@ use soroban_sdk::contracterror;
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod account_security;
+pub mod network_authentication;
 pub mod admin;
 pub mod cross_contract_auth;
 pub use cross_contract_auth::CrossContractAuth;
@@ -75,6 +76,7 @@ pub mod transaction_guard;
 pub mod validator_accountability;
 pub mod cross_chain_sync;
 pub mod vrf;
+pub mod zk_audit;
 pub mod bft_consensus;
 pub mod payment_integrity;
 pub mod threat_intelligence;
@@ -418,10 +420,10 @@ pub use outcome_authenticity::{
     OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
 };
 pub use params::{
-    get_all_params, get_param, governance_admin_role, init_protocol_params, key_cooldown_days,
-    key_interest_rate_bps, key_min_bond, key_min_credit_score, key_platform_fee_bps,
-    key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver, set_param, ParamKey,
-    DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
+    get_all_params, get_param, get_params_paginated, governance_admin_role, init_protocol_params,
+    key_cooldown_days, key_interest_rate_bps, key_min_bond, key_min_credit_score,
+    key_platform_fee_bps, key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver,
+    set_param, ParamKey, DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
     DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
     DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
 };
@@ -556,7 +558,8 @@ pub use cross_chain_sync::{
     acknowledge_prepare, begin_atomic_xchain_op, cleanup_expired_op, compute_state_merkle_root, confirm_commit,
     confirm_rollback, expire_xchain_op, get_chain_isolation, get_inconsistency,
     get_xchain_op, initiate_rollback, is_chain_isolated, is_reorg_safe, isolate_chain,
-    lift_chain_isolation, record_inconsistency, record_reorg_event, require_finality,
+    get_chain_isolation_lift_proposal_id, lift_chain_isolation,
+    record_governance_proposal_passed, record_inconsistency, record_reorg_event, require_finality,
     validate_state_proof, AtomicXChainOp, ChainFinalityConfig, ChainIsolationRecord,
     CrossChainInconsistency, CrossChainStateProof, FinalityTier, XChainPhase,
     XChainSyncError, MAX_PARTICIPATING_CHAINS, MIN_FINALITY_CONFIRMATIONS,
@@ -628,6 +631,8 @@ pub use vrf::{
     MIN_VALIDATORS, DEFAULT_EPOCH_DURATION_SECS,
 };
 
+pub use zk_audit::{commit_audit_entry, verify_audit_commitment, AuditCommitment};
+
 pub use bft_consensus::{
     start_round, cast_prepare, cast_commit, finalize_round, fail_round,
     is_round_expired, verify_quorum_certificate, create_view_change,
@@ -636,6 +641,7 @@ pub use bft_consensus::{
     ConsensusRound, ConsensusPhase, QuorumCertificate, ViewChange,
     ViewChangeReason, ConsensusState, ConsensusError,
     ROUND_TIMEOUT_SECS, MAX_TIMEOUTS_BEFORE_EJECT,
+    cleanup_finalized_rounds, auto_cleanup_finalized_rounds, needs_cleanup, MAX_RETAINED_ROUNDS,
 };
 
 // Content protection exports
@@ -726,10 +732,16 @@ pub use algorithm_transparency::{
     REVERSE_ENGINEERING_RISK_THRESHOLD,
 };
 pub use account_security::{
-    compute_correlation_score, is_account_locked, is_identity_match, record_failed_attempt,
-    record_successful_login, AccountSecurityRecord, CrossPlatformIdentity, FraudAlert, FraudType,
-    BEHAVIORAL_WINDOW_SECS, CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS, LOCKOUT_DURATION_SECS,
-    MAX_DEVICE_SIGNATURES, MAX_FAILED_ATTEMPTS,
+    appeal_lockout, clamp_lockout_duration, compute_correlation_score, compute_lockout_duration,
+    is_account_locked, is_identity_match, lockout_started_at, record_failed_attempt,
+    record_successful_login, AccountSecurityRecord, AppealError, CrossPlatformIdentity,
+    FraudAlert, FraudType, BEHAVIORAL_WINDOW_SECS, CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS,
+    LOCKOUT_DURATION_SECS, MAX_DEVICE_SIGNATURES, MAX_FAILED_ATTEMPTS, MAX_LOCKOUT_SECS,
+};
+pub use network_authentication::{
+    get_peer_token, is_token_expired, issue_peer_token, peer_token_needs_rotation,
+    rotate_peer_token, token_expires_at, validate_peer_token, NetworkAuthError, NetworkAuthKey,
+    PeerAuthToken, TOKEN_ROTATION_INTERVAL_SECS,
 };
 pub use exit_facilitation::{
     evaluate_competition_protection, facilitate_migration, validate_dependency_necessity,
@@ -783,14 +795,17 @@ pub use skill_verification::{
 pub use assessment_authenticity::{
     check_source_diversity, perform_consensus_validation, submit_validation,
     verify_assessment_authenticity, verify_blockchain_attestation, AuthenticityVerification,
-    ConsensusRecord, ValidationResult, ValidationSource, MAX_VALIDATION_AGE_SECS,
-    MIN_VALIDATION_SOURCES, VALIDATION_CONSENSUS_BPS,
+    ConsensusRecord, ValidationResult, ValidationSource, MAX_ASSESSMENT_SCORE,
+    MAX_VALIDATION_AGE_SECS, MIN_ASSESSMENT_SCORE, MIN_VALIDATION_SOURCES,
+    VALIDATION_CONSENSUS_BPS, validate_assessment_score,
 };
 pub use grade_inflation::{
     apply_inflation_adjustment, calculate_grade_distribution, detect_grade_inflation,
-    record_grade_correction, GradeCorrectionRecord, GradeDistributionStats,
-    InflationDetectionResult, MentorScoringAdjustment, INFLATION_PENALTY_BPS_PER_DETECTION,
-    INFLATION_WINDOW, MAX_INFLATION_RATE_BPS, MIN_SESSIONS_FOR_ANALYSIS, OUTLIER_ZSCORE_THRESHOLD,
+    record_grade_correction, exceeds_volume_adjusted_threshold, volume_adjusted_inflation_threshold,
+    GradeCorrectionRecord, GradeDistributionStats, InflationDetectionResult,
+    MentorScoringAdjustment, INFLATION_PENALTY_BPS_PER_DETECTION, INFLATION_WINDOW,
+    MAX_INFLATION_RATE_BPS, MIN_SESSIONS_FOR_ANALYSIS, OUTLIER_ZSCORE_THRESHOLD,
+    VOLUME_BASELINE_SESSIONS,
 };
 pub use assessment_security::{
     AssessmentMetrics, AssessmentRecord, AssessmentSecurity, AssessmentSecurityError,

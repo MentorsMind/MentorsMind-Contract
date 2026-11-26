@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::token;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Timestamp security constants
@@ -44,6 +44,9 @@ pub enum Error {
     InsufficientBalance = 7,
     AlreadyClaimed = 8,
     InvalidProof = 9,
+    /// Schedule was terminated by admin after a governance decision.
+    ScheduleTerminated = 10,
+    AlreadyTerminated = 11,
 }
 
 #[contracttype]
@@ -84,6 +87,24 @@ pub struct ScheduleRevokedEventData {
     pub refunded_amount: i128,
 }
 
+/// Lifecycle status of a vesting schedule (#1437).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleStatus {
+    Active,
+    Terminated,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleTerminatedEventData {
+    pub schedule_id: u32,
+    pub beneficiary: Address,
+    pub refunded_amount: i128,
+    /// Hash of the governance decision / justification for the termination.
+    pub justification_hash: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -98,6 +119,8 @@ pub enum DataKey {
     TotalSupply,
     MerkleRoot,
     ClaimedMerkleLeaf(BytesN<32>),
+    /// Termination status by schedule id (#1437).
+    TerminationStatus(u32),
 }
 
 #[contract]
@@ -252,6 +275,10 @@ impl VestingContract {
             .get(&DataKey::Schedule(schedule_id))
             .expect("Schedule not found");
 
+        if env.storage().persistent().has(&DataKey::TerminationStatus(schedule_id)) {
+            return 0;
+        }
+
         let current_time = env.ledger().timestamp();
 
         // Apply tolerance: require current_time to exceed cliff_end by at least
@@ -272,7 +299,7 @@ impl VestingContract {
         let total_period = schedule.vesting_end - schedule.cliff_end;
         let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
 
-        vested_amount - schedule.claimed
+        vested_amount.saturating_sub(schedule.claimed)
     }
 
     /// Claim available tokens from a vesting schedule.
@@ -285,6 +312,10 @@ impl VestingContract {
             .expect("Schedule not found");
 
         schedule.beneficiary.require_auth();
+
+        if env.storage().persistent().has(&DataKey::TerminationStatus(schedule_id)) {
+            panic!("Schedule terminated");
+        }
 
         // Inline claimable calculation with single storage read and timestamp call
         let current_time = env.ledger().timestamp();
@@ -302,7 +333,7 @@ impl VestingContract {
             let vested_period = current_time.saturating_sub(effective_start);
             let total_period = schedule.vesting_end - schedule.cliff_end;
             let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
-            vested_amount - schedule.claimed
+            vested_amount.saturating_sub(schedule.claimed)
         };
 
         if claimable <= 0 {
@@ -442,6 +473,72 @@ impl VestingContract {
         );
     }
 
+    /// Terminate a vesting schedule after a governance decision (#1437).
+    ///
+    /// Callable only by admin. All unclaimed tokens (`total - claimed`) are
+    /// returned to the treasury (admin), the schedule is marked `Terminated`,
+    /// and a `ScheduleTerminated` event carries the justification hash.
+    /// Subsequent claims on the schedule always fail.
+    pub fn terminate_schedule(env: Env, schedule_id: u32, justification_hash: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TerminationStatus(schedule_id))
+        {
+            panic!("Schedule already terminated");
+        }
+
+        let schedule: VestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("Schedule not found");
+        let refund_amount = schedule.total.saturating_sub(schedule.claimed);
+
+        let token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+        let token_client = token::Client::new(&env, &token);
+        if refund_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &admin, &refund_amount);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::TerminationStatus(schedule_id),
+            &ScheduleStatus::Terminated,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "VestingContract"),
+                Symbol::new(&env, "ScheduleTerminated"),
+            ),
+            ScheduleTerminatedEventData {
+                schedule_id,
+                beneficiary: schedule.beneficiary.clone(),
+                refunded_amount: refund_amount,
+                justification_hash,
+            },
+        );
+    }
+
+    /// Lifecycle status of a schedule (#1437).
+    pub fn get_schedule_status(env: Env, schedule_id: u32) -> ScheduleStatus {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TerminationStatus(schedule_id))
+            .unwrap_or(ScheduleStatus::Active)
+    }
+
     /// Get all schedule IDs for a beneficiary.
     pub fn get_schedules_by_beneficiary(env: Env, addr: Address) -> Vec<u32> {
         env.storage()
@@ -536,6 +633,10 @@ impl VestingContract {
         let actual_start = if start == 0 { now } else { start };
         let cliff_end = actual_start.saturating_add(cliff_seconds);
         let vesting_end = actual_start.saturating_add(vesting_seconds);
+        // A cliff that ends at or after the schedule ends would never let tokens vest.
+        if cliff_end >= vesting_end {
+            soroban_sdk::panic_with_error!(&env, Error::InvalidSchedule);
+        }
 
         let schedule = VestingSchedule {
             beneficiary: beneficiary.clone(),
@@ -1118,5 +1219,83 @@ mod test {
         fn symbol(_env: Env) -> String {
             String::from_str(&_env, "MOCK")
         }
+    }
+    #[test]
+    fn test_claims_sum_to_total_after_full_vest() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token.clone(), admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&vesting_contract_id, &1000);
+
+        let schedule_id = vesting_client.create_schedule(&beneficiary, &1000, &CLIFF, &VEST, &0);
+
+        // Multiple partial claims lose fractional units to integer division.
+        env.ledger().set_timestamp(CLIFF + VEST / 3);
+        vesting_client.claim(&schedule_id);
+        env.ledger().set_timestamp(CLIFF + VEST / 2);
+        vesting_client.claim(&schedule_id);
+
+        // The final claim releases exactly the remainder (#1436).
+        env.ledger().set_timestamp(CLIFF + VEST + 1);
+        vesting_client.claim(&schedule_id);
+
+        assert_eq!(vesting_client.get_schedule(&schedule_id).claimed, 1000);
+        assert_eq!(token_client.balance(&beneficiary), 1000);
+    }
+
+    #[test]
+    fn test_terminate_schedule_refunds_unclaimed_and_marks_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token.clone(), admin.clone());
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&vesting_contract_id, &1000);
+
+        let schedule_id = vesting_client.create_schedule(&beneficiary, &1000, &CLIFF, &VEST, &0);
+        env.ledger().set_timestamp(CLIFF + VEST / 2);
+        vesting_client.claim(&schedule_id);
+        let claimed = vesting_client.get_schedule(&schedule_id).claimed;
+
+        let reason = BytesN::from_array(&env, &[7u8; 32]);
+        vesting_client.terminate_schedule(&schedule_id, &reason);
+
+        assert_eq!(
+            vesting_client.get_schedule_status(&schedule_id),
+            ScheduleStatus::Terminated
+        );
+        assert_eq!(vesting_client.claimable_amount(&schedule_id), 0);
+        assert_eq!(token_client.balance(&admin), 1000 - claimed);
+        assert_eq!(token_client.balance(&beneficiary), claimed);
+    }
+
+    #[test]
+    #[should_panic(expected = "Schedule terminated")]
+    fn test_claim_after_termination_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let token = create_mock_token(&env);
+        let vesting_contract_id = create_vesting_contract(&env, token.clone(), admin);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&vesting_contract_id, &1000);
+
+        let schedule_id = vesting_client.create_schedule(&beneficiary, &1000, &CLIFF, &VEST, &0);
+        vesting_client.terminate_schedule(&schedule_id, &BytesN::from_array(&env, &[1u8; 32]));
+        env.ledger().set_timestamp(CLIFF + VEST + 1);
+        vesting_client.claim(&schedule_id);
     }
 }

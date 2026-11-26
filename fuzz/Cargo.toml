@@ -1,3 +1,7 @@
+# Standalone workspace so this crate can be tested independently of the
+# contract workspace (see the comment above about intentional exclusion).
+[workspace]
+
 [package]
 name = "mentormind-fuzz"
 version = "0.1.0"
@@ -54,6 +58,10 @@ path = "fuzz_targets/fuzz_stateful_harness.rs"
 [[test]]
 name = "fuzz_staking_rewards"
 path = "fuzz_targets/fuzz_staking_rewards.rs"
+
+[[test]]
+name = "fuzz_milestone_escrow"
+path = "fuzz_targets/fuzz_milestone_escrow.rs"
 
 [profile.release]
 opt-level = 3

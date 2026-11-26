@@ -123,6 +123,8 @@ pub enum DiffKind {
     VariantAdded,
     VariantPayloadChanged,
     VariantRenamed,
+    /// Deletion + addition pair that looks like a semantic rename (heuristic).
+    LikelyRename,
     // Struct field changes
     FieldRemoved,
     FieldAdded,

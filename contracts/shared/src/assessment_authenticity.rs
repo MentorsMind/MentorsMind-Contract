@@ -11,6 +11,10 @@ pub const MIN_VALIDATION_SOURCES: u32 = 3;
 pub const VALIDATION_CONSENSUS_BPS: u32 = 8000; // 80%
 /// Maximum age of validation sources (seconds)
 pub const MAX_VALIDATION_AGE_SECS: u64 = 30 * 24 * 3600; // 30 days
+/// Minimum valid assessment score (inclusive).
+pub const MIN_ASSESSMENT_SCORE: u32 = 0;
+/// Maximum valid assessment score (inclusive).
+pub const MAX_ASSESSMENT_SCORE: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +35,7 @@ pub struct ValidationResult {
     pub assessment_id: Symbol,
     pub is_valid: bool,
     pub confidence_bps: u32, // 0-10000
+    pub assessment_score: u32, // 0-100
     pub evidence_hash: BytesN<32>,
     pub validated_at: u64,
     pub details: Symbol,
@@ -61,6 +66,11 @@ pub struct ConsensusRecord {
     pub dissenting_opinions: u32,
 }
 
+/// Validate that an assessment score lies within the expected [0, 100] range.
+pub fn validate_assessment_score(score: u32) -> bool {
+    score >= MIN_ASSESSMENT_SCORE && score <= MAX_ASSESSMENT_SCORE
+}
+
 /// Submit a validation result from a specific source
 pub fn submit_validation(
     env: &Env,
@@ -69,15 +79,21 @@ pub fn submit_validation(
     validator: &Address,
     is_valid: bool,
     confidence_bps: u32,
+    assessment_score: u32,
     evidence_hash: BytesN<32>,
     details: Symbol,
 ) -> ValidationResult {
+    assert!(
+        validate_assessment_score(assessment_score),
+        "assessment score out of range [0, 100]"
+    );
     ValidationResult {
         source,
         validator: validator.clone(),
         assessment_id: assessment_id.clone(),
         is_valid,
         confidence_bps: confidence_bps.min(10000),
+        assessment_score,
         evidence_hash,
         validated_at: env.ledger().timestamp(),
         details,
@@ -96,8 +112,13 @@ pub fn verify_assessment_authenticity(
     let mut total_confidence: u64 = 0;
     let mut actual_sources = 0u32;
     
-    // Count unique sources and valid validations
+    // Count unique sources and valid validations. Reject out-of-range
+    // assessment scores at this layer so they cannot corrupt downstream
+    // competency verification.
     for validation in validations.iter() {
+        if !validate_assessment_score(validation.assessment_score) {
+            continue;
+        }
         if validation.assessment_id == *assessment_id {
             let source_key = validation.source.clone();
             if !source_map.contains_key(source_key.clone()) {
@@ -245,9 +266,85 @@ mod tests {
             validator,
             is_valid,
             9000,
+            90,
             BytesN::from_array(env, &bytes),
             Symbol::new(env, "valid"),
         )
+    }
+
+    #[test]
+    fn test_validate_assessment_score_boundaries() {
+        assert!(validate_assessment_score(MIN_ASSESSMENT_SCORE));
+        assert!(validate_assessment_score(0));
+        assert!(validate_assessment_score(50));
+        assert!(validate_assessment_score(100));
+        assert!(validate_assessment_score(MAX_ASSESSMENT_SCORE));
+        assert!(!validate_assessment_score(101));
+        assert!(!validate_assessment_score(u32::MAX));
+    }
+
+    #[test]
+    #[should_panic(expected = "assessment score out of range [0, 100]")]
+    fn test_submit_validation_rejects_out_of_range_score() {
+        let env = Env::default();
+        let bytes = [1u8; 32];
+        submit_validation(
+            &env,
+            &Symbol::new(&env, "assess_bad"),
+            ValidationSource::AutomatedCheck,
+            &Address::generate(&env),
+            true,
+            9000,
+            101,
+            BytesN::from_array(&env, &bytes),
+            Symbol::new(&env, "invalid"),
+        );
+    }
+
+    #[test]
+    fn test_verify_authenticity_rejects_out_of_range_score() {
+        let env = Env::default();
+        let assessment_id = Symbol::new(&env, "assess_score");
+        let mut validations = Vec::new(&env);
+        let bytes = [1u8; 32];
+
+        // Three valid sources at boundary scores 0 and 100.
+        for (source, score) in [
+            (ValidationSource::MentorAssessment, 0),
+            (ValidationSource::PeerReview, 100),
+            (ValidationSource::AutomatedCheck, 75),
+        ] {
+            validations.push_back(submit_validation(
+                &env,
+                &assessment_id,
+                source,
+                &Address::generate(&env),
+                true,
+                9000,
+                score,
+                BytesN::from_array(&env, &bytes),
+                Symbol::new(&env, "valid"),
+            ));
+        }
+
+        // A fourth source with an invalid score is ignored at this layer.
+        let mut bad = submit_validation(
+            &env,
+            &assessment_id,
+            ValidationSource::ExternalOracle,
+            &Address::generate(&env),
+            true,
+            9000,
+            100,
+            BytesN::from_array(&env, &bytes),
+            Symbol::new(&env, "tampered"),
+        );
+        bad.assessment_score = 101;
+        validations.push_back(bad);
+
+        let result = verify_assessment_authenticity(&env, &assessment_id, &validations, 3);
+        assert!(result.consensus_achieved);
+        assert_eq!(result.actual_sources, 3);
     }
 
     #[test]

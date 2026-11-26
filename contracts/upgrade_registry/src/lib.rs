@@ -32,7 +32,7 @@ use shared::storage_compatibility::{
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address,
-    BytesN, Env, IntoVal, Symbol, Vec,
+    Bytes, BytesN, Env, IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +83,14 @@ pub enum Error {
     StorageLayoutNotFound = 22,
     /// Migration batch size is invalid (e.g. 0 or too large).
     InvalidMigrationBatch = 23,
+    /// No provisional upgrade exists for this contract (#1433).
+    NoProvisionalUpgrade = 24,
+    /// Another upgrade is still inside its observation window (#1433).
+    ObservationWindowOpen = 25,
+    /// The observation window has closed; rollback votes are no longer accepted (#1433).
+    ObservationWindowClosed = 26,
+    /// This signer already voted to roll back this upgrade (#1433).
+    AlreadyVoted = 27,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +105,32 @@ pub struct UpgradeRecord {
     pub changelog_hash: BytesN<32>,
     pub timestamp: u64,
     pub admin: Address,
+}
+
+/// How long an executed upgrade stays open to rollback votes (#1433).
+pub const POST_UPGRADE_OBSERVATION_SECS: u64 = 72 * 3600;
+
+/// Lifecycle of an executed upgrade (#1433).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpgradeStatus {
+    /// Live, and rollback votes are accepted until the window closes.
+    Provisional,
+    /// The observation window passed without a rollback.
+    Final,
+    /// A quorum of signers voted to roll back during the window.
+    RolledBack,
+}
+
+/// An executed upgrade inside its observation window (#1433).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvisionalUpgrade {
+    pub old_version: u32,
+    pub new_version: u32,
+    pub applied_at: u64,
+    pub observe_until: u64,
+    pub status: UpgradeStatus,
 }
 
 /// Stored by `schedule_upgrade`; consumed by `execute_pending_upgrade`.
@@ -190,6 +224,12 @@ pub enum DataKey {
     RollbackProposal(u32),
     RollbackApproval(u32, Address),
     RollbackProposalCount,
+    /// The provisional upgrade for a contract (#1433).
+    Provisional(Symbol),
+    /// Rollback votes for one upgrade: contract, new version, signer (#1433).
+    RollbackVote(Symbol, u32, Address),
+    /// Rollback vote count for one upgrade: contract, new version (#1433).
+    RollbackVotes(Symbol, u32),
 }
 
 /// Default upgrade timelock: 48 hours.
@@ -326,6 +366,30 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
+    /// Schedule an upgrade with the WASM hash verified against actual bytes (#1434).
+    ///
+    /// Additive companion to `schedule_upgrade`: existing callers are unchanged,
+    /// while callers that hold the WASM blob can prove the hash before proposing.
+    pub fn schedule_upgrade_verified(
+        env: Env,
+        wasm: Bytes,
+        new_wasm_hash: BytesN<32>,
+        contract_name: Symbol,
+        new_version: u32,
+        changelog_hash: BytesN<32>,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        verify_wasm_hash(&env, &wasm, &new_wasm_hash)?;
+        Self::schedule_upgrade(
+            env,
+            new_wasm_hash,
+            contract_name,
+            new_version,
+            changelog_hash,
+            approvers,
+        )
+    }
+
     pub fn execute_pending_upgrade(env: Env, approvers: Vec<Address>) -> Result<(), Error> {
         let pending: PendingUpgrade = env
             .storage()
@@ -343,6 +407,16 @@ impl UpgradeRegistryContract {
 
         if env.ledger().timestamp() < pending.executable_after {
             return Err(Error::TimelockNotElapsed);
+        }
+
+        if let Some(open) = env
+            .storage()
+            .persistent()
+            .get::<_, ProvisionalUpgrade>(&DataKey::Provisional(pending.contract_name.clone()))
+        {
+            if open.status == UpgradeStatus::Provisional && env.ledger().timestamp() < open.observe_until {
+                return Err(Error::ObservationWindowOpen);
+            }
         }
 
         let old_version: u32 = env
@@ -376,6 +450,18 @@ impl UpgradeRegistryContract {
         env.storage().persistent().set(
             &DataKey::LatestVersion(pending.contract_name.clone()),
             &pending.new_version,
+        );
+
+        let applied_at = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &DataKey::Provisional(pending.contract_name.clone()),
+            &ProvisionalUpgrade {
+                old_version,
+                new_version: pending.new_version,
+                applied_at,
+                observe_until: applied_at.saturating_add(POST_UPGRADE_OBSERVATION_SECS),
+                status: UpgradeStatus::Provisional,
+            },
         );
 
         env.storage()
@@ -606,6 +692,92 @@ impl UpgradeRegistryContract {
             (new_admin, approved_signers),
         );
         Ok(())
+    }
+
+    /// Casts a rollback vote for the provisional upgrade of `contract_name` (#1433).
+    ///
+    /// Only signers from the upgrade config may vote, once each, and only while the
+    /// observation window is open. Reaching the config threshold reverts the registry's
+    /// version for the contract to the previous one. Returns the vote count so far.
+    pub fn vote_rollback(env: Env, signer: Address, contract_name: Symbol) -> Result<u32, Error> {
+        signer.require_auth();
+        let config = Self::get_upgrade_config(env.clone())?;
+        if !config.signers.contains(signer.clone()) {
+            return Err(Error::NotSigner);
+        }
+
+        let key = DataKey::Provisional(contract_name.clone());
+        let mut upgrade: ProvisionalUpgrade = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoProvisionalUpgrade)?;
+        if upgrade.status != UpgradeStatus::Provisional {
+            return Err(Error::NoProvisionalUpgrade);
+        }
+        if env.ledger().timestamp() >= upgrade.observe_until {
+            return Err(Error::ObservationWindowClosed);
+        }
+
+        let vote_key = DataKey::RollbackVote(contract_name.clone(), upgrade.new_version, signer.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::AlreadyVoted);
+        }
+        env.storage().persistent().set(&vote_key, &true);
+
+        let count_key = DataKey::RollbackVotes(contract_name.clone(), upgrade.new_version);
+        let votes: u32 = env.storage().persistent().get(&count_key).unwrap_or(0).saturating_add(1);
+        env.storage().persistent().set(&count_key, &votes);
+
+        if votes >= config.threshold {
+            env.storage()
+                .persistent()
+                .set(&DataKey::LatestVersion(contract_name.clone()), &upgrade.old_version);
+            upgrade.status = UpgradeStatus::RolledBack;
+            env.storage().persistent().set(&key, &upgrade);
+            env.events().publish(
+                (symbol_short!("upgrade"), symbol_short!("rollback"), contract_name),
+                (upgrade.new_version, upgrade.old_version),
+            );
+        }
+        Ok(votes)
+    }
+
+    /// Marks the provisional upgrade of `contract_name` as `Final` once its window has
+    /// closed without a rollback (#1433).
+    pub fn finalize_upgrade(env: Env, contract_name: Symbol) -> Result<(), Error> {
+        let key = DataKey::Provisional(contract_name.clone());
+        let mut upgrade: ProvisionalUpgrade = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoProvisionalUpgrade)?;
+        if upgrade.status != UpgradeStatus::Provisional {
+            return Err(Error::NoProvisionalUpgrade);
+        }
+        if env.ledger().timestamp() < upgrade.observe_until {
+            return Err(Error::ObservationWindowOpen);
+        }
+        upgrade.status = UpgradeStatus::Final;
+        env.storage().persistent().set(&key, &upgrade);
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("final"), contract_name),
+            upgrade.new_version,
+        );
+        Ok(())
+    }
+
+    /// Observation status of the latest executed upgrade of `contract_name`. A provisional
+    /// upgrade reads as `Final` once its window has passed, even before `finalize_upgrade`.
+    pub fn get_upgrade_status(env: Env, contract_name: Symbol) -> Option<UpgradeStatus> {
+        let upgrade: ProvisionalUpgrade = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Provisional(contract_name))?;
+        if upgrade.status == UpgradeStatus::Provisional && env.ledger().timestamp() >= upgrade.observe_until {
+            return Some(UpgradeStatus::Final);
+        }
+        Some(upgrade.status)
     }
 
     pub fn cancel_pending_upgrade(env: Env) -> Result<(), Error> {
@@ -1480,6 +1652,18 @@ fn require_upgrade_approvals_cached(
     Ok(result)
 }
 
+/// Verify that a claimed WASM hash matches the actual WASM bytes (#1434).
+///
+/// Uses Soroban's SHA-256 facility so an attacker cannot attach a
+/// legitimate-looking hash to unrelated or malicious WASM bytecode.
+pub fn verify_wasm_hash(env: &Env, wasm: &Bytes, claimed_hash: &BytesN<32>) -> Result<(), Error> {
+    let actual = env.crypto().sha256(wasm);
+    if actual != claimed_hash.clone() {
+        return Err(Error::WasmHashMismatch);
+    }
+    Ok(())
+}
+
 /// Validate that a WASM binary exports all required functions.
 ///
 /// This prevents upgrades to WASM that omits critical functions like
@@ -2273,5 +2457,34 @@ mod test {
         // Rollback to version 1
         client.rollback_storage_layout(&contract_name, &1, &signers);
         assert_eq!(client.get_active_storage_version(&contract_name).unwrap().current_version, 1);
+    }
+}
+
+#[cfg(test)]
+mod wasm_hash_verification_tests {
+    use super::*;
+
+    fn sample_wasm(env: &Env) -> Bytes {
+        // Minimal valid empty WASM module (magic + version).
+        Bytes::from_slice(env, b"\0asm\x01\0\0\0")
+    }
+
+    #[test]
+    fn rejects_hash_that_does_not_match_wasm() {
+        let env = Env::default();
+        let wasm = sample_wasm(&env);
+        let claimed = BytesN::from_array(&env, &[0x11u8; 32]);
+        assert_eq!(
+            verify_wasm_hash(&env, &wasm, &claimed),
+            Err(Error::WasmHashMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_hash_computed_from_wasm() {
+        let env = Env::default();
+        let wasm = sample_wasm(&env);
+        let actual = env.crypto().sha256(&wasm);
+        assert_eq!(verify_wasm_hash(&env, &wasm, &actual), Ok(()));
     }
 }

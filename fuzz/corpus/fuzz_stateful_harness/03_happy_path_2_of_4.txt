@@ -1,0 +1,5 @@
+# Happy-path test with 2-of-4 signers
+init_ms 4 2
+ms_propose 0 0 0
+ms_sign 1 1
+ms_execute 1
